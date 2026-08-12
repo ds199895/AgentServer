@@ -8,13 +8,15 @@ import { cn } from '@/lib/utils'
 type Props = {
   preview: Preview
   authorizedUrl: string
+  /** 页面顶部栏（顶栏 + 终端 tab 栏）占用的高度，面板不得越过该区域 */
+  topOffset?: number
   onClose: () => void
   onStop: () => void
 }
 
 type Viewport = 'desktop' | 'tablet' | 'mobile'
 
-export function PreviewPane({ preview, authorizedUrl, onClose, onStop }: Props) {
+export function PreviewPane({ preview, authorizedUrl, topOffset = 58, onClose, onStop }: Props) {
   const [frameKey, setFrameKey] = useState(0)
   const [frameUrl, setFrameUrl] = useState(authorizedUrl)
   const [viewport, setViewport] = useState<Viewport>('desktop')
@@ -51,7 +53,10 @@ export function PreviewPane({ preview, authorizedUrl, onClose, onStop }: Props) 
     )
   }
   return (
-    <section className="fixed right-3 bottom-3 z-40 grid h-[min(720px,calc(100dvh-1.5rem))] w-[min(1120px,calc(100vw-1.5rem))] grid-rows-[48px_minmax(0,1fr)] overflow-hidden rounded-xl border border-[#344b53] bg-[#080d12] shadow-[0_28px_90px_#000e] max-md:right-1.5 max-md:bottom-1.5 max-md:left-1.5 max-md:h-[55dvh] max-md:w-auto">
+    <section
+      style={{ maxHeight: `calc(100dvh - ${topOffset + 12}px)` }}
+      className="fixed right-3 bottom-3 z-40 grid h-[min(720px,calc(100dvh-1.5rem))] w-[min(1120px,calc(100vw-1.5rem))] grid-rows-[48px_minmax(0,1fr)] overflow-hidden rounded-xl border border-[#344b53] bg-[#080d12] shadow-[0_28px_90px_#000e] max-md:right-1.5 max-md:bottom-1.5 max-md:left-1.5 max-md:h-[55dvh] max-md:w-auto"
+    >
       <header className="flex min-w-0 items-center gap-2 border-b border-[#26323c] bg-[#0d141a] px-3">
         <span className="size-2 flex-none rounded-full bg-primary shadow-[0_0_9px_#77f2b477]" />
         <div className="min-w-0 flex-1">

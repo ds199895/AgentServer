@@ -367,6 +367,7 @@ export default function App() {
         <PreviewPane
           preview={activePreview.preview}
           authorizedUrl={activePreview.url}
+          topOffset={58 + (showTerminalTabs ? 44 : 0)}
           onClose={() => setActivePreview(null)}
           onStop={() => void stopPreview(activePreview.preview)}
         />
