@@ -55,7 +55,7 @@ export function PreviewPane({ preview, authorizedUrl, topOffset = 58, onClose, o
   return (
     <section
       style={{ maxHeight: `calc(100dvh - ${topOffset + 12}px)` }}
-      className="fixed right-3 bottom-3 z-40 grid h-[min(720px,calc(100dvh-1.5rem))] w-[min(1120px,calc(100vw-1.5rem))] grid-rows-[48px_minmax(0,1fr)] overflow-hidden rounded-xl border border-[#344b53] bg-[#080d12] shadow-[0_28px_90px_#000e] max-md:right-1.5 max-md:bottom-1.5 max-md:left-1.5 max-md:h-[55dvh] max-md:w-auto"
+      className="fixed right-3 bottom-3 z-40 grid h-[min(360px,calc(100dvh-1.5rem))] w-[min(520px,calc(100vw-1.5rem))] grid-rows-[48px_minmax(0,1fr)] overflow-hidden rounded-xl border border-[#344b53] bg-[#080d12] shadow-[0_28px_90px_#000e] max-md:right-1.5 max-md:bottom-1.5 max-md:left-1.5 max-md:h-[38dvh] max-md:w-auto"
     >
       <header className="flex min-w-0 items-center gap-2 border-b border-[#26323c] bg-[#0d141a] px-3">
         <span className="size-2 flex-none rounded-full bg-primary shadow-[0_0_9px_#77f2b477]" />
@@ -81,7 +81,7 @@ export function PreviewPane({ preview, authorizedUrl, topOffset = 58, onClose, o
           key={frameKey}
           src={frameUrl}
           title={`${preview.label} 开发预览`}
-          className="h-full min-h-[420px] max-w-full border-0 bg-white shadow-[0_0_0_1px_#26323c] max-md:min-h-0"
+          className="h-full max-w-full border-0 bg-white shadow-[0_0_0_1px_#26323c]"
           style={{ width: sizes[viewport] }}
           allow="clipboard-read; clipboard-write; fullscreen"
         />
