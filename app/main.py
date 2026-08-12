@@ -957,5 +957,7 @@ if FRONTEND_DIST.is_dir():
     async def frontend(path: str) -> FileResponse:
         requested = (FRONTEND_DIST / path).resolve()
         if path and requested.is_file() and FRONTEND_DIST in requested.parents:
-            return FileResponse(requested)
-        return FileResponse(FRONTEND_DIST / "index.html")
+            # index.html 不带内容哈希，禁止启发式缓存；/assets 下的文件带哈希可缓存
+            headers = {"Cache-Control": "no-cache"} if requested.name == "index.html" else None
+            return FileResponse(requested, headers=headers)
+        return FileResponse(FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-cache"})
