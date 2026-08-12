@@ -79,6 +79,7 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
             className={cn(
               'flex h-[33px] flex-none items-stretch overflow-hidden rounded-[7px] border border-[#26323c] bg-[#0f161d] hover:border-[#354451]',
               groupActive && 'border-[#315a48] bg-[#122019] shadow-[inset_0_-2px_var(--color-primary)]',
+              'max-md:h-auto max-md:max-w-[46vw] max-md:flex-col',
             )}
           >
             <button
@@ -86,7 +87,7 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
               aria-label={deviceLabel}
               onClick={() => { if (!groupActive) onSelect(group.sessions[0].id) }}
               className={cn(
-                'flex max-w-[150px] min-w-0 cursor-pointer items-center gap-[7px] border-r border-[#26323c] bg-transparent px-2.5 hover:bg-[#17212a] max-md:max-w-[72px] max-md:px-[7px]',
+                'flex max-w-[150px] min-w-0 cursor-pointer items-center gap-[7px] border-r border-[#26323c] bg-transparent px-2.5 hover:bg-[#17212a] max-md:max-w-none max-md:border-r-0 max-md:border-b max-md:px-2 max-md:py-[2px]',
                 groupActive && 'cursor-default hover:bg-transparent',
               )}
             >
@@ -94,10 +95,11 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
                 data-active={group.sessions.some((session) => session.active)}
                 className="size-1.5 flex-none rounded-full bg-[#59636d] data-[active=true]:bg-primary data-[active=true]:shadow-[0_0_8px_#77f2b488]"
               />
-              <strong className={cn('truncate text-[10px] font-semibold text-[#b9c5ce]', groupActive && 'text-[#edf4f9]')}>
+              <strong className={cn('truncate text-[10px] font-semibold text-[#b9c5ce] max-md:text-[9px]', groupActive && 'text-[#edf4f9]')}>
                 {group.name}
               </strong>
             </button>
+            <div className="flex items-stretch">
             <span className="flex items-stretch">
               {group.sessions.map((session, sessionIndex) => {
                 const sessionActive = session.id === activeId
@@ -155,6 +157,7 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
                 </button>
               </>
             )}
+            </div>
           </div>
         )
       })}

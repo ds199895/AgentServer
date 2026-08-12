@@ -210,7 +210,7 @@ export default function App() {
         onShowPassword={() => setShowPassword(true)}
         onLogout={() => void logout()}
       />
-      <section className={cn('grid min-h-0 min-w-0', showTerminalTabs ? 'grid-rows-[44px_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
+      <section className={cn('grid min-h-0 min-w-0', showTerminalTabs ? 'grid-rows-[44px_minmax(0,1fr)] max-md:grid-rows-[auto_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
         {showTerminalTabs && (
           <TerminalTabsBar
             sessions={sessions}
