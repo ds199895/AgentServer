@@ -706,6 +706,7 @@ class TerminalManager:
             for session in self.sessions.values()
             if session.active and session.device_id
             for service in session.services.values()
+            if service.status != "offline"
         ]
 
     def update_service_status(

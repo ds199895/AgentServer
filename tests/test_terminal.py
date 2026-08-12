@@ -113,8 +113,8 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager.sessions[session.id] = session
         self.manager._append(
             session,
-            b"docs https://example.com:443 then Server running on 0.0.0.0:3000\\n"
-            b"Serving HTTP on 0.0.0.0 port 8000\\n",
+            b"docs https://example.com:443 then Server running on 0.0.0.0:3000\n"
+            b"Serving HTTP on 0.0.0.0 port 8000\n",
         )
         self.assertEqual([3000, 8000], list(session.services))
 
@@ -133,9 +133,15 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("offline", service.status)
         self.assertTrue(became_offline)
+        self.assertNotIn(service, [item for _session, item in self.manager.service_candidates()])
 
-        self.manager._append(session, b"Server ready at http://127.0.0.1:3000/\\n")
-        self.assertEqual("checking", service.status)
+        session.exited_at = None
+        try:
+            self.manager._append(session, b"Server ready at http://127.0.0.1:3000/\n")
+            self.assertEqual("checking", service.status)
+            self.assertIn(service, [item for _session, item in self.manager.service_candidates()])
+        finally:
+            session.exited_at = 0
 
     async def test_multiple_clients_receive_the_same_live_output(self) -> None:
         session = self.manager.create("Shared")

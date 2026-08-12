@@ -462,11 +462,13 @@ async def probe_device_service(
         return False, error
     finally:
         if process.returncode is None:
-            process.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
             except asyncio.TimeoutError:
-                process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
 
 
@@ -477,16 +479,18 @@ async def service_monitor_loop(app: FastAPI) -> None:
 
     async def check(session_id: str, device_id: str, port: int, url: str) -> None:
         async with semaphore:
-            device = await asyncio.to_thread(devices.get, device_id)
-            if not device or not device["frp_online"] or not device["ssh_available"]:
-                online, error = False, "设备 SSH 当前不可用"
-            else:
-                try:
+            try:
+                device = await asyncio.to_thread(devices.get, device_id)
+                if not device or not device["frp_online"] or not device["ssh_available"]:
+                    online, error = False, "设备 SSH 当前不可用"
+                else:
                     online, error = await probe_device_service(
                         device, port, "https" if url.lower().startswith("https://") else "http"
                     )
-                except (OSError, RuntimeError, ValueError, HTTPException) as exc:
-                    online, error = False, str(exc)
+            except Exception as exc:
+                # One stale or malformed service must not terminate monitoring
+                # for all current and future terminal services.
+                online, error = False, str(exc)
             _service, became_offline = app.state.terminals.update_service_status(
                 session_id,
                 port,
@@ -495,7 +499,8 @@ async def service_monitor_loop(app: FastAPI) -> None:
                 failure_threshold=threshold,
             )
             if became_offline:
-                await app.state.previews.delete_for_service(session_id, port)
+                with contextlib.suppress(Exception):
+                    await app.state.previews.delete_for_service(session_id, port)
 
     while True:
         candidates = [
@@ -503,7 +508,10 @@ async def service_monitor_loop(app: FastAPI) -> None:
             for session, service in app.state.terminals.service_candidates()
         ]
         if candidates:
-            await asyncio.gather(*(check(*candidate) for candidate in candidates))
+            await asyncio.gather(
+                *(check(*candidate) for candidate in candidates),
+                return_exceptions=True,
+            )
         await asyncio.sleep(interval)
 
 
