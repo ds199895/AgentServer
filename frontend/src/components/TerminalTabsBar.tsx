@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { LoaderCircle, Plus, XIcon } from 'lucide-react'
+import { LoaderCircle, MonitorPlay, Plus, XIcon } from 'lucide-react'
 
 import type { TerminalSession } from '@/api'
 import { getCharacter, hashString, type CharPose } from '@/pixel/sprites'
@@ -62,9 +62,10 @@ type Props = {
   onSelect: (id: string) => void
   onClose: (session: TerminalSession) => void
   onClone: (source: TerminalSession) => void
+  onPreview: (source: TerminalSession) => void
 }
 
-export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClose, onClone }: Props) {
+export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClose, onClone, onPreview }: Props) {
   const terminalGroups = groupTerminalSessions(sessions)
   return (
     <nav aria-label="按设备分组的终端列表" className="flex min-w-0 items-center gap-1.5 overflow-x-auto border-b border-border bg-[#0b1016] px-2.5 py-[5px] [scrollbar-color:#34404c_transparent] [scrollbar-width:thin] max-md:px-1.5">
@@ -132,17 +133,27 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
               })}
             </span>
             {group.deviceId && (
-              <button
-                disabled={cloningId !== null}
-                aria-label={`在 ${group.name} 新建终端`}
-                title="在同一设备新建终端"
-                onClick={() => onClone(cloneSource)}
-                className="grid w-7 cursor-pointer place-items-center bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
-              >
-                {cloningId && group.sessions.some((session) => session.id === cloningId)
-                  ? <LoaderCircle className="size-3 animate-spin" />
-                  : <Plus className="size-3.5" />}
-              </button>
+              <>
+                <button
+                  aria-label={`预览 ${group.name} 的开发服务`}
+                  title="预览设备本地开发服务"
+                  onClick={() => onPreview(cloneSource)}
+                  className="grid w-7 cursor-pointer place-items-center border-r border-[#26323c] bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary"
+                >
+                  <MonitorPlay className="size-3.5" />
+                </button>
+                <button
+                  disabled={cloningId !== null}
+                  aria-label={`在 ${group.name} 新建终端`}
+                  title="在同一设备新建终端"
+                  onClick={() => onClone(cloneSource)}
+                  className="grid w-7 cursor-pointer place-items-center bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
+                >
+                  {cloningId && group.sessions.some((session) => session.id === cloningId)
+                    ? <LoaderCircle className="size-3 animate-spin" />
+                    : <Plus className="size-3.5" />}
+                </button>
+              </>
             )}
           </div>
         )

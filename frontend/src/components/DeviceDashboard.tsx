@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState } from 'react'
-import { Activity, LayoutGrid, List, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
+import { Activity, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
 import type { Device, TerminalSession } from '@/api'
 import { DeviceIcon, StateBadge } from '@/components/device-bits'
@@ -29,9 +29,10 @@ type Props = {
   onSync: () => void
   onAdd: () => void
   onSelectTerminal: (sessionId: string) => void
+  onPreview: (device?: Device) => void
 }
 
-export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal }: Props) {
+export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onPreview }: Props) {
   const [view, setView] = useState<'world' | 'list'>('world')
   const online = devices.filter((device) => device.frp_online).length
   const sshReady = devices.filter((device) => device.ssh_available).length
@@ -62,6 +63,10 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
           <Button variant="outline" size="sm" aria-label="同步 FRP 设备" className="text-[10px] max-md:size-7 max-md:px-0" onClick={onSync}>
             <RefreshCw />
             <span className="max-md:hidden">同步</span>
+          </Button>
+          <Button variant="outline" size="sm" aria-label="打开设备开发预览" className="text-[10px] max-md:size-7 max-md:px-0" onClick={() => onPreview()}>
+            <MonitorPlay />
+            <span className="max-md:hidden">预览</span>
           </Button>
           <Button size="sm" aria-label="添加设备" className="text-[10px] font-bold max-md:size-7 max-md:px-0" onClick={onAdd}>
             <Plus />
@@ -130,6 +135,10 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                       <Button variant="outline" size="xs" aria-label={`打开 ${device.name} 终端`} className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={busyId === device.id || !device.ssh_available} onClick={() => onOpen(device)}>
                         <Terminal />
                         <span className="max-md:hidden">终端</span>
+                      </Button>
+                      <Button variant="outline" size="xs" aria-label={`预览 ${device.name} 的开发服务`} className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={!device.ssh_available} onClick={() => onPreview(device)}>
+                        <MonitorPlay />
+                        <span className="max-md:hidden">预览</span>
                       </Button>
                       <Button variant="outline" size="xs" aria-label={`检测 ${device.name}`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onProbe(device)}>
                         <Activity />

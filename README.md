@@ -29,6 +29,7 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 - 在浏览器中创建、切换和恢复多个 SSH/本地终端，支持断线重连与历史输出回放。
 - 使用独立 tmux 服务持久托管终端任务，Web 服务更新不会终止正在运行的任务。
 - 提供像素风房间 Canvas，将设备和终端会话映射为可交互的小人，并可从场景直接跳转终端。
+- 通过 SSH 临时隧道和隔离子域名预览设备本地开发服务，支持 HTTP、WebSocket 与 HMR。
 - 提供设备端一键安装脚本、登录鉴权、HTTPS 部署支持，以及桌面端和移动端基础适配。
 
 ### TODO
@@ -194,6 +195,27 @@ systemctl enable --now frpc
 macOS 需要启用“系统设置 → 通用 → 共享 → 远程登录”；Windows 需要启用 OpenSSH
 Server；Linux 通常使用 `sshd`。
 
+## 设备开发服务预览
+
+AgentServer 可以通过设备现有的 SSH 入口建立临时本地转发，预览仅监听在设备
+`127.0.0.1` 上的 Vite、Next.js、Storybook 等开发服务。登录后可从设备列表或终端设备组
+点击“预览”，手动填写端口；预览面板支持刷新、响应式宽度、全屏、新窗口打开和停止隧道。
+
+为保持根路径资源、前端路由和 HMR WebSocket 兼容，同时隔离不受信任的开发页面，生产
+环境必须使用独立泛域名，例如：
+
+```text
+*.preview.metakroma.com -> 101.43.103.46
+PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
+```
+
+泛域名证书通常需要 DNS-01 验证。可参考 `deploy/preview.nginx.example` 配置 Nginx。
+每个预览使用独立子域名和短时访问票据，不会收到 AgentServer 主站的登录 Cookie；隧道
+在关闭预览、删除设备或超过 `PREVIEW_IDLE_TIMEOUT` 无访问时自动回收。
+
+当前 `*.preview.metakroma.com` 证书通过手动 DNS-01 签发，不能无人值守自动续期。到期前
+需要更新 `_acme-challenge.preview.metakroma.com` TXT 记录并重新执行 ACME 验证。
+
 ## 关键环境变量
 
 | 变量 | 说明 |
@@ -213,6 +235,8 @@ Server；Linux 通常使用 `sshd`。
 | `TERMINAL_BACKEND` | `tmux` 可跨 AgentServer 部署保存进程；`direct` 为开发兼容模式 |
 | `TMUX_SOCKET` | 独立 tmux 服务的 socket，生产默认 `/var/lib/agentserver/tmux/agentserver.sock` |
 | `COOKIE_SECURE` | HTTPS 部署设为 `1` |
+| `PREVIEW_PUBLIC_ORIGIN` | 预览泛域名基础 Origin，生产为 `https://preview.metakroma.com` |
+| `PREVIEW_IDLE_TIMEOUT` | 预览无访问后的自动回收秒数，默认 1800 |
 
 ## API
 
@@ -222,8 +246,12 @@ Server；Linux 通常使用 `sshd`。
 - `POST /api/devices/sync`
 - `POST /api/devices/{id}/probe`
 - `POST /api/devices/{id}/terminals`
+- `POST /api/devices/{id}/previews`
 - `GET/POST /api/terminals`
 - `DELETE /api/terminals/{id}`
+- `GET /api/previews`
+- `POST /api/previews/{id}/ticket`
+- `DELETE /api/previews/{id}`
 - `WS /ws/terminal/{id}`
 - `GET /downloads/install-frpc-ssh.sh`
 - `GET /downloads/install-frpc-ssh.ps1`

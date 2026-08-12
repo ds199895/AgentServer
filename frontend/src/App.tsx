@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
-import { api, type Device, type TerminalSession } from '@/api'
+import { api, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
 import { Eyebrow } from '@/components/Eyebrow'
 import { Login } from '@/components/Login'
 import { PasswordDialog } from '@/components/PasswordDialog'
+import { PreviewDialog } from '@/components/PreviewDialog'
+import { PreviewPane } from '@/components/PreviewPane'
 import { TerminalEmpty } from '@/components/TerminalEmpty'
 import { TerminalRoomOverview } from '@/components/TerminalRoomOverview'
 import { TerminalTabsBar } from '@/components/TerminalTabsBar'
@@ -58,11 +60,14 @@ export default function App() {
   const [username, setUsername] = useState<string | null | undefined>(undefined)
   const [devices, setDevices] = useState<Device[]>([])
   const [sessions, setSessions] = useState<TerminalSession[]>([])
+  const [previews, setPreviews] = useState<Preview[]>([])
   const [activeId, setActiveId] = useState<string | null>(() => routeFromLocation().terminalId)
   const [page, setPage] = useState<MainPage>(() => routeFromLocation().page)
   const [missingTerminalId, setMissingTerminalId] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
+  const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
+  const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [cloningId, setCloningId] = useState<string | null>(null)
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
@@ -71,9 +76,10 @@ export default function App() {
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
 
   const load = useCallback(async () => {
-    const [nextDevices, nextSessions] = await Promise.all([api.devices(), api.terminals()])
+    const [nextDevices, nextSessions, nextPreviews] = await Promise.all([api.devices(), api.terminals(), api.previews()])
     setDevices(nextDevices)
     setSessions(nextSessions)
+    setPreviews(nextPreviews)
     const route = routeFromLocation()
     const routedSession = route.terminalId ? nextSessions.find((item) => item.id === route.terminalId) : undefined
     const rememberedSession = nextSessions.find((item) => item.id === lastTerminalIdRef.current)
@@ -174,7 +180,14 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]) }
+  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setActivePreview(null) }
+  const stopPreview = async (preview: Preview) => {
+    try {
+      await api.deletePreview(preview.id)
+      setPreviews((current) => current.filter((item) => item.id !== preview.id))
+      if (activePreview?.preview.id === preview.id) setActivePreview(null)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法关闭预览') }
+  }
 
   if (username === undefined) {
     return (
@@ -206,6 +219,7 @@ export default function App() {
             onSelect={(id) => showTerminal(id)}
             onClose={setCloseTarget}
             onClone={(source) => void cloneTerminal(source)}
+            onPreview={(source) => setPreviewTarget({ deviceId: source.device_id || undefined, terminalId: source.id })}
           />
         )}
         <div className="relative min-h-0 min-w-0 overflow-auto">
@@ -253,6 +267,7 @@ export default function App() {
               onSync={() => void sync()}
               onAdd={() => navigate('setup')}
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
+              onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
             />
           )}
         </div>
@@ -286,6 +301,33 @@ export default function App() {
           device={deviceDialog === 'new' ? undefined : deviceDialog}
           onClose={() => setDeviceDialog(null)}
           onSaved={() => void load()}
+        />
+      )}
+      {previewTarget && (
+        <PreviewDialog
+          devices={devices}
+          sessions={sessions}
+          previews={previews}
+          initialDeviceId={previewTarget.deviceId}
+          initialTerminalId={previewTarget.terminalId}
+          onClose={() => setPreviewTarget(null)}
+          onCreated={(preview, url) => {
+            setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
+            setActivePreview({ preview, url })
+            setPreviewTarget(null)
+          }}
+          onDeleted={(id) => {
+            setPreviews((current) => current.filter((item) => item.id !== id))
+            if (activePreview?.preview.id === id) setActivePreview(null)
+          }}
+        />
+      )}
+      {activePreview && (
+        <PreviewPane
+          preview={activePreview.preview}
+          authorizedUrl={activePreview.url}
+          onClose={() => setActivePreview(null)}
+          onStop={() => void stopPreview(activePreview.preview)}
         />
       )}
     </main>

@@ -1,22 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect as websocket_connect
 
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
+from .preview import (
+    PREVIEW_COOKIE_NAME,
+    PreviewHostMiddleware,
+    PreviewManager,
+    preview_id_from_host,
+    preview_public_url,
+    rewrite_frame_ancestors,
+    rewrite_set_cookie,
+    upstream_cookie,
+)
 from .terminal import (
     RESIZE_MESSAGE,
     SNAPSHOT_COMPLETE_MESSAGE,
@@ -35,7 +50,10 @@ admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
 if len(admin_password) < 8:
     raise RuntimeError("ADMIN_PASSWORD must be explicitly set to at least 8 characters")
 users.ensure_user(os.getenv("ADMIN_USERNAME", "admin"), admin_password)
-signer = SessionSigner(load_or_create_secret(DATA_DIR))
+session_secret = load_or_create_secret(DATA_DIR)
+signer = SessionSigner(session_secret)
+preview_signer = SessionSigner(session_secret, max_age=120)
+preview_access_signer = SessionSigner(session_secret, max_age=24 * 60 * 60)
 devices = DeviceStore(DATA_DIR / "agent_server.db")
 
 
@@ -70,6 +88,10 @@ async def lifespan(app: FastAPI):
         ),
     )
     app.state.devices = devices
+    app.state.previews = PreviewManager(
+        idle_timeout=float(os.getenv("PREVIEW_IDLE_TIMEOUT", "1800"))
+    )
+    app.state.previews.start()
     dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
     app.state.frp_monitor = None
     app.state.frp_monitor_task = None
@@ -93,10 +115,17 @@ async def lifespan(app: FastAPI):
     if app.state.frp_monitor_task:
         app.state.frp_monitor_task.cancel()
         await asyncio.gather(app.state.frp_monitor_task, return_exceptions=True)
+    await app.state.previews.close()
     await app.state.terminals.close()
 
 
 app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
+preview_origin = os.getenv("PREVIEW_PUBLIC_ORIGIN", "").strip()
+if preview_origin:
+    preview_hostname = urlsplit(preview_origin).hostname
+    if not preview_hostname:
+        raise RuntimeError("PREVIEW_PUBLIC_ORIGIN must be an http(s) origin")
+    app.add_middleware(PreviewHostMiddleware, base_domain=preview_hostname)
 
 
 class LoginBody(BaseModel):
@@ -113,6 +142,12 @@ class CreateTerminalBody(BaseModel):
     name: str | None = Field(default=None, max_length=80)
     cols: int = Field(default=120, ge=2, le=500)
     rows: int = Field(default=32, ge=1, le=300)
+
+
+class CreatePreviewBody(BaseModel):
+    port: int = Field(ge=1, le=65535)
+    label: str | None = Field(default=None, max_length=80)
+    terminal_id: str | None = Field(default=None, max_length=80)
 
 
 class DeviceCreateBody(BaseModel):
@@ -143,6 +178,10 @@ def current_user(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) 
 
 def terminal_manager(request: Request) -> TerminalManager:
     return request.app.state.terminals
+
+
+def preview_manager(request: Request) -> PreviewManager:
+    return request.app.state.previews
 
 
 @app.get("/api/health")
@@ -270,12 +309,14 @@ async def update_device(
 @app.delete("/api/devices/{device_id}")
 async def delete_device(
     device_id: str,
+    request: Request,
     manager: TerminalManager = Depends(terminal_manager),
     _username: str = Depends(current_user),
 ) -> dict[str, bool]:
     for session in tuple(manager.sessions.values()):
         if session.device_id == device_id:
             await manager.delete(session.id)
+    await request.app.state.previews.delete_for_device(device_id)
     if not await asyncio.to_thread(devices.delete, device_id):
         raise HTTPException(status_code=404, detail="设备不存在")
     return {"ok": True}
@@ -311,7 +352,7 @@ async def probe_device(
     return {"available": available, "error": error}
 
 
-def ssh_command(device: dict[str, object]) -> list[str]:
+def ssh_base_command(device: dict[str, object]) -> list[str]:
     private_key = Path(os.getenv("SSH_PRIVATE_KEY", "")).expanduser()
     if not str(private_key) or not private_key.is_file():
         raise HTTPException(status_code=409, detail="服务器尚未配置 SSH_PRIVATE_KEY")
@@ -323,9 +364,8 @@ def ssh_command(device: dict[str, object]) -> list[str]:
     known_hosts.chmod(0o600)
     strict_mode = os.getenv("SSH_STRICT_HOST_KEY", "accept-new")
     proxy_host = os.getenv("FRP_PROXY_HOST", "127.0.0.1")
-    command = [
+    return [
         os.getenv("SSH_BINARY", "ssh"),
-        "-tt",
         "-p",
         str(device["remote_port"]),
         "-i",
@@ -346,7 +386,31 @@ def ssh_command(device: dict[str, object]) -> list[str]:
         f"UserKnownHostsFile={known_hosts}",
         f"{device['ssh_user']}@{proxy_host}",
     ]
+
+
+def ssh_command(device: dict[str, object]) -> list[str]:
+    command = ssh_base_command(device)
+    command.insert(1, "-tt")
     command.extend(remote_shell_command(str(device.get("remote_shell") or "system")))
+    return command
+
+
+def preview_tunnel_command(
+    device: dict[str, object], target_port: int, local_port: int
+) -> list[str]:
+    command = ssh_base_command(device)
+    # A preview tunnel never allocates a remote shell. It only exposes one
+    # loopback service through the already authenticated device SSH route.
+    command[1:1] = [
+        "-N",
+        "-T",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "LogLevel=ERROR",
+        "-L",
+        f"127.0.0.1:{local_port}:127.0.0.1:{target_port}",
+    ]
     return command
 
 
@@ -402,6 +466,322 @@ async def delete_terminal(
     if not await manager.delete(session_id):
         raise HTTPException(status_code=404, detail="Terminal not found")
     return {"ok": True}
+
+
+def preview_api_payload(preview) -> dict[str, object]:
+    payload = preview.as_dict()
+    payload["url"] = (
+        preview_public_url(preview.id, preview_origin) if preview_origin else None
+    )
+    return payload
+
+
+@app.get("/api/previews")
+async def list_previews(
+    manager: PreviewManager = Depends(preview_manager),
+    _username: str = Depends(current_user),
+) -> list[dict[str, object]]:
+    return [preview_api_payload(item) for item in manager.sessions.values()]
+
+
+@app.post("/api/devices/{device_id}/previews", status_code=201)
+async def create_preview(
+    device_id: str,
+    body: CreatePreviewBody,
+    manager: PreviewManager = Depends(preview_manager),
+    terminal_manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    if not preview_origin:
+        raise HTTPException(
+            status_code=503,
+            detail="服务器尚未配置 PREVIEW_PUBLIC_ORIGIN",
+        )
+    device = await asyncio.to_thread(devices.get, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if not device["frp_online"] or not device["ssh_available"]:
+        raise HTTPException(status_code=409, detail="设备 SSH 当前不可用")
+    if body.terminal_id:
+        terminal = terminal_manager.get(body.terminal_id)
+        if not terminal or terminal.device_id != device_id:
+            raise HTTPException(status_code=422, detail="终端不属于所选设备")
+    try:
+        preview = await manager.create(
+            device_id=device_id,
+            device_name=str(device["name"]),
+            target_port=body.port,
+            label=(body.label or "").strip() or f"localhost:{body.port}",
+            terminal_id=body.terminal_id,
+            tunnel_command=lambda local_port: preview_tunnel_command(
+                device, body.port, local_port
+            ),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"无法建立预览隧道：{exc}") from exc
+    return preview_api_payload(preview)
+
+
+@app.post("/api/previews/{preview_id}/ticket")
+async def create_preview_ticket(
+    preview_id: str,
+    manager: PreviewManager = Depends(preview_manager),
+    username: str = Depends(current_user),
+) -> dict[str, str]:
+    preview = manager.get(preview_id)
+    if not preview:
+        raise HTTPException(status_code=404, detail="预览不存在或已过期")
+    url = preview_public_url(preview.id, preview_origin)
+    ticket = preview_signer.issue(f"ticket:{preview.id}:{username}")
+    return {"url": f"{url}_agentserver/auth?ticket={ticket}"}
+
+
+@app.delete("/api/previews/{preview_id}")
+async def delete_preview(
+    preview_id: str,
+    manager: PreviewManager = Depends(preview_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, bool]:
+    if not await manager.delete(preview_id):
+        raise HTTPException(status_code=404, detail="预览不存在")
+    return {"ok": True}
+
+
+def preview_access_allowed(preview_id: str, token: str | None) -> bool:
+    subject = preview_access_signer.verify(token)
+    return bool(subject and subject.startswith(f"access:{preview_id}:"))
+
+
+def preview_host_allowed(preview_id: str, host: str) -> bool:
+    return bool(
+        preview_origin
+        and preview_id_from_host(host, urlsplit(preview_origin).hostname or "")
+        == preview_id
+    )
+
+
+@app.get("/preview/{preview_id}/_agentserver/auth", include_in_schema=False)
+async def authorize_preview(
+    preview_id: str,
+    ticket: str,
+    request: Request,
+    manager: PreviewManager = Depends(preview_manager),
+) -> RedirectResponse:
+    if not preview_host_allowed(preview_id, request.headers.get("host", "")):
+        raise HTTPException(status_code=404, detail="预览入口不存在")
+    preview = manager.get(preview_id, touch=True)
+    subject = preview_signer.verify(ticket)
+    expected_prefix = f"ticket:{preview_id}:"
+    if not preview or not subject or not subject.startswith(expected_prefix):
+        raise HTTPException(status_code=401, detail="预览访问票据无效或已过期")
+    username = subject[len(expected_prefix) :]
+    response = RedirectResponse(url="/", status_code=302)
+    response.set_cookie(
+        PREVIEW_COOKIE_NAME,
+        preview_access_signer.issue(f"access:{preview_id}:{username}"),
+        max_age=preview_access_signer.max_age,
+        httponly=True,
+        samesite="lax",
+        secure=urlsplit(preview_origin).scheme == "https",
+        path="/",
+    )
+    return response
+
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+@app.api_route(
+    "/preview/{preview_id}/{path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def proxy_preview_http(
+    preview_id: str,
+    path: str,
+    request: Request,
+    manager: PreviewManager = Depends(preview_manager),
+):
+    if not preview_host_allowed(preview_id, request.headers.get("host", "")):
+        raise HTTPException(status_code=404, detail="预览入口不存在")
+    if not preview_access_allowed(
+        preview_id, request.cookies.get(PREVIEW_COOKIE_NAME)
+    ):
+        raise HTTPException(status_code=401, detail="预览未授权或授权已过期")
+    preview = manager.get(preview_id, touch=True)
+    if not preview or not preview.active:
+        raise HTTPException(status_code=404, detail="预览不存在或隧道已关闭")
+    target = f"http://127.0.0.1:{preview.local_port}/{path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+        and key.lower() not in {"host", "cookie", "content-length"}
+    }
+    headers["host"] = f"127.0.0.1:{preview.target_port}"
+    headers["x-forwarded-host"] = request.headers.get("host", "")
+    headers["x-forwarded-proto"] = request.url.scheme
+    if cookie := upstream_cookie(request.headers.get("cookie", "")):
+        headers["cookie"] = cookie
+    local_origin = f"http://127.0.0.1:{preview.target_port}"
+    if "origin" in headers:
+        headers["origin"] = local_origin
+    if "referer" in headers:
+        parsed_referer = urlsplit(headers["referer"])
+        headers["referer"] = parsed_referer._replace(
+            scheme="http", netloc=f"127.0.0.1:{preview.target_port}"
+        ).geturl()
+    client = httpx.AsyncClient(follow_redirects=False, timeout=None, trust_env=False)
+    request_body = await request.body()
+    upstream_request = client.build_request(
+        request.method,
+        target,
+        headers=headers,
+        content=request_body,
+    )
+    try:
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"设备上的 localhost:{preview.target_port} 当前不可访问：{exc}",
+        ) from exc
+    response_headers = []
+    for key, value in upstream.headers.multi_items():
+        lowered = key.lower()
+        if lowered in HOP_BY_HOP_HEADERS or lowered in {
+            "content-length",
+            "x-frame-options",
+        }:
+            continue
+        if lowered == "set-cookie":
+            value = rewrite_set_cookie(value)
+        elif lowered == "content-security-policy":
+            value = rewrite_frame_ancestors(value)
+            if not value:
+                continue
+        response_headers.append((key, value))
+    location = next(
+        (value for key, value in response_headers if key.lower() == "location"), None
+    )
+    if location:
+        parsed_location = urlsplit(location)
+        if parsed_location.hostname in {"127.0.0.1", "localhost", "::1"}:
+            public = urlsplit(preview_public_url(preview.id, preview_origin))
+            rewritten_location = parsed_location._replace(
+                scheme=public.scheme,
+                netloc=public.netloc,
+            ).geturl()
+            response_headers = [
+                (key, rewritten_location if key.lower() == "location" else value)
+                for key, value in response_headers
+            ]
+    response = StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        background=BackgroundTask(_close_preview_response, upstream, client),
+    )
+    response.raw_headers = [
+        (key.encode("latin-1"), value.encode("latin-1"))
+        for key, value in response_headers
+    ]
+    return response
+
+
+async def _close_preview_response(upstream, client) -> None:
+    await upstream.aclose()
+    await client.aclose()
+
+
+@app.websocket("/preview/{preview_id}/{path:path}")
+async def proxy_preview_websocket(
+    websocket: WebSocket, preview_id: str, path: str
+) -> None:
+    if not preview_host_allowed(preview_id, websocket.headers.get("host", "")):
+        await websocket.close(code=4404)
+        return
+    if not preview_access_allowed(
+        preview_id, websocket.cookies.get(PREVIEW_COOKIE_NAME)
+    ):
+        await websocket.close(code=4401)
+        return
+    manager: PreviewManager = websocket.app.state.previews
+    preview = manager.get(preview_id, touch=True)
+    if not preview or not preview.active:
+        await websocket.close(code=4404)
+        return
+    # Keep the URI authority equal to the device's original development port
+    # for Host/Origin checks, while dialing the local SSH-forward socket.
+    target = f"ws://127.0.0.1:{preview.target_port}/{path}"
+    query = websocket.scope.get("query_string", b"").decode("latin-1")
+    if query:
+        target = f"{target}?{query}"
+    protocols = [
+        item.strip()
+        for item in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if item.strip()
+    ]
+    additional_headers = {}
+    if cookie := upstream_cookie(websocket.headers.get("cookie", "")):
+        additional_headers["cookie"] = cookie
+    if authorization := websocket.headers.get("authorization"):
+        additional_headers["authorization"] = authorization
+    try:
+        async with websocket_connect(
+            target,
+            origin=f"http://127.0.0.1:{preview.target_port}",
+            subprotocols=protocols or None,
+            additional_headers=additional_headers or None,
+            compression=None,
+            proxy=None,
+            host="127.0.0.1",
+            port=preview.local_port,
+        ) as upstream:
+            await websocket.accept(subprotocol=upstream.subprotocol)
+
+            async def browser_to_upstream() -> None:
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        return
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            async def upstream_to_browser() -> None:
+                async for message in upstream:
+                    manager.get(preview_id, touch=True)
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            tasks = {
+                asyncio.create_task(browser_to_upstream()),
+                asyncio.create_task(upstream_to_browser()),
+            }
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
+    except Exception:
+        with contextlib.suppress(RuntimeError):
+            await websocket.close(code=1011)
 
 
 @app.websocket("/ws/terminal/{session_id}")

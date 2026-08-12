@@ -41,6 +41,20 @@ export type DeviceInput = Pick<Device, 'name' | 'proxy_name' | 'remote_port' | '
   id?: string
 }
 
+export type Preview = {
+  id: string
+  device_id: string
+  device_name: string
+  terminal_id: string | null
+  target_port: number
+  label: string
+  created_at: number
+  last_access_at: number
+  active: boolean
+  error: string
+  url: string | null
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -101,4 +115,14 @@ export const api = {
     }),
   deleteTerminal: (id: string) =>
     request<{ ok: boolean }>(`/api/terminals/${id}`, { method: 'DELETE' }),
+  previews: () => request<Preview[]>('/api/previews'),
+  createPreview: (deviceId: string, port: number, label?: string, terminalId?: string) =>
+    request<Preview>(`/api/devices/${deviceId}/previews`, {
+      method: 'POST',
+      body: JSON.stringify({ port, label: label || null, terminal_id: terminalId || null }),
+    }),
+  previewTicket: (id: string) =>
+    request<{ url: string }>(`/api/previews/${id}/ticket`, { method: 'POST' }),
+  deletePreview: (id: string) =>
+    request<{ ok: boolean }>(`/api/previews/${id}`, { method: 'DELETE' }),
 }
