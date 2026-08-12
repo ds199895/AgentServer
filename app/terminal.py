@@ -1,0 +1,771 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import fcntl
+import os
+import pty
+import re
+import signal
+import shlex
+import shutil
+import sqlite3
+import stat
+import struct
+import subprocess
+import termios
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+RESIZE_MESSAGE = re.compile(r"^\x01\[(\d+),(\d+)\]$")
+SNAPSHOT_COMPLETE_MESSAGE = "\x01[snapshot-complete]"
+REMOTE_SHELL_COMMANDS = {
+    "system": [],
+    "powershell": ["powershell.exe", "-NoLogo", "-NoExit"],
+    "cmd": ["cmd.exe", "/Q"],
+}
+
+
+def remote_shell_command(remote_shell: str) -> list[str]:
+    """Return the SSH remote command for a validated device shell choice."""
+    return list(REMOTE_SHELL_COMMANDS.get(remote_shell, ()))
+
+
+@dataclass(eq=False)
+class TerminalSession:
+    id: str
+    name: str
+    pid: int
+    fd: int
+    command: str
+    cwd: str
+    kind: str = "local"
+    device_id: str | None = None
+    device_name: str | None = None
+    remote_port: int | None = None
+    tmux_name: str | None = None
+    created_at: float = field(default_factory=time.time)
+    exited_at: float | None = None
+    return_code: int | None = None
+    chunks: deque[bytes] = field(default_factory=deque)
+    buffer_size: int = 0
+    subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
+    pending_input: bytearray = field(default_factory=bytearray)
+
+    @property
+    def active(self) -> bool:
+        return self.exited_at is None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "command": self.command,
+            "cwd": self.cwd,
+            "kind": self.kind,
+            "device_id": self.device_id,
+            "device_name": self.device_name,
+            "remote_port": self.remote_port,
+            "created_at": self.created_at,
+            "active": self.active,
+            "return_code": self.return_code,
+        }
+
+
+class TerminalStore:
+    """Persist the stable identity of tmux-backed terminal sessions."""
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS terminal_sessions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    device_id TEXT,
+                    device_name TEXT,
+                    remote_port INTEGER,
+                    tmux_name TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def list(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM terminal_sessions ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save(self, session: TerminalSession) -> None:
+        if not session.tmux_name:
+            raise ValueError("A persistent terminal must have a tmux session name")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO terminal_sessions(
+                    id, name, command, cwd, kind, device_id, device_name,
+                    remote_port, tmux_name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.id,
+                    session.name,
+                    session.command,
+                    session.cwd,
+                    session.kind,
+                    session.device_id,
+                    session.device_name,
+                    session.remote_port,
+                    session.tmux_name,
+                    session.created_at,
+                ),
+            )
+
+    def delete(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM terminal_sessions WHERE id = ?", (session_id,))
+
+
+class TerminalManager:
+    def __init__(
+        self,
+        command: str,
+        cwd: str,
+        shell: str | None = None,
+        proxy: str | None = None,
+        scrollback_bytes: int = 2 * 1024 * 1024,
+        backend: str = "direct",
+        database_path: Path | None = None,
+        tmux_binary: str = "tmux",
+        tmux_socket: Path | None = None,
+    ) -> None:
+        self.command = command
+        self.cwd = str(Path(cwd).expanduser().resolve())
+        self.shell = shell or os.getenv("SHELL") or "/bin/sh"
+        self.proxy = proxy
+        self.scrollback_bytes = max(scrollback_bytes, 64 * 1024)
+        if backend not in {"direct", "tmux"}:
+            raise ValueError("TERMINAL_BACKEND must be 'direct' or 'tmux'")
+        self.backend = backend
+        self.tmux_binary = tmux_binary
+        self.tmux_socket = tmux_socket
+        self.store: TerminalStore | None = None
+        self.sessions: dict[str, TerminalSession] = {}
+        self.loop = asyncio.get_running_loop()
+        if self.backend == "tmux":
+            if not shutil.which(self.tmux_binary):
+                raise RuntimeError(f"tmux executable not found: {self.tmux_binary}")
+            if database_path is None or tmux_socket is None:
+                raise ValueError("tmux backend requires database_path and tmux_socket")
+            self.tmux_socket = Path(tmux_socket).expanduser().resolve()
+            self.store = TerminalStore(Path(database_path).expanduser().resolve())
+            self._restore_tmux_sessions()
+
+    def list(self) -> list[dict[str, object]]:
+        if self.backend == "tmux":
+            for session in tuple(self.sessions.values()):
+                if session.active:
+                    self._refresh_tmux_state(session)
+        sessions = sorted(self.sessions.values(), key=lambda item: item.created_at)
+        return [session.as_dict() for session in sessions]
+
+    def get(self, session_id: str) -> TerminalSession | None:
+        session = self.sessions.get(session_id)
+        if session and self.backend == "tmux":
+            if session.active:
+                self._refresh_tmux_state(session)
+            if (
+                session.active
+                and session.fd < 0
+                and self._tmux_session_exists(session.tmux_name or "")
+            ):
+                self._spawn_tmux_client(session)
+        return session
+
+    def create(self, name: str | None = None, cols: int = 120, rows: int = 32) -> TerminalSession:
+        if not Path(self.cwd).is_dir():
+            raise ValueError(f"TERMINAL_CWD does not exist: {self.cwd}")
+        if not Path(self.shell).is_file() or not os.access(self.shell, os.X_OK):
+            raise ValueError(f"TERMINAL_SHELL is not executable: {self.shell}")
+
+        if self.backend == "tmux":
+            return self._create_tmux_session(
+                name=name or "Terminal",
+                command=shlex.join([self.shell, "-l"]),
+                cols=cols,
+                rows=rows,
+                initial_input=self.command.strip() or None,
+            )
+
+        session_id = uuid.uuid4().hex
+        display_name = (name or "Terminal").strip()[:80] or "Terminal"
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(self.cwd)
+                environment = os.environ.copy()
+                environment.setdefault("TERM", "xterm-256color")
+                environment.setdefault("COLORTERM", "truecolor")
+                if self.proxy:
+                    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                        environment[key] = self.proxy
+                environment["SHELL"] = self.shell
+                login_argv0 = f"-{Path(self.shell).name}"
+                os.execvpe(self.shell, [login_argv0], environment)
+            except BaseException as exc:
+                os.write(2, f"Unable to start terminal: {exc}\r\n".encode())
+                os._exit(127)
+
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        session = TerminalSession(
+            id=session_id,
+            name=display_name,
+            pid=pid,
+            fd=fd,
+            command=self.command,
+            cwd=self.cwd,
+        )
+        self.sessions[session_id] = session
+        self.resize(session_id, cols, rows)
+        self.loop.add_reader(fd, self._read_ready, session_id)
+        if self.command.strip():
+            initial_input = f"{self.command}\r".encode("utf-8")
+            self.loop.call_later(0.05, self.write, session_id, initial_input)
+        return session
+
+    def create_process(
+        self,
+        *,
+        name: str,
+        argv: list[str],
+        cols: int = 120,
+        rows: int = 32,
+        device_id: str | None = None,
+        device_name: str | None = None,
+        remote_port: int | None = None,
+    ) -> TerminalSession:
+        if not argv:
+            raise ValueError("Process command is empty")
+        executable = shutil.which(argv[0])
+        if not executable:
+            raise ValueError(f"Executable not found: {argv[0]}")
+        if not Path(self.cwd).is_dir():
+            raise ValueError(f"TERMINAL_CWD does not exist: {self.cwd}")
+
+        if self.backend == "tmux":
+            return self._create_tmux_session(
+                name=name,
+                command=shlex.join([executable, *argv[1:]]),
+                cols=cols,
+                rows=rows,
+                kind="ssh",
+                device_id=device_id,
+                device_name=device_name,
+                remote_port=remote_port,
+            )
+
+        session_id = uuid.uuid4().hex
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(self.cwd)
+                environment = os.environ.copy()
+                environment.setdefault("TERM", "xterm-256color")
+                environment.setdefault("COLORTERM", "truecolor")
+                os.execvpe(executable, [executable, *argv[1:]], environment)
+            except BaseException as exc:
+                os.write(2, f"Unable to start process: {exc}\r\n".encode())
+                os._exit(127)
+
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        session = TerminalSession(
+            id=session_id,
+            name=name.strip()[:80] or "SSH Terminal",
+            pid=pid,
+            fd=fd,
+            command=shlex.join(argv),
+            cwd=self.cwd,
+            kind="ssh",
+            device_id=device_id,
+            device_name=device_name,
+            remote_port=remote_port,
+        )
+        self.sessions[session_id] = session
+        self.resize(session_id, cols, rows)
+        self.loop.add_reader(fd, self._read_ready, session_id)
+        return session
+
+    def _tmux_command(self, *arguments: str) -> list[str]:
+        if self.tmux_socket is None:
+            raise RuntimeError("tmux socket is not configured")
+        return [self.tmux_binary, "-S", str(self.tmux_socket), *arguments]
+
+    def _tmux_run(
+        self, *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            self._tmux_command(*arguments), capture_output=True, text=True
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(detail or f"tmux command failed: {arguments[0]}")
+        return result
+
+    def _tmux_session_exists(self, tmux_name: str) -> bool:
+        if not tmux_name:
+            return False
+        result = self._tmux_run("has-session", "-t", tmux_name, check=False)
+        return result.returncode == 0
+
+    def _configure_tmux_server(self) -> None:
+        if self.tmux_socket is None:
+            return
+        self.tmux_socket.parent.mkdir(parents=True, exist_ok=True)
+        self.tmux_socket.parent.chmod(0o700)
+        if self.tmux_socket.exists():
+            mode = self.tmux_socket.stat().st_mode
+            if not stat.S_ISSOCK(mode):
+                raise RuntimeError(f"TMUX_SOCKET is not a Unix socket: {self.tmux_socket}")
+        result = self._tmux_run(
+            "set-option", "-s", "exit-empty", "off", check=False
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or "Persistent tmux server is unavailable; start agentserver-tmux.service"
+            )
+        # The production service account intentionally uses /usr/sbin/nologin.
+        # tmux otherwise uses that passwd shell to wrap every pane command,
+        # causing newly created sessions to exit immediately.
+        self._tmux_run("set-option", "-g", "default-shell", self.shell)
+        # Keep tmux's mouse capture off: the xterm.js frontend handles
+        # drag-to-select and wheel scrolling natively, and tmux mouse mode
+        # would steal drags into copy-mode and clear them on mouseup.
+        self._tmux_run("set-option", "-g", "mouse", "off")
+        # This is a dedicated tmux server whose clients are xterm.js panes.
+        # Keep those outer clients on the normal screen so xterm.js can retain
+        # scrollback; programs inside tmux may still use tmux's alternate screen.
+        self._tmux_run(
+            "set-option",
+            "-s",
+            "-g",
+            "terminal-overrides",
+            "xterm-256color:smcup@:rmcup@",
+        )
+        if self.proxy:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                self._tmux_run("set-environment", "-g", key, self.proxy)
+
+    def _capture_tmux_history(self, tmux_name: str) -> bytes:
+        result = self._tmux_run(
+            "capture-pane", "-ep", "-S", "-10000", "-t", tmux_name, check=False
+        )
+        if result.returncode != 0 or not result.stdout:
+            return b""
+        return result.stdout.replace("\r\n", "\n").replace("\n", "\r\n").encode()
+
+    def _restore_tmux_sessions(self) -> None:
+        if self.store is None:
+            return
+        self._configure_tmux_server()
+        for record in self.store.list():
+            session = TerminalSession(
+                id=str(record["id"]),
+                name=str(record["name"]),
+                pid=-1,
+                fd=-1,
+                command=str(record["command"]),
+                cwd=str(record["cwd"]),
+                kind=str(record["kind"]),
+                device_id=record["device_id"] and str(record["device_id"]),
+                device_name=record["device_name"] and str(record["device_name"]),
+                remote_port=(
+                    int(record["remote_port"])
+                    if record["remote_port"] is not None
+                    else None
+                ),
+                tmux_name=str(record["tmux_name"]),
+                created_at=float(record["created_at"]),
+            )
+            if self._tmux_session_exists(session.tmux_name):
+                history = self._capture_tmux_history(session.tmux_name)
+                if history:
+                    self._append(session, history)
+                self.sessions[session.id] = session
+                self._refresh_tmux_state(session)
+                if session.active:
+                    self._spawn_tmux_client(session)
+            else:
+                session.exited_at = time.time()
+                session.return_code = -1
+                self._append(
+                    session,
+                    b"\r\n\x1b[90m[tmux session unavailable after host restart]\x1b[0m\r\n",
+                )
+                self.sessions[session.id] = session
+
+    def _create_tmux_session(
+        self,
+        *,
+        name: str,
+        command: str,
+        cols: int,
+        rows: int,
+        initial_input: str | None = None,
+        kind: str = "local",
+        device_id: str | None = None,
+        device_name: str | None = None,
+        remote_port: int | None = None,
+    ) -> TerminalSession:
+        if self.store is None:
+            raise RuntimeError("Persistent terminal store is not configured")
+        session_id = uuid.uuid4().hex
+        tmux_name = f"agentserver-{session_id}"
+        cols = min(max(cols, 2), 500)
+        rows = min(max(rows, 1), 300)
+        self._tmux_run(
+            "new-session",
+            "-d",
+            "-s",
+            tmux_name,
+            "-x",
+            str(cols),
+            "-y",
+            str(rows),
+            "-c",
+            self.cwd,
+            command,
+        )
+        try:
+            self._tmux_run("set-option", "-t", tmux_name, "status", "off")
+            self._tmux_run(
+                "set-option", "-w", "-t", tmux_name, "remain-on-exit", "on"
+            )
+            self._tmux_run(
+                "set-option", "-w", "-t", tmux_name, "history-limit", "10000"
+            )
+            session = TerminalSession(
+                id=session_id,
+                name=name.strip()[:80] or ("SSH Terminal" if kind == "ssh" else "Terminal"),
+                pid=-1,
+                fd=-1,
+                command=self.command if kind == "local" else command,
+                cwd=self.cwd,
+                kind=kind,
+                device_id=device_id,
+                device_name=device_name,
+                remote_port=remote_port,
+                tmux_name=tmux_name,
+            )
+            self.store.save(session)
+        except BaseException:
+            self._tmux_run("kill-session", "-t", tmux_name, check=False)
+            raise
+        self.sessions[session.id] = session
+        self._spawn_tmux_client(session)
+        if initial_input:
+            self._tmux_run("send-keys", "-t", tmux_name, "-l", initial_input)
+            self._tmux_run("send-keys", "-t", tmux_name, "Enter")
+        return session
+
+    def _spawn_tmux_client(self, session: TerminalSession) -> None:
+        if session.fd >= 0 or not session.tmux_name:
+            return
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(session.cwd if Path(session.cwd).is_dir() else self.cwd)
+                environment = os.environ.copy()
+                environment.setdefault("TERM", "xterm-256color")
+                environment.setdefault("COLORTERM", "truecolor")
+                environment.pop("TMUX", None)
+                argv = self._tmux_command("attach-session", "-t", session.tmux_name)
+                os.execvpe(argv[0], argv, environment)
+            except BaseException as exc:
+                os.write(2, f"Unable to attach tmux session: {exc}\r\n".encode())
+                os._exit(127)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        session.pid = pid
+        session.fd = fd
+        self.loop.add_reader(fd, self._read_ready, session.id)
+
+    def _refresh_tmux_state(self, session: TerminalSession) -> None:
+        if not session.tmux_name or not self._tmux_session_exists(session.tmux_name):
+            session.exited_at = session.exited_at or time.time()
+            session.return_code = session.return_code if session.return_code is not None else -1
+            return
+        result = self._tmux_run(
+            "display-message",
+            "-p",
+            "-t",
+            session.tmux_name,
+            "#{pane_dead}:#{pane_dead_status}",
+            check=False,
+        )
+        fields = result.stdout.strip().split(":", 1)
+        if result.returncode == 0 and fields[0] == "1":
+            session.exited_at = session.exited_at or time.time()
+            try:
+                session.return_code = int(fields[1])
+            except (IndexError, ValueError):
+                session.return_code = None
+        elif result.returncode == 0:
+            session.exited_at = None
+            session.return_code = None
+
+    def _close_client(self, session: TerminalSession) -> None:
+        if session.fd >= 0:
+            self.loop.remove_reader(session.fd)
+            self.loop.remove_writer(session.fd)
+            try:
+                os.close(session.fd)
+            except OSError:
+                pass
+        if session.pid > 0:
+            self._signal_session(session.pid, signal.SIGTERM)
+            try:
+                os.waitpid(session.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+        session.fd = -1
+        session.pid = -1
+        session.pending_input.clear()
+
+    def _read_ready(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if not session or not session.active:
+            return
+        try:
+            chunk = os.read(session.fd, 65_536)
+            if chunk:
+                self._append(session, chunk)
+                self._broadcast(session, chunk)
+                return
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            if exc.errno != errno.EIO:
+                self._append(session, f"\r\n[terminal read error: {exc}]\r\n".encode())
+        self._mark_exited(session)
+
+    def _append(self, session: TerminalSession, chunk: bytes) -> None:
+        session.chunks.append(chunk)
+        session.buffer_size += len(chunk)
+        while session.buffer_size > self.scrollback_bytes and session.chunks:
+            removed = session.chunks.popleft()
+            session.buffer_size -= len(removed)
+
+    def _broadcast(self, session: TerminalSession, chunk: bytes) -> None:
+        for queue in tuple(session.subscribers):
+            try:
+                queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(chunk)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
+
+    def _mark_exited(self, session: TerminalSession) -> None:
+        if self.backend == "tmux":
+            self._close_client(session)
+            self._refresh_tmux_state(session)
+            return
+        if not session.active:
+            return
+        self.loop.remove_reader(session.fd)
+        self.loop.remove_writer(session.fd)
+        try:
+            os.close(session.fd)
+        except OSError:
+            pass
+        try:
+            waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
+            session.return_code = os.waitstatus_to_exitcode(status) if waited_pid else None
+        except ChildProcessError:
+            session.return_code = None
+        session.exited_at = time.time()
+        marker = b"\r\n\x1b[90m[process exited]\x1b[0m\r\n"
+        self._append(session, marker)
+        self._broadcast(session, marker)
+        if session.return_code is None:
+            self.loop.call_later(0.05, self._reap_child, session, 0)
+
+    def _reap_child(self, session: TerminalSession, attempt: int) -> None:
+        if session.return_code is not None:
+            return
+        try:
+            waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited_pid:
+            session.return_code = os.waitstatus_to_exitcode(status)
+        elif attempt < 20:
+            self.loop.call_later(0.05, self._reap_child, session, attempt + 1)
+
+    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes]]:
+        session = self.sessions[session_id]
+        if self.backend == "tmux" and session.active and session.fd < 0:
+            self._spawn_tmux_client(session)
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
+        session.subscribers.add(queue)
+        return b"".join(session.chunks), queue
+
+    def detach(self, session_id: str, queue: asyncio.Queue[bytes]) -> None:
+        session = self.sessions.get(session_id)
+        if session:
+            session.subscribers.discard(queue)
+
+    def write(self, session_id: str, data: bytes) -> None:
+        session = self.sessions.get(session_id)
+        if not session or not session.active or not data:
+            return
+        session.pending_input.extend(data)
+        self._flush_input(session_id)
+
+    def _flush_input(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if not session or not session.active:
+            return
+        while session.pending_input:
+            try:
+                written = os.write(session.fd, session.pending_input)
+                if written == 0:
+                    break
+                del session.pending_input[:written]
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    self.loop.add_writer(session.fd, self._flush_input, session_id)
+                    return
+                if exc.errno == errno.EIO:
+                    session.pending_input.clear()
+                    return
+                raise
+        self.loop.remove_writer(session.fd)
+
+    def resize(self, session_id: str, cols: int, rows: int) -> None:
+        session = self.sessions.get(session_id)
+        if not session or not session.active or session.fd < 0:
+            return
+        cols = min(max(cols, 2), 500)
+        rows = min(max(rows, 1), 300)
+        size = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(session.fd, termios.TIOCSWINSZ, size)
+        try:
+            foreground_pgid = os.tcgetpgrp(session.fd)
+            os.killpg(foreground_pgid, signal.SIGWINCH)
+        except (OSError, ProcessLookupError):
+            pass
+
+    def _session_pids(self, leader_pid: int) -> list[int]:
+        try:
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return [leader_pid]
+
+        children: dict[int, list[int]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            try:
+                process_pid, parent_pid = map(int, fields)
+            except ValueError:
+                continue
+            children.setdefault(parent_pid, []).append(process_pid)
+
+        pids = [leader_pid]
+        index = 0
+        while index < len(pids):
+            pids.extend(children.get(pids[index], ()))
+            index += 1
+        return pids
+
+    def _signal_session(self, leader_pid: int, sig: signal.Signals) -> None:
+        pids = self._session_pids(leader_pid)
+        pids.sort(key=lambda pid: pid == leader_pid)
+        for process_pid in pids:
+            try:
+                os.kill(process_pid, sig)
+            except ProcessLookupError:
+                pass
+
+    async def delete(self, session_id: str) -> bool:
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        if self.backend == "tmux":
+            self._close_client(session)
+            if session.tmux_name:
+                self._tmux_run("kill-session", "-t", session.tmux_name, check=False)
+            if self.store:
+                self.store.delete(session_id)
+            session.exited_at = time.time()
+            session.subscribers.clear()
+            self.sessions.pop(session_id, None)
+            return True
+        if session.active:
+            startup_grace = 0.5 - (time.time() - session.created_at)
+            if startup_grace > 0:
+                await asyncio.sleep(startup_grace)
+            self._signal_session(session.pid, signal.SIGTERM)
+            for _ in range(10):
+                try:
+                    waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
+                except ChildProcessError:
+                    waited_pid = session.pid
+                    status = 0
+                if waited_pid:
+                    session.return_code = os.waitstatus_to_exitcode(status)
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                try:
+                    self._signal_session(session.pid, signal.SIGKILL)
+                    os.waitpid(session.pid, 0)
+                except (ProcessLookupError, ChildProcessError):
+                    pass
+                session.return_code = -signal.SIGKILL
+            self.loop.remove_reader(session.fd)
+            self.loop.remove_writer(session.fd)
+            try:
+                os.close(session.fd)
+            except OSError:
+                pass
+            session.exited_at = time.time()
+        session.subscribers.clear()
+        self.sessions.pop(session_id, None)
+        return True
+
+    async def close(self) -> None:
+        if self.backend == "tmux":
+            for session in tuple(self.sessions.values()):
+                self._close_client(session)
+                session.subscribers.clear()
+            return
+        for session_id in tuple(self.sessions):
+            await self.delete(session_id)

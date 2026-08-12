@@ -1,0 +1,23 @@
+[Unit]
+Description=Persistent tmux server for AgentServer terminals
+After=local-fs.target
+
+[Service]
+Type=simple
+User=agentserver
+Group=agentserver
+Environment=HOME=/var/lib/agentserver
+WorkingDirectory=/var/lib/agentserver
+ExecStart=/usr/bin/tmux -S /var/lib/agentserver/tmux/agentserver.sock -D
+ExecStartPost=/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do [ -S /var/lib/agentserver/tmux/agentserver.sock ] && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agentserver
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

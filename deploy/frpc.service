@@ -1,0 +1,18 @@
+[Unit]
+Description=FRP SSH tunnel client
+After=network-online.target ssh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/frp/device.env
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/frp
+
+[Install]
+WantedBy=multi-user.target

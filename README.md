@@ -1,1 +1,243 @@
 # AgentServer
+
+AgentServer 是一个集中式 FRP 设备管理与 Web SSH 终端。每台受管设备只需运行 SSH
+Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测、登录鉴权和浏览器终端都
+运行在 frps 所在服务器。
+
+项目同时保留原有的本地 PTY 模式，方便在单机上运行 Codex 或普通 Shell。生产集中部署
+可以通过 `ENABLE_LOCAL_TERMINALS=0` 禁用本地 PTY。
+
+## 功能
+
+- 从 frps Dashboard 自动发现 TCP 代理，并持久保存设备记录。
+- 分别展示“FRP 隧道在线”和“SSH 服务可用”，避免把端口在线误判成终端可用。
+- 保存最后在线时间、frpc 版本、代理名称、远端端口和检测错误。
+- 手动注册、编辑、检测和删除设备。
+- 可为每台设备选择系统默认、PowerShell 或 CMD 作为 SSH 登录后的远程 Shell。
+- 通过服务器系统 SSH 客户端建立 PTY，再经 WebSocket 连接 xterm.js。
+- SSH 使用密钥、`BatchMode`、Keepalive 和独立 `known_hosts`，首次连接默认 TOFU 固定主机密钥。
+- PBKDF2 密码、HttpOnly 签名 Cookie，并要求显式配置初始管理员密码。
+- 支持多个并行 SSH/本地终端和断线后输出回放。
+- 生产环境使用独立 tmux 服务托管终端，并在 SQLite 保存会话元数据；部署重启后原标签可自动恢复。
+- 提供 systemd 服务、frpc/frps 示例和服务器安装脚本。
+
+## Roadmap
+
+### 已完成
+
+- 集中管理 FRP 设备，自动同步在线状态并检测 SSH 可用性。
+- 在浏览器中创建、切换和恢复多个 SSH/本地终端，支持断线重连与历史输出回放。
+- 使用独立 tmux 服务持久托管终端任务，Web 服务更新不会终止正在运行的任务。
+- 提供像素风房间 Canvas，将设备和终端会话映射为可交互的小人，并可从场景直接跳转终端。
+- 提供设备端一键安装脚本、登录鉴权、HTTPS 部署支持，以及桌面端和移动端基础适配。
+
+### TODO
+
+1. 添加终端 Agent 识别，自动区分 Codex、Kimi、Claude 等编码 Agent 和普通 Shell。
+2. 丰富 Agent 状态模型，统一管理任务进度、等待输入、提示、异常和告警，并提供聚合视图。
+3. 适配思考、编码、读取、等待、报错、完成等多状态动画，让场景更有游戏性和真实感。
+4. 建立 Tool、Agent 状态/行为与场景物件的交互映射，例如读取文件时从书柜取书、搜索时查看地图、执行命令时操作工作台。
+
+### 有趣的延伸
+
+- 增加 Agent 事件时间线、任务回放和关键节点快照，方便复盘长任务与定位异常。
+- 展示多 Agent 协作关系，让委派、并行执行、交接和结果汇总在房间中可视化。
+- 支持自定义房间、工位、角色外观和场景主题，使不同设备与项目拥有独立空间。
+- 加入任务里程碑、成就、连续稳定运行和空间成长等轻量游戏机制。
+- 提供插件式场景行为 API，让新的 Agent、Tool 和自动化工作流可以自行注册状态与动画。
+
+## 架构
+
+```text
+Device A: sshd + frpc ─┐
+Device B: sshd + frpc ─┼──> frps ──> AgentServer ──> Browser/xterm.js
+Device C: sshd + frpc ─┘       │           │
+                               │           └── SQLite device history
+                               └── local-only Dashboard API
+```
+
+FRP 只负责 TCP 传输。每台设备仍需启用 OpenSSH Server，并将 AgentServer 的 SSH 公钥
+加入目标账户的 `authorized_keys`。
+
+## 目录
+
+```text
+app/auth.py                 用户、密码与 Cookie 签名
+app/devices.py              设备库、FRP 同步和 SSH Banner 探测
+app/terminal.py             本地/SSH PTY 生命周期与 WebSocket 广播
+app/main.py                 FastAPI API、生命周期和 SSH 启动参数
+frontend/                   React、TypeScript、Tailwind CSS、shadcn/ui、xterm.js 源码
+web_dist/                   已构建的生产前端，服务器无需 Node.js
+deploy/                     systemd 与生产环境示例
+frpc.example.toml           每台设备的 SSH 穿透模板
+frps.example.toml           frps 安全配置模板
+scripts/install_server.sh   Ubuntu 服务器安装脚本
+```
+
+生产环境中的终端分为两层：`agentserver-tmux.service` 持有真正的 shell、SSH 和 Codex
+进程，`agentserver.service` 只负责 WebSocket attach。更新代码并重启 Web 服务只会断开
+短暂的浏览器连接，不会终止 tmux 中的任务；浏览器重连后会使用 SQLite 中保存的终端 ID
+恢复原标签与滚动历史。显式点击关闭终端时，才会删除数据库记录并执行
+`tmux kill-session`。
+
+## 本地开发
+
+需要 Python 3.10+ 和 Node.js 20.19+。
+
+```bash
+cp .env.example .env
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+npm --prefix frontend install
+npm --prefix frontend run build
+bash scripts/start.sh
+```
+
+复制 `.env.example` 后必须设置至少 8 位的 `ADMIN_PASSWORD`，再启动服务。默认访问地址为
+`http://127.0.0.1:18088`，初始管理员用户名默认为 `admin`。
+
+## 集中服务器部署
+
+推荐安装路径 `/opt/agentserver`，状态目录 `/var/lib/agentserver`，配置目录
+`/etc/agentserver`。
+
+```bash
+git clone https://github.com/ds199895/AgentServer.git /opt/agentserver
+cd /opt/agentserver
+bash scripts/install_server.sh
+```
+
+可以先自动生成生产配置和随机初始密码，再运行安装脚本：
+
+```bash
+bash scripts/configure_server.sh
+bash scripts/install_server.sh
+```
+
+初始登录信息只写入服务器的 `/root/agentserver-initial-credentials.txt`（权限 `0600`）。
+也可以跳过自动配置，让安装脚本生成环境模板，再手动填写所有 `CHANGE_ME`。
+
+生产服务监听 `0.0.0.0:18100`。云安全组放行 18100 后可直接访问：
+
+```text
+http://101.43.103.46:18100
+```
+
+直接 HTTP 不会加密登录凭据或终端数据。正式使用应配置 HTTPS；在 HTTPS 完成前，也可以
+不开放公网端口并使用 SSH 隧道：
+
+```bash
+ssh -L 18100:127.0.0.1:18100 root@101.43.103.46
+```
+
+然后打开 `http://127.0.0.1:18100`。如需公网访问，应在前方增加 HTTPS 反向代理、MFA
+和访问来源限制，不要直接开放明文 HTTP。
+
+安装脚本会生成：
+
+```text
+/var/lib/agentserver/ssh/id_ed25519
+/var/lib/agentserver/ssh/id_ed25519.pub
+/var/lib/agentserver/ssh/known_hosts
+/var/lib/agentserver/tmux/agentserver.sock
+```
+
+安装脚本会安装 tmux，并启用两个服务：
+
+```bash
+systemctl status agentserver-tmux.service
+systemctl status agentserver.service
+```
+
+日常部署只需重启 `agentserver.service`，不要重启 `agentserver-tmux.service`。宿主机完整
+重启后 tmux 进程无法继续存在；此时保存的标签会显示为已退出，而不是伪装成仍在运行。
+
+把 `.pub` 内容加入每台设备目标 SSH 用户的 `~/.ssh/authorized_keys`。
+
+## 设备端 frpc
+
+登录管理平台后打开“安装客户端”页面，填写唯一设备 ID、远端端口和 SSH 用户，即可下载：
+
+- Linux/macOS Shell 自动安装器；
+- Windows PowerShell 自动安装器；
+- 手动 frpc 配置模板；
+- AgentServer SSH 公钥。
+
+安装器会识别操作系统和 CPU 架构、验证官方 SHA-256、配置 SSH 授权密钥并注册开机服务。
+FRP token 在运行时隐藏输入，不包含在网页或下载文件中。
+如果设备已经运行其他 frpc，使用 `--merge-existing /path/to/frpc.toml`。安装器会备份
+原配置、保留现有 token 与 proxy、追加 SSH proxy、校验完整配置，并把原进程迁移为
+systemd/launchd 常驻服务。旧版 frpc 会原子升级到 0.69.0 并保留二进制备份，继续保持
+每台设备只有一个 frpc。脚本也能识别并修复上一次创建但启动失败的 systemd 单元。
+Shell 安装器支持 `--dry-run`：无需 root，只执行平台识别、下载、SHA-256 校验、配置生成
+和 `frpc verify`，不会修改系统或重启已有服务。
+
+将 `frpc.example.toml` 安装为 `/etc/frp/frpc.toml`，将 FRP token 放在权限为 `0600`
+的 `/etc/frp/token`，并创建：
+
+```dotenv
+DEVICE_ID=device-001
+FRP_SSH_REMOTE_PORT=20001
+```
+
+保存为 `/etc/frp/device.env`。然后安装 `deploy/frpc.service`：
+
+```bash
+install -m 0644 deploy/frpc.service /etc/systemd/system/frpc.service
+systemctl daemon-reload
+systemctl enable --now frpc
+```
+
+每台设备必须使用唯一 `DEVICE_ID` 和唯一 `FRP_SSH_REMOTE_PORT`。代理最终名称为
+`{DEVICE_ID}.ssh`，例如 `device-001.ssh`。
+
+macOS 需要启用“系统设置 → 通用 → 共享 → 远程登录”；Windows 需要启用 OpenSSH
+Server；Linux 通常使用 `sshd`。
+
+## 关键环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `ENVIRONMENT` | 生产部署设为 `production` |
+| `DATA_DIR` | SQLite、会话密钥和运行数据目录 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 首次创建管理账户 |
+| `FRPS_DASHBOARD_URL` | frps Dashboard，例如 `http://127.0.0.1:7500` |
+| `FRPS_DASHBOARD_USER/PASSWORD` | Dashboard Basic Auth |
+| `FRPS_SYNC_INTERVAL` | 状态同步周期，默认 15 秒 |
+| `FRPS_AUTO_DISCOVER` | 是否自动保存未知 TCP 代理 |
+| `FRP_PROXY_HOST` | AgentServer 访问代理端口的主机，通常是 `127.0.0.1` |
+| `SSH_PRIVATE_KEY` | 用于登录设备的私钥 |
+| `SSH_KNOWN_HOSTS` | 独立主机密钥库 |
+| `SSH_STRICT_HOST_KEY` | 默认 `accept-new`；完成首次固定后可改为 `yes` |
+| `ENABLE_LOCAL_TERMINALS` | 集中部署建议设为 `0` |
+| `TERMINAL_BACKEND` | `tmux` 可跨 AgentServer 部署保存进程；`direct` 为开发兼容模式 |
+| `TMUX_SOCKET` | 独立 tmux 服务的 socket，生产默认 `/var/lib/agentserver/tmux/agentserver.sock` |
+| `COOKIE_SECURE` | HTTPS 部署设为 `1` |
+
+## API
+
+- `GET /api/health`
+- `GET/POST /api/devices`
+- `PUT/DELETE /api/devices/{id}`
+- `POST /api/devices/sync`
+- `POST /api/devices/{id}/probe`
+- `POST /api/devices/{id}/terminals`
+- `GET/POST /api/terminals`
+- `DELETE /api/terminals/{id}`
+- `WS /ws/terminal/{id}`
+- `GET /downloads/install-frpc-ssh.sh`
+- `GET /downloads/install-frpc-ssh.ps1`
+- `GET /downloads/frpc.example.toml`
+- `GET /downloads/agentserver-ssh-key.pub`
+
+除健康检查与登录外，设备、下载、终端和 WebSocket 接口都要求有效登录 Cookie。
+
+## 验证
+
+```bash
+python -m unittest discover -s tests -v
+npm --prefix frontend run build
+bash -n scripts/*.sh
+```
+
+真实配置、token、数据库、日志、PID、SSH 密钥和前端依赖均被 `.gitignore` 排除。

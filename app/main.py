@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import sqlite3
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketDisconnect
+
+from .auth import SessionSigner, UserStore, load_or_create_secret
+from .devices import DeviceStore, FrpMonitor, probe_ssh
+from .terminal import (
+    RESIZE_MESSAGE,
+    SNAPSHOT_COMPLETE_MESSAGE,
+    TerminalManager,
+    remote_shell_command,
+)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data")).expanduser()
+COOKIE_NAME = "agentserver_session"
+
+users = UserStore(DATA_DIR / "agent_server.db")
+admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+if len(admin_password) < 8:
+    raise RuntimeError("ADMIN_PASSWORD must be explicitly set to at least 8 characters")
+users.ensure_user(os.getenv("ADMIN_USERNAME", "admin"), admin_password)
+signer = SessionSigner(load_or_create_secret(DATA_DIR))
+devices = DeviceStore(DATA_DIR / "agent_server.db")
+
+
+DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
+DOWNLOAD_FILES = {
+    "install-frpc-ssh.sh": (ROOT / "scripts" / "install_frpc_ssh.sh", "text/x-shellscript"),
+    "install-frpc-ssh.ps1": (ROOT / "scripts" / "install_frpc_ssh.ps1", "text/plain"),
+    "frpc.example.toml": (ROOT / "frpc.example.toml", "application/toml"),
+    "agentserver-ssh-key.pub": (
+        ROOT / "deploy" / "agentserver_ssh_key.pub",
+        "text/plain",
+    ),
+}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.terminals = TerminalManager(
+        command=os.getenv("TERMINAL_CMD", "codex"),
+        cwd=os.getenv("TERMINAL_CWD", str(ROOT)),
+        shell=os.getenv("TERMINAL_SHELL") or None,
+        proxy=os.getenv("TERMINAL_PROXY") or None,
+        scrollback_bytes=int(os.getenv("TERMINAL_SCROLLBACK_BYTES", str(2 * 1024 * 1024))),
+        backend=os.getenv(
+            "TERMINAL_BACKEND",
+            "tmux" if os.getenv("ENVIRONMENT") == "production" else "direct",
+        ),
+        database_path=DATA_DIR / "agent_server.db",
+        tmux_binary=os.getenv("TMUX_BINARY", "tmux"),
+        tmux_socket=Path(
+            os.getenv("TMUX_SOCKET", str(DATA_DIR / "tmux" / "agentserver.sock"))
+        ),
+    )
+    app.state.devices = devices
+    dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
+    app.state.frp_monitor = None
+    app.state.frp_monitor_task = None
+    if dashboard_url:
+        monitor = FrpMonitor(
+            devices,
+            dashboard_url,
+            os.getenv("FRPS_DASHBOARD_USER", ""),
+            os.getenv("FRPS_DASHBOARD_PASSWORD", ""),
+            interval=float(os.getenv("FRPS_SYNC_INTERVAL", "15")),
+            proxy_host=os.getenv("FRP_PROXY_HOST", "127.0.0.1"),
+            auto_discover=os.getenv("FRPS_AUTO_DISCOVER", "1") == "1",
+        )
+        app.state.frp_monitor = monitor
+        try:
+            await monitor.sync_once()
+        except Exception:
+            pass
+        app.state.frp_monitor_task = asyncio.create_task(monitor.run())
+    yield
+    if app.state.frp_monitor_task:
+        app.state.frp_monitor_task.cancel()
+        await asyncio.gather(app.state.frp_monitor_task, return_exceptions=True)
+    await app.state.terminals.close()
+
+
+app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
+
+
+class LoginBody(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class PasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=8, max_length=1024)
+
+
+class CreateTerminalBody(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
+    cols: int = Field(default=120, ge=2, le=500)
+    rows: int = Field(default=32, ge=1, le=300)
+
+
+class DeviceCreateBody(BaseModel):
+    id: str | None = Field(default=None, min_length=2, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    proxy_name: str = Field(min_length=1, max_length=160)
+    remote_port: int = Field(ge=1, le=65535)
+    ssh_user: str = Field(default="root", min_length=1, max_length=80)
+    remote_shell: Literal["system", "powershell", "cmd"] = "system"
+    notes: str = Field(default="", max_length=1000)
+
+
+class DeviceUpdateBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    proxy_name: str | None = Field(default=None, min_length=1, max_length=160)
+    remote_port: int | None = Field(default=None, ge=1, le=65535)
+    ssh_user: str | None = Field(default=None, min_length=1, max_length=80)
+    remote_shell: Literal["system", "powershell", "cmd"] | None = None
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+def current_user(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> str:
+    username = signer.verify(session)
+    if not username:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return username
+
+
+def terminal_manager(request: Request) -> TerminalManager:
+    return request.app.state.terminals
+
+
+@app.get("/api/health")
+async def health(request: Request) -> dict[str, object]:
+    monitor: FrpMonitor | None = request.app.state.frp_monitor
+    return {
+        "status": "ok",
+        "frp": monitor.status() if monitor else {"configured": False},
+    }
+
+
+@app.post("/api/auth/login")
+async def login(body: LoginBody, response: Response) -> dict[str, str]:
+    if not users.authenticate(body.username, body.password):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    response.set_cookie(
+        COOKIE_NAME,
+        signer.issue(body.username),
+        max_age=signer.max_age,
+        httponly=True,
+        samesite="lax",
+        secure=os.getenv("COOKIE_SECURE", "0") == "1",
+        path="/",
+    )
+    return {"username": body.username}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response) -> dict[str, bool]:
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def me(username: str = Depends(current_user)) -> dict[str, str]:
+    return {"username": username}
+
+
+@app.post("/api/auth/password")
+async def change_password(
+    body: PasswordBody, username: str = Depends(current_user)
+) -> dict[str, bool]:
+    if not users.authenticate(username, body.current_password):
+        raise HTTPException(status_code=400, detail="当前密码错误")
+    users.update_password(username, body.new_password)
+    return {"ok": True}
+
+
+@app.get("/downloads/{filename}", include_in_schema=False)
+async def download_client_file(
+    filename: str,
+    _username: str = Depends(current_user),
+) -> FileResponse:
+    download = DOWNLOAD_FILES.get(filename)
+    if not download or not download[0].is_file():
+        raise HTTPException(status_code=404, detail="下载文件不存在")
+    path, media_type = download
+    return FileResponse(path, filename=filename, media_type=media_type)
+
+
+@app.get("/api/terminals")
+async def list_terminals(
+    manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> list[dict[str, object]]:
+    return manager.list()
+
+
+@app.get("/api/devices")
+async def list_devices(
+    _username: str = Depends(current_user),
+) -> list[dict[str, object]]:
+    return await asyncio.to_thread(devices.list)
+
+
+@app.post("/api/devices", status_code=201)
+async def create_device(
+    body: DeviceCreateBody,
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    device_id = body.id or re.sub(r"[^A-Za-z0-9_.-]+", "-", body.name).strip("-.")
+    if not device_id or not DEVICE_ID.fullmatch(device_id):
+        raise HTTPException(
+            status_code=422,
+            detail="设备 ID 需为 2-64 位字母、数字、点、下划线或连字符",
+        )
+    try:
+        return await asyncio.to_thread(
+            devices.create,
+            device_id=device_id,
+            name=body.name.strip(),
+            proxy_name=body.proxy_name.strip(),
+            remote_port=body.remote_port,
+            ssh_user=body.ssh_user.strip(),
+            remote_shell=body.remote_shell,
+            notes=body.notes.strip(),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail="设备 ID、代理名称或远端端口已存在"
+        ) from exc
+
+
+@app.put("/api/devices/{device_id}")
+async def update_device(
+    device_id: str,
+    body: DeviceUpdateBody,
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    values = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in body.model_dump(exclude_none=True).items()
+    }
+    try:
+        result = await asyncio.to_thread(devices.update, device_id, values)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail="代理名称或远端端口已被其他设备使用"
+        ) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    return result
+
+
+@app.delete("/api/devices/{device_id}")
+async def delete_device(
+    device_id: str,
+    manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, bool]:
+    for session in tuple(manager.sessions.values()):
+        if session.device_id == device_id:
+            await manager.delete(session.id)
+    if not await asyncio.to_thread(devices.delete, device_id):
+        raise HTTPException(status_code=404, detail="设备不存在")
+    return {"ok": True}
+
+
+@app.post("/api/devices/sync")
+async def sync_devices(
+    request: Request,
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    monitor: FrpMonitor | None = request.app.state.frp_monitor
+    if not monitor:
+        raise HTTPException(status_code=409, detail="尚未配置 FRP Dashboard")
+    try:
+        return await monitor.sync_once()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"FRP 同步失败：{exc}") from exc
+
+
+@app.post("/api/devices/{device_id}/probe")
+async def probe_device(
+    device_id: str,
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    device = await asyncio.to_thread(devices.get, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    host = os.getenv("FRP_PROXY_HOST", "127.0.0.1")
+    available, error = await asyncio.to_thread(
+        probe_ssh, host, int(device["remote_port"])
+    )
+    await asyncio.to_thread(devices.update_probe, device_id, available, error)
+    return {"available": available, "error": error}
+
+
+def ssh_command(device: dict[str, object]) -> list[str]:
+    private_key = Path(os.getenv("SSH_PRIVATE_KEY", "")).expanduser()
+    if not str(private_key) or not private_key.is_file():
+        raise HTTPException(status_code=409, detail="服务器尚未配置 SSH_PRIVATE_KEY")
+    known_hosts = Path(
+        os.getenv("SSH_KNOWN_HOSTS", str(DATA_DIR / "ssh_known_hosts"))
+    ).expanduser()
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    known_hosts.touch(mode=0o600, exist_ok=True)
+    known_hosts.chmod(0o600)
+    strict_mode = os.getenv("SSH_STRICT_HOST_KEY", "accept-new")
+    proxy_host = os.getenv("FRP_PROXY_HOST", "127.0.0.1")
+    command = [
+        os.getenv("SSH_BINARY", "ssh"),
+        "-tt",
+        "-p",
+        str(device["remote_port"]),
+        "-i",
+        str(private_key),
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        f"StrictHostKeyChecking={strict_mode}",
+        "-o",
+        f"UserKnownHostsFile={known_hosts}",
+        f"{device['ssh_user']}@{proxy_host}",
+    ]
+    command.extend(remote_shell_command(str(device.get("remote_shell") or "system")))
+    return command
+
+
+@app.post("/api/devices/{device_id}/terminals", status_code=201)
+async def create_device_terminal(
+    device_id: str,
+    body: CreateTerminalBody,
+    manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    device = await asyncio.to_thread(devices.get, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if not device["frp_online"]:
+        raise HTTPException(status_code=409, detail="设备 FRP 隧道当前离线")
+    if not device["ssh_available"]:
+        raise HTTPException(status_code=409, detail="设备 SSH 服务当前不可用")
+    try:
+        session = manager.create_process(
+            name=body.name or str(device["name"]),
+            argv=ssh_command(device),
+            cols=body.cols,
+            rows=body.rows,
+            device_id=device_id,
+            device_name=str(device["name"]),
+            remote_port=int(device["remote_port"]),
+        )
+        return session.as_dict()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/terminals", status_code=201)
+async def create_terminal(
+    body: CreateTerminalBody,
+    manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, object]:
+    if os.getenv("ENABLE_LOCAL_TERMINALS", "1") != "1":
+        raise HTTPException(status_code=403, detail="服务器已禁用本地终端")
+    try:
+        return manager.create(body.name, body.cols, body.rows).as_dict()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/terminals/{session_id}")
+async def delete_terminal(
+    session_id: str,
+    manager: TerminalManager = Depends(terminal_manager),
+    _username: str = Depends(current_user),
+) -> dict[str, bool]:
+    if not await manager.delete(session_id):
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    return {"ok": True}
+
+
+@app.websocket("/ws/terminal/{session_id}")
+async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
+    username = signer.verify(websocket.cookies.get(COOKIE_NAME))
+    if not username:
+        await websocket.close(code=4401)
+        return
+
+    manager: TerminalManager = websocket.app.state.terminals
+    if not manager.get(session_id):
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    snapshot, queue = manager.attach(session_id)
+    if snapshot:
+        await websocket.send_bytes(snapshot)
+    # xterm may answer control-sequence queries while parsing a scrollback replay.
+    # Tell the browser exactly where the replay ends so those generated replies
+    # are not mistaken for fresh keyboard input and written back to the PTY.
+    await websocket.send_text(SNAPSHOT_COMPLETE_MESSAGE)
+
+    async def send_output() -> None:
+        while True:
+            await websocket.send_bytes(await queue.get())
+
+    async def receive_input() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            if data := message.get("bytes"):
+                manager.write(session_id, data)
+            elif (text := message.get("text")) is not None:
+                resize = RESIZE_MESSAGE.fullmatch(text)
+                if resize:
+                    manager.resize(session_id, int(resize.group(1)), int(resize.group(2)))
+                else:
+                    manager.write(session_id, text.encode("utf-8"))
+
+    sender = asyncio.create_task(send_output())
+    receiver = asyncio.create_task(receive_input())
+    try:
+        done, pending = await asyncio.wait(
+            {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+    finally:
+        manager.detach(session_id, queue)
+
+
+FRONTEND_DIST = Path(os.getenv("WEB_DIST", ROOT / "web_dist")).expanduser()
+if not FRONTEND_DIST.is_dir():
+    FRONTEND_DIST = ROOT / "frontend" / "dist"
+if FRONTEND_DIST.is_dir():
+    assets = FRONTEND_DIST / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def frontend(path: str) -> FileResponse:
+        requested = (FRONTEND_DIST / path).resolve()
+        if path and requested.is_file() and FRONTEND_DIST in requested.parents:
+            return FileResponse(requested)
+        return FileResponse(FRONTEND_DIST / "index.html")

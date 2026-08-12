@@ -1,0 +1,26 @@
+# Copy to /etc/frp/frpc.toml on each device.
+# DEVICE_ID and FRP_SSH_REMOTE_PORT should be injected by the service environment.
+clientID = "{{ .Envs.DEVICE_ID }}"
+user = "{{ .Envs.DEVICE_ID }}"
+serverAddr = "101.43.103.46"
+serverPort = 7000
+loginFailExit = false
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+
+transport.tls.enable = true
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = {{ .Envs.FRP_SSH_REMOTE_PORT }}
+
+[proxies.annotations]
+device_id = "{{ .Envs.DEVICE_ID }}"
+ssh_user = "root"
+service = "ssh"
