@@ -50,8 +50,8 @@ def remote_shell_command(remote_shell: str) -> list[str]:
     return list(REMOTE_SHELL_COMMANDS.get(remote_shell, ()))
 
 
-def service_label(line: str, port: int) -> str:
-    """Infer a concise product label without trusting terminal escape output."""
+def service_product(line: str) -> str | None:
+    """Infer a known development-server product from one sanitized line."""
     lowered = line.lower()
     products = (
         ("storybook", "Storybook"),
@@ -69,7 +69,12 @@ def service_label(line: str, port: int) -> str:
     for marker, label in products:
         if marker in lowered:
             return label
-    return f"Web 服务 :{port}"
+    return None
+
+
+def service_label(line: str, port: int) -> str:
+    """Infer a concise product label without trusting terminal escape output."""
+    return service_product(line) or f"Web 服务 :{port}"
 
 
 @dataclass(eq=False)
@@ -119,6 +124,7 @@ class TerminalSession:
     pending_input: bytearray = field(default_factory=bytearray)
     services: dict[int, DetectedService] = field(default_factory=dict)
     discovery_tail: str = ""
+    discovery_label_hint: str = ""
 
     @property
     def active(self) -> bool:
@@ -659,6 +665,9 @@ class TerminalManager:
     @staticmethod
     def _discover_services_in_line(session: TerminalSession, line: str) -> None:
         now = time.time()
+        product = service_product(line)
+        if product:
+            session.discovery_label_hint = product
         candidates: dict[int, str] = {}
         for match in LOCAL_SERVICE_URL.finditer(line):
             scheme = match.group("url").split(":", 1)[0].lower()
@@ -671,12 +680,13 @@ class TerminalManager:
             if 1 <= port <= 65535:
                 candidates.setdefault(port, f"http://localhost:{port}/")
         for port, url in candidates.items():
+            label = product or session.discovery_label_hint or f"Web 服务 :{port}"
             existing = session.services.get(port)
             if existing:
                 existing.url = url
                 existing.last_seen_at = now
                 if existing.label.startswith("Web 服务"):
-                    existing.label = service_label(line, port)
+                    existing.label = label
                 if existing.status == "offline":
                     existing.status = "checking"
                     existing.failure_count = 0
@@ -685,7 +695,7 @@ class TerminalManager:
             session.services[port] = DetectedService(
                 port=port,
                 url=url,
-                label=service_label(line, port),
+                label=label,
                 detected_at=now,
                 last_seen_at=now,
             )

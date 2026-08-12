@@ -84,7 +84,7 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             argv=[
                 "/bin/sh",
                 "-c",
-                "printf '\\033[32mVITE ready Local: http://localhost:5173/app\\033[0m\\n'; sleep 30",
+                "printf '\\033[32mVITE ready\\033[0m\\nLocal: http://localhost:5173/app\\n'; sleep 30",
             ],
             device_id="device-001",
             device_name="Device 001",

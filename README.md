@@ -30,6 +30,7 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 - 使用独立 tmux 服务持久托管终端任务，Web 服务更新不会终止正在运行的任务。
 - 提供像素风房间 Canvas，将设备和终端会话映射为可交互的小人，并可从场景直接跳转终端。
 - 通过 SSH 临时隧道和隔离子域名预览设备本地开发服务，支持 HTTP、WebSocket 与 HMR。
+- 自动从终端输出识别 Vite、Next.js、Storybook 等本地 Web 服务，主动探活并提供一键预览；服务停止后自动关闭关联预览隧道。
 - 提供设备端一键安装脚本、登录鉴权、HTTPS 部署支持，以及桌面端和移动端基础适配。
 
 ### TODO
@@ -201,6 +202,12 @@ AgentServer 可以通过设备现有的 SSH 入口建立临时本地转发，预
 `127.0.0.1` 上的 Vite、Next.js、Storybook 等开发服务。登录后可从设备列表或终端设备组
 点击“预览”，手动填写端口；预览面板支持刷新、响应式宽度、全屏、新窗口打开和停止隧道。
 
+终端启动开发服务并输出 `http://localhost:<port>`、`http://127.0.0.1:<port>` 或明确的
+`listening/running/ready ... port <port>` 提示后，AgentServer 会自动识别端口，并通过设备
+现有 SSH 入口主动检查它是否为可访问的 HTTP(S) 服务。终端右下角会显示“正在检查 / 运行中 /
+已停止”，运行中时可一键打开预览。相同终端和端口会复用已有预览；连续探测失败后，关联
+预览会自动关闭。手动填写端口的入口仍然保留，供未输出标准地址的服务使用。
+
 为保持根路径资源、前端路由和 HMR WebSocket 兼容，同时隔离不受信任的开发页面，生产
 环境必须使用独立泛域名，例如：
 
@@ -237,6 +244,10 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 | `COOKIE_SECURE` | HTTPS 部署设为 `1` |
 | `PREVIEW_PUBLIC_ORIGIN` | 预览泛域名基础 Origin，生产为 `https://preview.metakroma.com` |
 | `PREVIEW_IDLE_TIMEOUT` | 预览无访问后的自动回收秒数，默认 1800 |
+| `SERVICE_PROBE_INTERVAL` | 自动发现服务的探活间隔秒数，默认 10，最小 2 |
+| `SERVICE_PROBE_TIMEOUT` | 单次 SSH/HTTP 探活最长秒数，默认 6 |
+| `SERVICE_PROBE_FAILURES` | 连续失败多少次后标记停止并回收预览，默认 2 |
+| `SERVICE_PROBE_CONCURRENCY` | 同时执行的服务探活数，默认 3 |
 
 ## API
 
