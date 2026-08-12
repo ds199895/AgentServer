@@ -5,6 +5,7 @@ import { api, type Device, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
+import { Eyebrow } from '@/components/Eyebrow'
 import { Login } from '@/components/Login'
 import { PasswordDialog } from '@/components/PasswordDialog'
 import { TerminalEmpty } from '@/components/TerminalEmpty'
@@ -12,6 +13,8 @@ import { TerminalRoomOverview } from '@/components/TerminalRoomOverview'
 import { TerminalTabsBar } from '@/components/TerminalTabsBar'
 import { Topbar, type MainPage } from '@/components/Topbar'
 import TerminalPane from '@/TerminalPane'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
@@ -62,6 +65,7 @@ export default function App() {
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [cloningId, setCloningId] = useState<string | null>(null)
+  const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
   const [error, setError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
@@ -151,8 +155,10 @@ export default function App() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法克隆终端') }
     finally { setCloningId(null) }
   }
-  const closeTerminal = async (session: TerminalSession) => {
-    if (!window.confirm(`关闭 ${session.name} (${session.id.slice(0, 8)})？`)) return
+  const closeTerminal = async () => {
+    const session = closeTarget
+    if (!session) return
+    setCloseTarget(null)
     await api.deleteTerminal(session.id)
     const remaining = sessions.filter((item) => item.id !== session.id)
     setSessions(remaining)
@@ -198,7 +204,7 @@ export default function App() {
             activeId={activeId}
             cloningId={cloningId}
             onSelect={(id) => showTerminal(id)}
-            onClose={(session) => void closeTerminal(session)}
+            onClose={setCloseTarget}
             onClone={(source) => void cloneTerminal(source)}
           />
         )}
@@ -258,6 +264,23 @@ export default function App() {
         </button>
       )}
       {showPassword && <PasswordDialog onClose={() => setShowPassword(false)} />}
+      {closeTarget && (
+        <Dialog open onOpenChange={(open) => { if (!open) setCloseTarget(null) }}>
+          <DialogContent className="sm:max-w-[410px]">
+            <DialogHeader>
+              <Eyebrow>TERMINAL</Eyebrow>
+              <DialogTitle>关闭终端</DialogTitle>
+              <DialogDescription>
+                关闭 {closeTarget.name} ({closeTarget.id.slice(0, 8)})？后台会话将被终止，未保存的输出会丢失。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setCloseTarget(null)}>取消</Button>
+              <Button variant="destructive" onClick={() => void closeTerminal()}>关闭终端</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
       {deviceDialog && (
         <DeviceDialog
           device={deviceDialog === 'new' ? undefined : deviceDialog}
