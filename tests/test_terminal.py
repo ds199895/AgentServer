@@ -92,11 +92,36 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.wait_for_output(session.id, b"localhost:5173")
 
+        self.assertEqual([], session.as_dict()["services"])
+        service = session.services[5173]
+        self.manager.update_service_status(session.id, 5173, online=True)
         services = session.as_dict()["services"]
         self.assertEqual(1, len(services))
         self.assertEqual(5173, services[0]["port"])
         self.assertEqual("Vite", services[0]["label"])
-        self.assertEqual("checking", services[0]["status"])
+        self.assertEqual("online", services[0]["status"])
+        self.assertEqual("online", service.status)
+
+    async def test_ignores_local_urls_without_service_context(self) -> None:
+        session = TerminalSession(
+            id="quiet-discovery",
+            name="Remote device",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._append(
+            session,
+            b"curl http://localhost:3000/api\n"
+            b"documentation: http://127.0.0.1:8080/\n"
+            b"server configuration value: 9000\n",
+        )
+        self.assertEqual({}, session.services)
 
     async def test_ignores_public_urls_and_tracks_service_lifecycle(self) -> None:
         session = TerminalSession(
@@ -134,14 +159,40 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("offline", service.status)
         self.assertTrue(became_offline)
         self.assertNotIn(service, [item for _session, item in self.manager.service_candidates()])
+        self.assertEqual([], session.as_dict()["services"])
 
         session.exited_at = None
         try:
+            self.manager._append(session, b"Server ready at http://127.0.0.1:3000/\n")
+            self.assertEqual("offline", service.status)
+            self.assertNotIn(service, [item for _session, item in self.manager.service_candidates()])
+
+            service.retry_after = 0
             self.manager._append(session, b"Server ready at http://127.0.0.1:3000/\n")
             self.assertEqual("checking", service.status)
             self.assertIn(service, [item for _session, item in self.manager.service_candidates()])
         finally:
             session.exited_at = 0
+
+    async def test_caps_unverified_service_candidates(self) -> None:
+        session = TerminalSession(
+            id="candidate-cap",
+            name="Remote device",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        for port in range(4100, 4112):
+            self.manager._append(
+                session, f"Local: http://localhost:{port}/\n".encode()
+            )
+        self.assertEqual(8, len(session.services))
+        self.assertEqual([], session.as_dict()["services"])
 
     async def test_multiple_clients_receive_the_same_live_output(self) -> None:
         session = self.manager.create("Shared")
