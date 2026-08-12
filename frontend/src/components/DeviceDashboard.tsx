@@ -43,9 +43,9 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
   ]
   return (
     <section className="flex min-h-full flex-col bg-[#090d12] bg-[radial-gradient(circle_at_90%_0,#15302655,transparent_30%)] px-[clamp(18px,4vw,58px)] pt-5 pb-[34px] max-md:px-3 max-md:pt-6 max-md:pb-[50px]">
-      <div className="mb-3.5 flex items-center justify-end gap-6 max-md:flex-col max-md:items-stretch">
-        <div className="flex gap-2 max-md:grid max-md:grid-cols-2">
-          <div role="group" aria-label="设备展示方式" className="flex h-8 rounded-[9px] border border-[#293641] bg-[#0d141a] p-[3px] max-md:col-span-full">
+      <div className="mb-3.5 flex items-center justify-end gap-6">
+        <div className="flex gap-2">
+          <div role="group" aria-label="设备展示方式" className="flex h-8 rounded-[9px] border border-[#293641] bg-[#0d141a] p-[3px]">
             {(['world', 'list'] as const).map((option) => (
               <button
                 key={option}
