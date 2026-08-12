@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.terminal import TerminalManager, TerminalSession, TerminalStore, remote_shell_command
+from app.terminal import (
+    TerminalManager,
+    TerminalSession,
+    TerminalStore,
+    remote_shell_command,
+)
 
 
 class RemoteShellCommandTests(unittest.TestCase):
@@ -72,6 +77,65 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ssh", session.kind)
         self.assertEqual("device-001", session.device_id)
         self.assertEqual(20001, session.remote_port)
+
+    async def test_detects_local_web_services_from_terminal_output(self) -> None:
+        session = self.manager.create_process(
+            name="Remote device",
+            argv=[
+                "/bin/sh",
+                "-c",
+                "printf '\\033[32mVITE ready Local: http://localhost:5173/app\\033[0m\\n'; sleep 30",
+            ],
+            device_id="device-001",
+            device_name="Device 001",
+            remote_port=20001,
+        )
+        await self.wait_for_output(session.id, b"localhost:5173")
+
+        services = session.as_dict()["services"]
+        self.assertEqual(1, len(services))
+        self.assertEqual(5173, services[0]["port"])
+        self.assertEqual("Vite", services[0]["label"])
+        self.assertEqual("checking", services[0]["status"])
+
+    async def test_ignores_public_urls_and_tracks_service_lifecycle(self) -> None:
+        session = TerminalSession(
+            id="service-session",
+            name="Remote device",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._append(
+            session,
+            b"docs https://example.com:443 then Server running on 0.0.0.0:3000\\n"
+            b"Serving HTTP on 0.0.0.0 port 8000\\n",
+        )
+        self.assertEqual([3000, 8000], list(session.services))
+
+        service, became_offline = self.manager.update_service_status(
+            session.id, 3000, online=True
+        )
+        self.assertEqual("online", service.status)
+        self.assertFalse(became_offline)
+        _, became_offline = self.manager.update_service_status(
+            session.id, 3000, online=False, error="refused", failure_threshold=2
+        )
+        self.assertEqual("online", service.status)
+        self.assertFalse(became_offline)
+        _, became_offline = self.manager.update_service_status(
+            session.id, 3000, online=False, error="refused", failure_threshold=2
+        )
+        self.assertEqual("offline", service.status)
+        self.assertTrue(became_offline)
+
+        self.manager._append(session, b"Server ready at http://127.0.0.1:3000/\\n")
+        self.assertEqual("checking", service.status)
 
     async def test_multiple_clients_receive_the_same_live_output(self) -> None:
         session = self.manager.create("Shared")

@@ -122,6 +122,14 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
                     >
                       <SessionSprite session={session} pose={sessionIndex === 0 ? 'sit' : 'stand'} />
                       <code className="font-mono text-[8px] max-md:hidden">{session.id.slice(0, 6)}</code>
+                      {session.services.some((service) => service.status === 'online') && (
+                        <i
+                          aria-label={`${session.services.filter((service) => service.status === 'online').length} 个开发服务运行中`}
+                          className="grid min-w-3.5 place-items-center rounded-full bg-primary px-1 font-mono text-[7px] font-bold not-italic text-[#07120d]"
+                        >
+                          {session.services.filter((service) => service.status === 'online').length}
+                        </i>
+                      )}
                     </button>
                     <button
                       aria-label={`关闭 ${group.name} 终端 ${session.id.slice(0, 8)}`}

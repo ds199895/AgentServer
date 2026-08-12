@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
-import { api, type Device, type Preview, type TerminalSession } from '@/api'
+import { api, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
@@ -71,15 +71,23 @@ export default function App() {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [cloningId, setCloningId] = useState<string | null>(null)
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
+  const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
   const [error, setError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
+  const activePreviewRef = useRef<{ preview: Preview; url: string } | null>(null)
 
   const load = useCallback(async () => {
     const [nextDevices, nextSessions, nextPreviews] = await Promise.all([api.devices(), api.terminals(), api.previews()])
     setDevices(nextDevices)
     setSessions(nextSessions)
     setPreviews(nextPreviews)
+    const currentPreview = activePreviewRef.current
+    if (currentPreview && !nextPreviews.some((item) => item.id === currentPreview.preview.id)) {
+      activePreviewRef.current = null
+      setActivePreview(null)
+      setError('开发服务已停止，关联预览隧道已自动关闭')
+    }
     const route = routeFromLocation()
     const routedSession = route.terminalId ? nextSessions.find((item) => item.id === route.terminalId) : undefined
     const rememberedSession = nextSessions.find((item) => item.id === lastTerminalIdRef.current)
@@ -103,6 +111,10 @@ export default function App() {
       setMissingTerminalId(null)
     }
   }, [])
+
+  useEffect(() => {
+    activePreviewRef.current = activePreview
+  }, [activePreview])
 
   useEffect(() => { api.me().then(({ username: name }) => { setUsername(name); return load() }).catch(() => setUsername(null)) }, [load])
   useEffect(() => {
@@ -180,13 +192,35 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setActivePreview(null) }
+  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); activePreviewRef.current = null; setActivePreview(null) }
   const stopPreview = async (preview: Preview) => {
     try {
       await api.deletePreview(preview.id)
       setPreviews((current) => current.filter((item) => item.id !== preview.id))
-      if (activePreview?.preview.id === preview.id) setActivePreview(null)
+      if (activePreview?.preview.id === preview.id) { activePreviewRef.current = null; setActivePreview(null) }
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法关闭预览') }
+  }
+  const openDetectedService = async (session: TerminalSession, service: DetectedService) => {
+    if (!session.device_id || service.status !== 'online') return
+    setPreviewBusy({ terminalId: session.id, port: service.port })
+    setError('')
+    try {
+      const preview = await api.createPreview(
+        session.device_id,
+        service.port,
+        service.label,
+        session.id,
+      )
+      const { url } = await api.previewTicket(preview.id)
+      setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
+      activePreviewRef.current = { preview, url }
+      setActivePreview({ preview, url })
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法打开检测到的开发服务')
+      await load().catch(() => undefined)
+    } finally {
+      setPreviewBusy(null)
+    }
   }
 
   if (username === undefined) {
@@ -229,7 +263,13 @@ export default function App() {
               !(page === 'terminals' && activeSession) && 'invisible pointer-events-none',
             )}>
               {sessions.map((session) => (
-                <TerminalPane key={session.id} sessionId={session.id} visible={page === 'terminals' && session.id === activeId} />
+                  <TerminalPane
+                    key={session.id}
+                    session={session}
+                    visible={page === 'terminals' && session.id === activeId}
+                    previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
+                    onPreviewService={(service) => void openDetectedService(session, service)}
+                  />
               ))}
             </div>
           )}
@@ -313,12 +353,13 @@ export default function App() {
           onClose={() => setPreviewTarget(null)}
           onCreated={(preview, url) => {
             setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
+            activePreviewRef.current = { preview, url }
             setActivePreview({ preview, url })
             setPreviewTarget(null)
           }}
           onDeleted={(id) => {
             setPreviews((current) => current.filter((item) => item.id !== id))
-            if (activePreview?.preview.id === id) setActivePreview(null)
+            if (activePreview?.preview.id === id) { activePreviewRef.current = null; setActivePreview(null) }
           }}
         />
       )}

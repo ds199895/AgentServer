@@ -10,6 +10,18 @@ export type TerminalSession = {
   device_id: string | null
   device_name: string | null
   remote_port: number | null
+  services: DetectedService[]
+}
+
+export type DetectedService = {
+  port: number
+  url: string
+  label: string
+  status: 'checking' | 'online' | 'offline'
+  detected_at: number
+  last_seen_at: number
+  last_checked_at: number | null
+  error: string
 }
 
 export type Device = {
@@ -55,6 +67,17 @@ export type Preview = {
   url: string | null
 }
 
+type TerminalSessionPayload = Omit<TerminalSession, 'services'> & {
+  services?: DetectedService[] | null
+}
+
+function normalizeTerminalSession(session: TerminalSessionPayload): TerminalSession {
+  return {
+    ...session,
+    services: Array.isArray(session.services) ? session.services : [],
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -92,7 +115,10 @@ export const api = {
         new_password: newPassword,
       }),
     }),
-  terminals: () => request<TerminalSession[]>('/api/terminals'),
+  terminals: async () => {
+    const sessions = await request<TerminalSessionPayload[]>('/api/terminals')
+    return sessions.map(normalizeTerminalSession)
+  },
   devices: () => request<Device[]>('/api/devices'),
   createDevice: (input: DeviceInput) =>
     request<Device>('/api/devices', { method: 'POST', body: JSON.stringify(input) }),
@@ -103,16 +129,20 @@ export const api = {
   syncDevices: () => request<{ last_sync_at: number }>('/api/devices/sync', { method: 'POST' }),
   probeDevice: (id: string) =>
     request<{ available: boolean; error: string }>(`/api/devices/${id}/probe`, { method: 'POST' }),
-  createDeviceTerminal: (id: string, name?: string) =>
-    request<TerminalSession>(`/api/devices/${id}/terminals`, {
+  createDeviceTerminal: async (id: string, name?: string) => {
+    const session = await request<TerminalSessionPayload>(`/api/devices/${id}/terminals`, {
       method: 'POST',
       body: JSON.stringify({ name: name || null }),
-    }),
-  createTerminal: (name?: string) =>
-    request<TerminalSession>('/api/terminals', {
+    })
+    return normalizeTerminalSession(session)
+  },
+  createTerminal: async (name?: string) => {
+    const session = await request<TerminalSessionPayload>('/api/terminals', {
       method: 'POST',
       body: JSON.stringify({ name: name || null }),
-    }),
+    })
+    return normalizeTerminalSession(session)
+  },
   deleteTerminal: (id: string) =>
     request<{ ok: boolean }>(`/api/terminals/${id}`, { method: 'DELETE' }),
   previews: () => request<Preview[]>('/api/previews'),

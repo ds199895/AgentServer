@@ -5,6 +5,7 @@ import contextlib
 import os
 import re
 import sqlite3
+import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -92,6 +93,7 @@ async def lifespan(app: FastAPI):
         idle_timeout=float(os.getenv("PREVIEW_IDLE_TIMEOUT", "1800"))
     )
     app.state.previews.start()
+    app.state.service_monitor_task = asyncio.create_task(service_monitor_loop(app))
     dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
     app.state.frp_monitor = None
     app.state.frp_monitor_task = None
@@ -115,6 +117,8 @@ async def lifespan(app: FastAPI):
     if app.state.frp_monitor_task:
         app.state.frp_monitor_task.cancel()
         await asyncio.gather(app.state.frp_monitor_task, return_exceptions=True)
+    app.state.service_monitor_task.cancel()
+    await asyncio.gather(app.state.service_monitor_task, return_exceptions=True)
     await app.state.previews.close()
     await app.state.terminals.close()
 
@@ -414,6 +418,95 @@ def preview_tunnel_command(
     return command
 
 
+def reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+async def probe_device_service(
+    device: dict[str, object], target_port: int, scheme: str
+) -> tuple[bool, str]:
+    """Verify a discovered HTTP service through a short-lived SSH forward."""
+    local_port = reserve_loopback_port()
+    process = await asyncio.create_subprocess_exec(
+        *preview_tunnel_command(device, target_port, local_port),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    deadline = asyncio.get_running_loop().time() + float(
+        os.getenv("SERVICE_PROBE_TIMEOUT", "6")
+    )
+    error = "服务端口当前不可访问"
+    try:
+        async with httpx.AsyncClient(
+            verify=False,
+            follow_redirects=False,
+            timeout=httpx.Timeout(1.5),
+        ) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                if process.returncode is not None:
+                    detail = (await process.stderr.read()).decode(errors="replace").strip()
+                    return False, detail or f"SSH 探测已退出 ({process.returncode})"
+                try:
+                    async with client.stream(
+                        "GET",
+                        f"{scheme}://127.0.0.1:{local_port}/",
+                        headers={"host": f"localhost:{target_port}"},
+                    ):
+                        return True, ""
+                except (httpx.HTTPError, OSError) as exc:
+                    error = str(exc)
+                    await asyncio.sleep(0.25)
+        return False, error
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+
+
+async def service_monitor_loop(app: FastAPI) -> None:
+    interval = max(2.0, float(os.getenv("SERVICE_PROBE_INTERVAL", "10")))
+    threshold = max(1, int(os.getenv("SERVICE_PROBE_FAILURES", "2")))
+    semaphore = asyncio.Semaphore(max(1, int(os.getenv("SERVICE_PROBE_CONCURRENCY", "3"))))
+
+    async def check(session_id: str, device_id: str, port: int, url: str) -> None:
+        async with semaphore:
+            device = await asyncio.to_thread(devices.get, device_id)
+            if not device or not device["frp_online"] or not device["ssh_available"]:
+                online, error = False, "设备 SSH 当前不可用"
+            else:
+                try:
+                    online, error = await probe_device_service(
+                        device, port, "https" if url.lower().startswith("https://") else "http"
+                    )
+                except (OSError, RuntimeError, ValueError, HTTPException) as exc:
+                    online, error = False, str(exc)
+            _service, became_offline = app.state.terminals.update_service_status(
+                session_id,
+                port,
+                online=online,
+                error=error,
+                failure_threshold=threshold,
+            )
+            if became_offline:
+                await app.state.previews.delete_for_service(session_id, port)
+
+    while True:
+        candidates = [
+            (session.id, str(session.device_id), service.port, service.url)
+            for session, service in app.state.terminals.service_candidates()
+        ]
+        if candidates:
+            await asyncio.gather(*(check(*candidate) for candidate in candidates))
+        await asyncio.sleep(interval)
+
+
 @app.post("/api/devices/{device_id}/terminals", status_code=201)
 async def create_device_terminal(
     device_id: str,
@@ -460,9 +553,11 @@ async def create_terminal(
 @app.delete("/api/terminals/{session_id}")
 async def delete_terminal(
     session_id: str,
+    request: Request,
     manager: TerminalManager = Depends(terminal_manager),
     _username: str = Depends(current_user),
 ) -> dict[str, bool]:
+    await request.app.state.previews.delete_for_terminal(session_id)
     if not await manager.delete(session_id):
         raise HTTPException(status_code=404, detail="Terminal not found")
     return {"ok": True}
@@ -506,6 +601,12 @@ async def create_preview(
         terminal = terminal_manager.get(body.terminal_id)
         if not terminal or terminal.device_id != device_id:
             raise HTTPException(status_code=422, detail="终端不属于所选设备")
+        detected = terminal.services.get(body.port)
+        if detected and detected.status == "offline":
+            raise HTTPException(status_code=409, detail="检测到该开发服务已经停止")
+        existing = manager.find_for_service(body.terminal_id, body.port)
+        if existing:
+            return preview_api_payload(existing)
     try:
         preview = await manager.create(
             device_id=device_id,

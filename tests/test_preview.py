@@ -129,6 +129,43 @@ class PreviewManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(preview.id, self.manager.sessions)
         self.assertTrue(self.process.terminated)
 
+    async def test_find_and_delete_preview_for_detected_service(self) -> None:
+        preview = await self.manager.create(
+            device_id="device-001",
+            device_name="Development Mac",
+            target_port=5173,
+            label="Vite",
+            terminal_id="terminal-001",
+            tunnel_command=lambda port: ["ssh", "-L", str(port)],
+        )
+        self.assertIs(
+            preview, self.manager.find_for_service("terminal-001", 5173)
+        )
+        await self.manager.delete_for_service("terminal-001", 5173)
+        self.assertIsNone(self.manager.find_for_service("terminal-001", 5173))
+
+    async def test_delete_for_terminal_only_removes_related_previews(self) -> None:
+        first = await self.manager.create(
+            device_id="device-001",
+            device_name="Development Mac",
+            target_port=3000,
+            label="Next.js",
+            terminal_id="terminal-001",
+            tunnel_command=lambda port: ["ssh", "-L", str(port)],
+        )
+        self.process = FakeProcess()
+        second = await self.manager.create(
+            device_id="device-001",
+            device_name="Development Mac",
+            target_port=4173,
+            label="Vite Preview",
+            terminal_id="terminal-002",
+            tunnel_command=lambda port: ["ssh", "-L", str(port)],
+        )
+        await self.manager.delete_for_terminal("terminal-001")
+        self.assertNotIn(first.id, self.manager.sessions)
+        self.assertIn(second.id, self.manager.sessions)
+
 
 if __name__ == "__main__":
     unittest.main()

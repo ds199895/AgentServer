@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
+import { LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
+import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
@@ -35,11 +37,14 @@ async function copyText(text: string): Promise<void> {
 }
 
 type Props = {
-  sessionId: string
+  session: TerminalSession
   visible: boolean
+  previewBusyPort?: number | null
+  onPreviewService?: (service: DetectedService) => void
 }
 
-export default function TerminalPane({ sessionId, visible }: Props) {
+export default function TerminalPane({ session, visible, previewBusyPort, onPreviewService }: Props) {
+  const sessionId = session.id
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
   const restoreRef = useRef<(() => void) | null>(null)
@@ -385,6 +390,46 @@ export default function TerminalPane({ sessionId, visible }: Props) {
           <span className={cn('size-1.5 rounded-full bg-[#f0bb5a]', connection === 'offline' && 'bg-[#ed6876]')} />
           {connection === 'connecting' ? '正在连接' : '连接已断开，正在重试'}
         </div>
+      )}
+      {visible && session.services.length > 0 && (
+        <aside
+          aria-label="检测到的开发服务"
+          className="absolute right-4 bottom-4 z-20 grid w-[min(320px,calc(100%-2rem))] gap-1.5 rounded-xl border border-[#30404b] bg-[#0c1319eF] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:right-2 max-md:bottom-2"
+        >
+          <div className="flex items-center gap-2 px-1 pb-0.5 text-[9px] font-semibold tracking-[0.09em] text-[#82919c] uppercase">
+            <RadioTower className="size-3 text-primary" />开发服务
+          </div>
+          {session.services.map((service) => {
+            const online = service.status === 'online'
+            const checking = service.status === 'checking'
+            const busy = previewBusyPort === service.port
+            return (
+              <div key={service.port} className="flex min-w-0 items-center gap-2 rounded-lg border border-[#25323c] bg-[#101820] px-2.5 py-2">
+                <Radio className={cn(
+                  'size-3.5 flex-none',
+                  online ? 'text-primary' : checking ? 'animate-pulse text-[#f4c66f]' : 'text-[#e76f7b]',
+                )} />
+                <div className="min-w-0 flex-1">
+                  <strong className="block truncate text-[10px] text-[#dce6ed]">{service.label}</strong>
+                  <small className="block truncate font-mono text-[8px] text-[#758590]">
+                    localhost:{service.port} · {online ? '运行中' : checking ? '正在检查' : '已停止'}
+                  </small>
+                </div>
+                <button
+                  type="button"
+                  disabled={!online || busy}
+                  onClick={() => onPreviewService?.(service)}
+                  aria-label={`预览 ${service.label} localhost:${service.port}`}
+                  title={online ? '一键打开安全预览' : checking ? '等待服务检查完成' : service.error || '服务已停止'}
+                  className="grid h-7 flex-none cursor-pointer grid-cols-[auto_auto] items-center gap-1 rounded-md border border-[#315a48] bg-[#15251e] px-2 text-[9px] font-semibold text-primary hover:bg-[#1b3328] disabled:cursor-not-allowed disabled:border-[#2b353d] disabled:bg-[#151b20] disabled:text-[#59656e]"
+                >
+                  {busy ? <LoaderCircle className="size-3 animate-spin" /> : <MonitorPlay className="size-3" />}
+                  {busy ? '打开中' : '预览'}
+                </button>
+              </div>
+            )
+          })}
+        </aside>
       )}
       {contextMenu && visible && createPortal(
         <div

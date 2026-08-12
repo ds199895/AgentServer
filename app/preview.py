@@ -183,6 +183,20 @@ class PreviewManager:
             preview.last_access_at = time.time()
         return preview
 
+    def find_for_service(
+        self, terminal_id: str, target_port: int
+    ) -> PreviewSession | None:
+        return next(
+            (
+                preview
+                for preview in self.sessions.values()
+                if preview.terminal_id == terminal_id
+                and preview.target_port == target_port
+                and preview.active
+            ),
+            None,
+        )
+
     def list(self) -> list[dict[str, object]]:
         return [
             preview.as_dict()
@@ -212,6 +226,16 @@ class PreviewManager:
     async def delete_for_device(self, device_id: str) -> None:
         for preview in tuple(self.sessions.values()):
             if preview.device_id == device_id:
+                await self.delete(preview.id)
+
+    async def delete_for_terminal(self, terminal_id: str) -> None:
+        for preview in tuple(self.sessions.values()):
+            if preview.terminal_id == terminal_id:
+                await self.delete(preview.id)
+
+    async def delete_for_service(self, terminal_id: str, target_port: int) -> None:
+        for preview in tuple(self.sessions.values()):
+            if preview.terminal_id == terminal_id and preview.target_port == target_port:
                 await self.delete(preview.id)
 
     async def cleanup_idle(self, now: float | None = None) -> int:

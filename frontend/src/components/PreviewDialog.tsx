@@ -27,6 +27,10 @@ export function PreviewDialog({ devices, sessions, previews, initialDeviceId, in
   const [label, setLabel] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const relatedSession = useMemo(
+    () => sessions.find((session) => session.id === initialTerminalId),
+    [initialTerminalId, sessions],
+  )
 
   useEffect(() => {
     if (initialDeviceId) setDeviceId(initialDeviceId)
@@ -99,6 +103,28 @@ export function PreviewDialog({ devices, sessions, previews, initialDeviceId, in
               <Input id="preview-label" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Vite / Storybook / 管理后台" maxLength={80} />
             </div>
           </div>
+          {relatedSession && relatedSession.services.length > 0 && (
+            <div className="grid gap-2">
+              <Label>终端检测到的服务</Label>
+              <div className="flex flex-wrap gap-2">
+                {relatedSession.services.map((service) => (
+                  <button
+                    key={service.port}
+                    type="button"
+                    disabled={service.status === 'offline'}
+                    onClick={() => {
+                      setPort(String(service.port))
+                      if (!label) setLabel(service.label)
+                    }}
+                    className="rounded-md border border-[#2e3d47] bg-[#0c1319] px-2.5 py-1.5 text-left text-[9px] text-[#a9b6bf] hover:border-[#47705e] hover:text-primary disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <strong className="mr-1.5 text-[#dbe5eb]">{service.label}</strong>
+                    :{service.port} · {service.status === 'online' ? '运行中' : service.status === 'checking' ? '检查中' : '已停止'}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {error && <p role="alert" className="m-0 rounded-md border border-[#713640] bg-[#28171b] px-3 py-2 text-xs text-[#ffadb5]">{error}</p>}
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
