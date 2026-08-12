@@ -1,0 +1,2 @@
+# Vite bundles can contain intentional whitespace inside third-party template strings.
+web_dist/assets/*.js -whitespace

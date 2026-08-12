@@ -1,0 +1,25 @@
+[Unit]
+Description=AgentServer fleet and SSH terminal console
+After=network-online.target frps.service agentserver-tmux.service
+Wants=network-online.target
+Wants=agentserver-tmux.service
+
+[Service]
+Type=simple
+User=agentserver
+Group=agentserver
+WorkingDirectory=/opt/agentserver
+EnvironmentFile=/etc/agentserver/agentserver.env
+ExecStart=/opt/agentserver/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 18100
+Restart=always
+RestartSec=5
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agentserver
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

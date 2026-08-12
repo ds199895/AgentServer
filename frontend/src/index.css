@@ -1,0 +1,131 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+:root {
+  --radius: 0.5rem;
+  --background: #080b0f;
+  --foreground: #dce5ef;
+  --card: #0d1218;
+  --card-foreground: #dce5ef;
+  --popover: #121922;
+  --popover-foreground: #dce5ef;
+  --primary: #77f2b4;
+  --primary-foreground: #07110d;
+  --secondary: #121920;
+  --secondary-foreground: #aeb9c3;
+  --muted: #121922;
+  --muted-foreground: #738190;
+  --accent: #1d2731;
+  --accent-foreground: #edf4f9;
+  --destructive: #ff6b7a;
+  --destructive-foreground: #07110d;
+  --warning: #f7c66f;
+  --warning-foreground: #07110d;
+  --border: #202a35;
+  --input: #2b3743;
+  --ring: #55b989;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: 'Manrope', system-ui, sans-serif;
+  --font-mono: 'DM Mono', monospace;
+  --animate-blink: blink 1s steps(1) infinite;
+  --animate-world-pulse: world-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes world-pulse {
+  50% {
+    opacity: 0.45;
+    box-shadow: 0 0 4px var(--primary);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+  body {
+    @apply bg-background font-sans text-foreground;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+  button {
+    color: inherit;
+  }
+}
+
+@layer components {
+  /* xterm host: keeps the terminal filling its pane and themes its scrollbar */
+  .terminal-host {
+    width: 100%;
+    height: 100%;
+  }
+  .terminal-host .xterm {
+    height: 100%;
+  }
+  .terminal-host .xterm-viewport {
+    scrollbar-color: #34404c transparent;
+    scrollbar-width: thin;
+  }
+
+  /* Pixel-world scanline/vignette overlay (multi-layer gradient, kept as CSS) */
+  .device-world-shell::after {
+    content: '';
+    position: absolute;
+    z-index: 1;
+    inset: 0;
+    pointer-events: none;
+    background:
+      repeating-linear-gradient(0deg, #ffffff05 0 1px, transparent 1px 3px),
+      radial-gradient(circle at 50% 45%, transparent 62%, #02040866 100%);
+  }
+  .device-world-shell.is-preview::after {
+    background:
+      linear-gradient(180deg, #02060a18, #02060966),
+      radial-gradient(circle at 50% 45%, transparent 65%, #02040888 100%);
+  }
+}

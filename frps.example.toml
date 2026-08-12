@@ -1,0 +1,23 @@
+bindPort = 7000
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+
+transport.tls.force = true
+
+webServer.addr = "127.0.0.1"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "CHANGE_ME"
+enablePrometheus = true
+
+# Keep fleet SSH ports out of the cloud security group. The management service
+# connects to these listeners through 127.0.0.1 on the frps host.
+allowPorts = [
+  { single = 18080 },
+  { single = 18088 },
+  { start = 20000, end = 29999 }
+]
+maxPortsPerClient = 2
