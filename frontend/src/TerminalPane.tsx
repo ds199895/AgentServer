@@ -295,6 +295,37 @@ export default function TerminalPane({ sessionId, visible }: Props) {
       }
     }
     host.addEventListener('contextmenu', onContextMenu, true)
+    // xterm 自身不处理触摸滚动，这里把单指拖动映射为 scrollLines，
+    // 与上面的自定义滚轮逻辑保持一致（手指上滑 = 查看更新的输出）。
+    let touchRemainder = 0
+    let lastTouchY: number | null = null
+    const onTouchStart = (event: TouchEvent) => {
+      if (event.touches.length === 1) lastTouchY = event.touches[0].clientY
+    }
+    const onTouchMove = (event: TouchEvent) => {
+      if (lastTouchY === null || event.touches.length !== 1) return
+      event.preventDefault()
+      const y = event.touches[0].clientY
+      const pixelsPerLine = Math.max(
+        1,
+        (terminal.options.fontSize ?? 14) * (terminal.options.lineHeight ?? 1),
+      )
+      touchRemainder += (lastTouchY - y) / pixelsPerLine
+      lastTouchY = y
+      const lines = touchRemainder < 0 ? Math.ceil(touchRemainder) : Math.floor(touchRemainder)
+      if (lines !== 0) {
+        terminal.scrollLines(lines)
+        touchRemainder -= lines
+      }
+    }
+    const onTouchEnd = () => {
+      lastTouchY = null
+      touchRemainder = 0
+    }
+    host.addEventListener('touchstart', onTouchStart, { passive: true })
+    host.addEventListener('touchmove', onTouchMove, { passive: false })
+    host.addEventListener('touchend', onTouchEnd)
+    host.addEventListener('touchcancel', onTouchEnd)
     document.addEventListener('pointerdown', closeContextMenu)
     document.addEventListener('keydown', closeContextMenuOnEscape)
     const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fit))
@@ -315,6 +346,10 @@ export default function TerminalPane({ sessionId, visible }: Props) {
       window.cancelAnimationFrame(refreshFrame ?? 0)
       resizeObserver.disconnect()
       host.removeEventListener('contextmenu', onContextMenu, true)
+      host.removeEventListener('touchstart', onTouchStart)
+      host.removeEventListener('touchmove', onTouchMove)
+      host.removeEventListener('touchend', onTouchEnd)
+      host.removeEventListener('touchcancel', onTouchEnd)
       document.removeEventListener('pointerdown', closeContextMenu)
       document.removeEventListener('keydown', closeContextMenuOnEscape)
       document.removeEventListener('visibilitychange', restoreWhenPageReturns)
