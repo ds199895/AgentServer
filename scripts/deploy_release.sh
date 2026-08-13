@@ -77,6 +77,9 @@ fi
 
 mv "$INCOMING_DIR" "$NEW_RELEASE"
 INCOMING_DIR=""
+# The restricted SSH receiver uses umask 077. The application service runs as
+# the unprivileged agentserver user and must be able to traverse the release.
+chmod 0755 "$NEW_RELEASE"
 python3 -m venv "$NEW_RELEASE/.venv"
 if [ -d "$NEW_RELEASE/wheelhouse" ]; then
   "$NEW_RELEASE/.venv/bin/pip" install -q \
