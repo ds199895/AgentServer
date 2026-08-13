@@ -250,6 +250,7 @@ class TerminalManager:
         self.tmux_socket = tmux_socket
         self.store: TerminalStore | None = None
         self.sessions: dict[str, TerminalSession] = {}
+        self._owned_pids: set[int] = set()
         self.loop = asyncio.get_running_loop()
         if self.backend == "tmux":
             if not shutil.which(self.tmux_binary):
@@ -317,6 +318,7 @@ class TerminalManager:
 
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._owned_pids.add(pid)
         session = TerminalSession(
             id=session_id,
             name=display_name,
@@ -379,6 +381,7 @@ class TerminalManager:
 
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._owned_pids.add(pid)
         session = TerminalSession(
             id=session_id,
             name=name.strip()[:80] or "SSH Terminal",
@@ -587,6 +590,7 @@ class TerminalManager:
                 os._exit(127)
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._owned_pids.add(pid)
         session.pid = pid
         session.fd = fd
         self.loop.add_reader(fd, self._read_ready, session.id)
@@ -626,9 +630,12 @@ class TerminalManager:
         if session.pid > 0:
             self._signal_session(session.pid, signal.SIGTERM)
             try:
-                os.waitpid(session.pid, os.WNOHANG)
+                waited_pid, _status = os.waitpid(session.pid, os.WNOHANG)
+                if waited_pid:
+                    self._owned_pids.discard(session.pid)
             except ChildProcessError:
-                pass
+                self._owned_pids.discard(session.pid)
+            self._owned_pids.discard(session.pid)
         session.fd = -1
         session.pid = -1
         session.pending_input.clear()
@@ -800,8 +807,11 @@ class TerminalManager:
         try:
             waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
             session.return_code = os.waitstatus_to_exitcode(status) if waited_pid else None
+            if waited_pid:
+                self._owned_pids.discard(session.pid)
         except ChildProcessError:
             session.return_code = None
+            self._owned_pids.discard(session.pid)
         session.exited_at = time.time()
         marker = b"\r\n\x1b[90m[process exited]\x1b[0m\r\n"
         self._append(session, marker)
@@ -815,9 +825,11 @@ class TerminalManager:
         try:
             waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
         except ChildProcessError:
+            self._owned_pids.discard(session.pid)
             return
         if waited_pid:
             session.return_code = os.waitstatus_to_exitcode(status)
+            self._owned_pids.discard(session.pid)
         elif attempt < 20:
             self.loop.call_later(0.05, self._reap_child, session, attempt + 1)
 
@@ -876,6 +888,10 @@ class TerminalManager:
             pass
 
     def _session_pids(self, leader_pid: int) -> list[int]:
+        # kill(2) assigns broadcast semantics to non-positive PIDs. PTY child
+        # leaders are always greater than 1, so reject sentinel values early.
+        if leader_pid <= 1:
+            return []
         try:
             result = subprocess.run(
                 ["ps", "-axo", "pid=,ppid="],
@@ -905,7 +921,19 @@ class TerminalManager:
         return pids
 
     def _signal_session(self, leader_pid: int, sig: signal.Signals) -> None:
-        pids = self._session_pids(leader_pid)
+        if leader_pid <= 1 or leader_pid not in self._owned_pids:
+            return
+        # A PTY leader is always this server's child. Verify that relationship
+        # before signaling so stale or fabricated PIDs cannot affect unrelated
+        # processes owned by the same operating-system user.
+        try:
+            waited_pid, _status = os.waitpid(leader_pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited_pid:
+            self._owned_pids.discard(leader_pid)
+            return
+        pids = [pid for pid in self._session_pids(leader_pid) if pid > 1]
         pids.sort(key=lambda pid: pid == leader_pid)
         for process_pid in pids:
             try:
@@ -928,33 +956,37 @@ class TerminalManager:
             self.sessions.pop(session_id, None)
             return True
         if session.active:
-            startup_grace = 0.5 - (time.time() - session.created_at)
-            if startup_grace > 0:
-                await asyncio.sleep(startup_grace)
-            self._signal_session(session.pid, signal.SIGTERM)
-            for _ in range(10):
+            if session.pid > 1:
+                startup_grace = 0.5 - (time.time() - session.created_at)
+                if startup_grace > 0:
+                    await asyncio.sleep(startup_grace)
+                self._signal_session(session.pid, signal.SIGTERM)
+                for _ in range(10):
+                    try:
+                        waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
+                    except ChildProcessError:
+                        waited_pid = session.pid
+                        status = 0
+                    if waited_pid:
+                        session.return_code = os.waitstatus_to_exitcode(status)
+                        self._owned_pids.discard(session.pid)
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    try:
+                        self._signal_session(session.pid, signal.SIGKILL)
+                        os.waitpid(session.pid, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
+                    self._owned_pids.discard(session.pid)
+                    session.return_code = -signal.SIGKILL
+            if session.fd >= 0:
+                self.loop.remove_reader(session.fd)
+                self.loop.remove_writer(session.fd)
                 try:
-                    waited_pid, status = os.waitpid(session.pid, os.WNOHANG)
-                except ChildProcessError:
-                    waited_pid = session.pid
-                    status = 0
-                if waited_pid:
-                    session.return_code = os.waitstatus_to_exitcode(status)
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                try:
-                    self._signal_session(session.pid, signal.SIGKILL)
-                    os.waitpid(session.pid, 0)
-                except (ProcessLookupError, ChildProcessError):
+                    os.close(session.fd)
+                except OSError:
                     pass
-                session.return_code = -signal.SIGKILL
-            self.loop.remove_reader(session.fd)
-            self.loop.remove_writer(session.fd)
-            try:
-                os.close(session.fd)
-            except OSError:
-                pass
             session.exited_at = time.time()
         session.subscribers.clear()
         self.sessions.pop(session_id, None)
