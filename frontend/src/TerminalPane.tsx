@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
+import { ChevronDown, ChevronUp, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
@@ -58,6 +58,9 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
   const [pasteDraft, setPasteDraft] = useState('')
   const [notice, setNotice] = useState('')
   const [showAllServices, setShowAllServices] = useState(false)
+  const [servicesCollapsed, setServicesCollapsed] = useState(
+    () => window.matchMedia('(max-width: 767px), (pointer: coarse)').matches,
+  )
   const onlineServices = session.services.filter((service) => service.status === 'online')
   const visibleServices = showAllServices ? onlineServices : onlineServices.slice(0, 3)
 
@@ -394,21 +397,44 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
           {connection === 'connecting' ? '正在连接' : '连接已断开，正在重试'}
         </div>
       )}
-      {visible && onlineServices.length > 0 && (
+      {visible && onlineServices.length > 0 && servicesCollapsed && (
+        <button
+          type="button"
+          aria-label="展开开发服务"
+          title="展开开发服务"
+          onClick={() => setServicesCollapsed(false)}
+          className="absolute right-4 bottom-4 z-20 flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-[#315a48] bg-[#102019ed] px-2.5 text-[9px] font-semibold text-primary shadow-[0_10px_30px_#000a] backdrop-blur-md hover:bg-[#193025] max-md:right-2 max-md:bottom-2 max-md:h-7 max-md:px-2"
+        >
+          <RadioTower className="size-3" />
+          服务 {onlineServices.length}
+          <ChevronUp className="size-3" />
+        </button>
+      )}
+      {visible && onlineServices.length > 0 && !servicesCollapsed && (
         <aside
           aria-label="检测到的开发服务"
-          className="absolute right-4 bottom-4 z-20 grid max-h-[min(310px,45%)] w-[min(320px,calc(100%-2rem))] gap-1.5 overflow-y-auto rounded-xl border border-[#30404b] bg-[#0c1319eF] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:right-2 max-md:bottom-2"
+          className="absolute right-4 bottom-4 z-20 grid max-h-[min(310px,45%)] w-[min(300px,calc(100%-2rem))] gap-1.5 overflow-y-auto rounded-xl border border-[#30404b] bg-[#0c1319eF] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:right-2 max-md:bottom-2 max-md:max-h-[min(180px,30%)] max-md:w-[min(230px,62vw)] max-md:gap-1 max-md:rounded-lg max-md:p-1.5"
         >
-          <div className="flex items-center gap-2 px-1 pb-0.5 text-[9px] font-semibold tracking-[0.09em] text-[#82919c] uppercase">
-            <RadioTower className="size-3 text-primary" />开发服务 · {onlineServices.length}
+          <div className="flex items-center gap-2 px-1 pb-0.5 text-[9px] font-semibold tracking-[0.09em] text-[#82919c] uppercase max-md:gap-1.5">
+            <RadioTower className="size-3 text-primary" />
+            <span className="min-w-0 flex-1 truncate">开发服务 · {onlineServices.length}</span>
+            <button
+              type="button"
+              aria-label="收起开发服务"
+              title="收起开发服务"
+              onClick={() => setServicesCollapsed(true)}
+              className="grid size-6 flex-none cursor-pointer place-items-center rounded-md text-[#71818c] hover:bg-[#1a2730] hover:text-primary max-md:size-5"
+            >
+              <ChevronDown className="size-3.5" />
+            </button>
           </div>
           {visibleServices.map((service) => {
             const online = service.status === 'online'
             const busy = previewBusyPort === service.port
             return (
-              <div key={service.port} className="flex min-w-0 items-center gap-2 rounded-lg border border-[#25323c] bg-[#101820] px-2.5 py-2">
+              <div key={service.port} className="flex min-w-0 items-center gap-2 rounded-lg border border-[#25323c] bg-[#101820] px-2.5 py-2 max-md:gap-1.5 max-md:rounded-md max-md:px-2 max-md:py-1.5">
                 <Radio className={cn(
-                  'size-3.5 flex-none',
+                  'size-3.5 flex-none max-md:hidden',
                   online && 'text-primary',
                 )} />
                 <div className="min-w-0 flex-1">
@@ -423,10 +449,10 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
                   onClick={() => onPreviewService?.(service)}
                   aria-label={`预览 ${service.label} localhost:${service.port}`}
                   title="一键打开安全预览"
-                  className="grid h-7 flex-none cursor-pointer grid-cols-[auto_auto] items-center gap-1 rounded-md border border-[#315a48] bg-[#15251e] px-2 text-[9px] font-semibold text-primary hover:bg-[#1b3328] disabled:cursor-not-allowed disabled:border-[#2b353d] disabled:bg-[#151b20] disabled:text-[#59656e]"
+                  className="grid h-7 flex-none cursor-pointer grid-cols-[auto_auto] items-center gap-1 rounded-md border border-[#315a48] bg-[#15251e] px-2 text-[9px] font-semibold text-primary hover:bg-[#1b3328] disabled:cursor-not-allowed disabled:border-[#2b353d] disabled:bg-[#151b20] disabled:text-[#59656e] max-md:size-7 max-md:grid-cols-1 max-md:px-0"
                 >
                   {busy ? <LoaderCircle className="size-3 animate-spin" /> : <MonitorPlay className="size-3" />}
-                  {busy ? '打开中' : '预览'}
+                  <span className="max-md:hidden">{busy ? '打开中' : '预览'}</span>
                 </button>
               </div>
             )
