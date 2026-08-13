@@ -211,7 +211,8 @@ systemctl enable --now frpc
 `{DEVICE_ID}.ssh`，例如 `device-001.ssh`。
 
 macOS 需要启用“系统设置 → 通用 → 共享 → 远程登录”；Windows 需要启用 OpenSSH
-Server；Linux 通常使用 `sshd`。
+Server。Linux 安装器会启用已有的 `ssh`/`sshd`；Ubuntu、Debian、Fedora、RHEL 等系统
+尚未安装 OpenSSH Server 时，还会通过 `apt-get`、`dnf` 或 `yum` 自动安装。
 
 ## 设备开发服务预览
 

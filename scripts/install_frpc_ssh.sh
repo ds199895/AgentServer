@@ -377,7 +377,7 @@ install_authorized_key() {
 }
 install_authorized_key
 
-enable_linux_ssh() {
+find_linux_ssh_service() {
   SSH_SERVICE_ID=""
   for candidate in ssh.service sshd.service; do
     if [ "$(systemctl show "$candidate" -p LoadState --value 2>/dev/null || true)" = loaded ]; then
@@ -385,9 +385,33 @@ enable_linux_ssh() {
       break
     fi
   done
-  if [ -z "$SSH_SERVICE_ID" ]; then
-    echo "未找到 OpenSSH Server，请先安装 openssh-server"
+}
+
+install_linux_ssh_server() {
+  echo "未找到 OpenSSH Server，正在自动安装..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y openssh-server
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y openssh-server
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y openssh-server
+  else
+    echo "无法识别可用的包管理器，请先手动安装 OpenSSH Server"
     return 1
+  fi
+}
+
+enable_linux_ssh() {
+  find_linux_ssh_service
+  if [ -z "$SSH_SERVICE_ID" ]; then
+    if ! install_linux_ssh_server; then return 1; fi
+    systemctl daemon-reload
+    find_linux_ssh_service
+    if [ -z "$SSH_SERVICE_ID" ]; then
+      echo "OpenSSH Server 已安装，但未找到 ssh.service 或 sshd.service"
+      return 1
+    fi
   fi
   echo "启用 OpenSSH 服务: $SSH_SERVICE_ID"
   systemctl enable --now "$SSH_SERVICE_ID"
