@@ -5,8 +5,10 @@ __pycache__/
 .env
 data/
 frontend/node_modules/
+e2e/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+dist/
 .e2e/
 .DS_Store
 frpc.toml

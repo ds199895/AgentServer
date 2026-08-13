@@ -74,6 +74,8 @@ deploy/                     systemd 与生产环境示例
 frpc.example.toml           每台设备的 SSH 穿透模板
 frps.example.toml           frps 安全配置模板
 scripts/install_server.sh   Ubuntu 服务器安装脚本
+scripts/build_release.sh    从干净 commit 构建不可变发布制品
+scripts/deploy_release.sh   原子切换、smoke 与失败回滚
 ```
 
 生产环境中的终端分为两层：`agentserver-tmux.service` 持有真正的 shell、SSH 和 Codex
@@ -151,8 +153,23 @@ systemctl status agentserver-tmux.service
 systemctl status agentserver.service
 ```
 
-日常部署只需重启 `agentserver.service`，不要重启 `agentserver-tmux.service`。宿主机完整
+日常部署不要直接复制源码或 `web_dist`。应从干净的 Git commit 构建完整制品，再通过原子
+发布脚本切换版本；该过程只重启 `agentserver.service`，不要重启 `agentserver-tmux.service`。
+宿主机完整
 重启后 tmux 进程无法继续存在；此时保存的标签会显示为已退出，而不是伪装成仍在运行。
+
+```bash
+# 开发机或 CI：工作区必须完全干净
+scripts/build_release.sh
+scp dist/agentserver-<sha>.tar.gz* root@server:/tmp/
+
+# 服务器：校验、安装依赖、原子切换 current，失败自动回滚
+sudo /opt/agentserver/current/scripts/deploy_release.sh /tmp/agentserver-<sha>.tar.gz
+```
+
+每个制品同时携带后端 `BUILD_SHA`、前端编译版本和 `web_dist/build.json`。生产启动时三者
+不一致会拒绝启动；部署后 smoke 会检查版本、静态资源、登录和终端 API 契约。发布目录位于
+`/opt/agentserver/releases/<sha>`，`/opt/agentserver/current` 始终原子指向当前版本。
 
 把 `.pub` 内容加入每台设备目标 SSH 用户的 `~/.ssh/authorized_keys`。
 
@@ -278,5 +295,9 @@ python -m unittest discover -s tests -v
 npm --prefix frontend run build
 bash -n scripts/*.sh
 ```
+
+GitHub Actions 会在每次 push 和 pull request 上执行这些检查，并运行一个浏览器契约回归：
+即使模拟旧后端省略终端的 `services` 字段，终端页也不得出现未捕获 JavaScript 错误。
+仓库设置中应将 `CI / verify` 配置为目标分支的 required status check，并禁止绕过保护规则。
 
 真实配置、token、数据库、日志、PID、SSH 密钥和前端依赖均被 `.gitignore` 排除。

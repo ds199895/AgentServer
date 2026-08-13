@@ -4,6 +4,9 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
+  define: {
+    __AGENTSERVER_BUILD_SHA__: JSON.stringify(process.env.AGENTSERVER_BUILD_SHA || 'development'),
+  },
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

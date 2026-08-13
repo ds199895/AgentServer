@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
-import { api, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
+import { api, frontendBuildSha, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
@@ -73,6 +73,7 @@ export default function App() {
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
   const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
   const [error, setError] = useState('')
+  const [startupError, setStartupError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
   const activePreviewRef = useRef<{ preview: Preview; url: string } | null>(null)
@@ -116,7 +117,23 @@ export default function App() {
     activePreviewRef.current = activePreview
   }, [activePreview])
 
-  useEffect(() => { api.me().then(({ username: name }) => { setUsername(name); return load() }).catch(() => setUsername(null)) }, [load])
+  useEffect(() => {
+    api.version()
+      .then(({ build_sha: backendBuildSha }) => {
+        if (frontendBuildSha !== 'development' && frontendBuildSha !== backendBuildSha) {
+          throw new Error(`前后端版本不一致（前端 ${frontendBuildSha.slice(0, 12)}，后端 ${backendBuildSha.slice(0, 12)}）`)
+        }
+        return api.me()
+      })
+      .then(({ username: name }) => { setUsername(name); return load() })
+      .catch((reason: unknown) => {
+        if (reason instanceof Error && reason.message.startsWith('前后端版本不一致')) {
+          setStartupError(`${reason.message}。部署已被安全拦截，请刷新或回滚版本。`)
+          return
+        }
+        setUsername(null)
+      })
+  }, [load])
   useEffect(() => {
     if (!username) return
     const timer = window.setInterval(() => void load().catch(() => undefined), 5000)
@@ -223,6 +240,13 @@ export default function App() {
     }
   }
 
+  if (startupError) {
+    return (
+      <div className="grid h-full w-full place-items-center bg-background p-6 text-center text-sm text-[#ffadb5]">
+        <div className="max-w-xl rounded-xl border border-[#713640] bg-[#28171bdd] p-5">{startupError}</div>
+      </div>
+    )
+  }
   if (username === undefined) {
     return (
       <div className="grid h-full w-full place-items-center bg-background">

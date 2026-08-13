@@ -67,6 +67,8 @@ export type Preview = {
   url: string | null
 }
 
+export const frontendBuildSha = __AGENTSERVER_BUILD_SHA__
+
 type TerminalSessionPayload = Omit<TerminalSession, 'services'> & {
   services?: DetectedService[] | null
 }
@@ -100,6 +102,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  version: () => request<{ build_sha: string }>('/api/version'),
   me: () => request<{ username: string }>('/api/auth/me'),
   login: (username: string, password: string) =>
     request<{ username: string }>('/api/auth/login', {

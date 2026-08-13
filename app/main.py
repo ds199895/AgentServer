@@ -39,12 +39,14 @@ from .terminal import (
     TerminalManager,
     remote_shell_command,
 )
+from .version import resolve_build_sha, verify_release_pair
 
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data")).expanduser()
 COOKIE_NAME = "agentserver_session"
+BUILD_SHA = resolve_build_sha(ROOT)
 
 users = UserStore(DATA_DIR / "agent_server.db")
 admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
@@ -222,6 +224,11 @@ async def logout(response: Response) -> dict[str, bool]:
 @app.get("/api/auth/me")
 async def me(username: str = Depends(current_user)) -> dict[str, str]:
     return {"username": username}
+
+
+@app.get("/api/version")
+async def version() -> dict[str, str]:
+    return {"build_sha": BUILD_SHA}
 
 
 @app.post("/api/auth/password")
@@ -945,10 +952,23 @@ async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
         manager.detach(session_id, queue)
 
 
-FRONTEND_DIST = Path(os.getenv("WEB_DIST", ROOT / "web_dist")).expanduser()
+if os.getenv("ENVIRONMENT") == "production" and BUILD_SHA != "development":
+    # Versioned releases always serve their own frontend, even when a legacy
+    # WEB_DIST value remains in the host environment.
+    FRONTEND_DIST = ROOT / "web_dist"
+else:
+    FRONTEND_DIST = Path(os.getenv("WEB_DIST", ROOT / "web_dist")).expanduser()
 if not FRONTEND_DIST.is_dir():
     FRONTEND_DIST = ROOT / "frontend" / "dist"
 if FRONTEND_DIST.is_dir():
+    verify_release_pair(
+        BUILD_SHA,
+        FRONTEND_DIST,
+        production=(
+            os.getenv("ENVIRONMENT") == "production"
+            and BUILD_SHA != "development"
+        ),
+    )
     assets = FRONTEND_DIST / "assets"
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")

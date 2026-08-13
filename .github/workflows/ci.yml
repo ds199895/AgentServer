@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            e2e/package-lock.json
+      - run: python -m pip install -r requirements.txt
+      - run: npm --prefix frontend ci
+      - run: python -m unittest discover -s tests -v
+      - run: npm --prefix frontend run build
+      - run: bash -n scripts/*.sh
+      - run: npm --prefix e2e ci
+      - run: npx --prefix e2e playwright install --with-deps chromium
+      - name: Start integration server
+        env:
+          ADMIN_PASSWORD: e2e-test-password
+          DATA_DIR: /tmp/agentserver-ci-data
+          WEB_DIST: frontend/dist
+          ENABLE_LOCAL_TERMINALS: '1'
+          TERMINAL_CMD: /bin/sh
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 18124 >/tmp/agentserver-ci.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18124/api/version >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/agentserver-ci.log
+          exit 1
+      - name: Run terminal compatibility regression
+        run: npm --prefix e2e run contract
+      - name: Build immutable release artifact
+        run: scripts/build_release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentserver-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
