@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,61 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.id, second.id)
         self.assertRegex(first.id, re.compile(r"^[a-f0-9]{32}$"))
         self.assertRegex(second.id, re.compile(r"^[a-f0-9]{32}$"))
+
+    async def test_session_cleanup_never_signals_special_pids(self) -> None:
+        with patch("app.terminal.subprocess.run") as process_scan, patch(
+            "app.terminal.os.kill"
+        ) as kill:
+            for unsafe_pid in (-1, 0, 1):
+                self.assertEqual([], self.manager._session_pids(unsafe_pid))
+                self.manager._signal_session(unsafe_pid, signal.SIGTERM)
+
+        process_scan.assert_not_called()
+        kill.assert_not_called()
+
+    async def test_session_cleanup_does_not_signal_unowned_positive_pid(self) -> None:
+        with patch("app.terminal.os.waitpid") as waitpid, patch(
+            "app.terminal.subprocess.run"
+        ) as process_scan, patch("app.terminal.os.kill") as kill:
+            self.manager._signal_session(987654, signal.SIGTERM)
+
+        waitpid.assert_not_called()
+        process_scan.assert_not_called()
+        kill.assert_not_called()
+
+    async def test_session_cleanup_signals_registered_live_child_tree(self) -> None:
+        self.manager._owned_pids.add(123)
+        with patch("app.terminal.os.waitpid", return_value=(0, 0)), patch.object(
+            self.manager, "_session_pids", return_value=[123, 124]
+        ), patch("app.terminal.os.kill") as kill:
+            self.manager._signal_session(123, signal.SIGTERM)
+
+        self.assertEqual(
+            [(124, signal.SIGTERM), (123, signal.SIGTERM)],
+            [call.args for call in kill.call_args_list],
+        )
+
+    async def test_delete_safely_discards_active_sentinel_session(self) -> None:
+        session = TerminalSession(
+            id="sentinel-session",
+            name="Sentinel",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+
+        with patch.object(self.manager, "_signal_session") as signal_session, patch(
+            "app.terminal.os.waitpid"
+        ) as waitpid, patch("app.terminal.os.close") as close:
+            self.assertTrue(await self.manager.delete(session.id))
+
+        signal_session.assert_not_called()
+        waitpid.assert_not_called()
+        close.assert_not_called()
+        self.assertFalse(session.active)
+        self.assertIsNone(self.manager.get(session.id))
 
     async def test_direct_process_session_keeps_device_metadata(self) -> None:
         session = self.manager.create_process(
