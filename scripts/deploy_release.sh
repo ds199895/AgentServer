@@ -60,15 +60,32 @@ PY
 
 NEW_RELEASE="$RELEASES_DIR/$BUILD_SHA"
 if [ -e "$NEW_RELEASE" ]; then
-  echo "错误: 发布版本已存在: $NEW_RELEASE" >&2
+  if [ "$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)" = "$NEW_RELEASE" ]; then
+    rm -rf "$INCOMING_DIR"
+    INCOMING_DIR=""
+    RELEASE_ACTIVATED=1
+    "$NEW_RELEASE/.venv/bin/python" "$NEW_RELEASE/scripts/smoke_release.py" \
+      --base-url "${DEPLOY_SMOKE_URL:-http://127.0.0.1:18100}" \
+      --expected-sha "$BUILD_SHA" \
+      --env-file /etc/agentserver/agentserver.env
+    echo "版本已部署，smoke 复核通过: $BUILD_SHA"
+    exit 0
+  fi
+  echo "错误: 非当前发布目录已存在，拒绝覆盖: $NEW_RELEASE" >&2
   exit 2
 fi
 
 mv "$INCOMING_DIR" "$NEW_RELEASE"
 INCOMING_DIR=""
 python3 -m venv "$NEW_RELEASE/.venv"
-"$NEW_RELEASE/.venv/bin/pip" install -q --upgrade pip
-"$NEW_RELEASE/.venv/bin/pip" install -q -r "$NEW_RELEASE/requirements.txt"
+if [ -d "$NEW_RELEASE/wheelhouse" ]; then
+  "$NEW_RELEASE/.venv/bin/pip" install -q \
+    --no-index \
+    --find-links "$NEW_RELEASE/wheelhouse" \
+    -r "$NEW_RELEASE/requirements.txt"
+else
+  "$NEW_RELEASE/.venv/bin/pip" install -q -r "$NEW_RELEASE/requirements.txt"
+fi
 
 if [ -f "$SERVICE_UNIT" ]; then cp -a "$SERVICE_UNIT" "$SERVICE_BACKUP"; fi
 install -m 0644 "$NEW_RELEASE/deploy/agentserver.service" "$SERVICE_UNIT"
