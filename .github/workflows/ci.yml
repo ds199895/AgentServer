@@ -106,7 +106,7 @@ jobs:
             dist/agentserver-*.tar.gz
             dist/agentserver-*.tar.gz.sha256
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
           compression-level: 0
 
   deploy-production:
