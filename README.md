@@ -308,6 +308,10 @@ GitHub `production` Environment 的专用受限 SSH key 部署到生产服务器
 登录或终端 API 任一失败都会触发回滚；GitHub runner 最后再从公网 `/api/version` 独立
 确认生产版本。
 
+为适应 GitHub Runner 到生产服务器的跨境链路，artifact 会拆成 1 MiB 分块，通过 6 条
+受限 SSH 连接并发上传。每个分块、重组后的传输包和内部 release 都分别校验 SHA-256；
+只有全部分块到齐且 commit SHA 一致时才允许 finalize 获取部署锁并切换版本。
+
 生产 release 还会打包与服务器 Python 3.10 兼容的 wheelhouse，部署时使用 `--no-index`
 离线安装；同一个 commit 不会因为 PyPI 上游版本或网络变化得到不同依赖。
 

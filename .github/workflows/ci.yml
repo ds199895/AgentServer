@@ -84,7 +84,8 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          # Download wheels for the same interpreter used in production.
+          python-version: '3.10'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -148,14 +149,38 @@ jobs:
           PROD_SSH_PORT: ${{ vars.PROD_SSH_PORT }}
           PROD_SSH_USER: ${{ vars.PROD_SSH_USER }}
         run: |
-          tar -C release -czf - . | ssh \
-            -i "$HOME/.ssh/agentserver_deploy" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -p "$PROD_SSH_PORT" \
-            "$PROD_SSH_USER@$PROD_HOST" \
-            "deploy $GITHUB_SHA"
+          ssh_base=(
+            ssh
+            -i "$HOME/.ssh/agentserver_deploy"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -p "$PROD_SSH_PORT"
+            "$PROD_SSH_USER@$PROD_HOST"
+          )
+          stream_file="$RUNNER_TEMP/agentserver-deploy-stream.tar.gz"
+          chunks_dir="$RUNNER_TEMP/agentserver-deploy-chunks"
+          tar -C release -czf "$stream_file" .
+          archive_sha=$(sha256sum "$stream_file" | awk '{print $1}')
+          mkdir -p "$chunks_dir"
+          split -b 1M -d -a 6 "$stream_file" "$chunks_dir/chunk-"
+          export chunks_dir GITHUB_SHA
+          export PROD_SSH_PORT PROD_SSH_USER PROD_HOST
+          printf '%s\0' "$chunks_dir"/chunk-* | xargs -0 -n 1 -P 6 bash -c '
+            chunk=$1
+            index=${chunk##*-}
+            chunk_sha=$(sha256sum "$chunk" | awk "{print \$1}")
+            cat "$chunk" | ssh \
+              -i "$HOME/.ssh/agentserver_deploy" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -p "$PROD_SSH_PORT" \
+              "$PROD_SSH_USER@$PROD_HOST" \
+              "chunk $GITHUB_SHA $index $chunk_sha"
+          ' _
+          chunk_count=$(find "$chunks_dir" -maxdepth 1 -name 'chunk-*' | wc -l | tr -d ' ')
+          "${ssh_base[@]}" "finalize $GITHUB_SHA $chunk_count $archive_sha"
       - name: Verify public production version
         env:
           PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
