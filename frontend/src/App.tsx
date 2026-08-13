@@ -131,6 +131,10 @@ export default function App() {
           setStartupError(`${reason.message}。部署已被安全拦截，请刷新或回滚版本。`)
           return
         }
+        if (frontendBuildSha !== 'development') {
+          setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+          return
+        }
         setUsername(null)
       })
   }, [load])

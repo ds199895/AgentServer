@@ -18,6 +18,7 @@ mkdir -p "$RELEASES_DIR"
 INCOMING_DIR="$(mktemp -d "$RELEASES_DIR/.incoming.XXXXXX")"
 PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
 NEW_RELEASE=""
+RELEASE_ACTIVATED=0
 SERVICE_UNIT=/etc/systemd/system/agentserver.service
 SERVICE_BACKUP="$RELEASES_DIR/.agentserver.service.previous.$$"
 
@@ -37,6 +38,9 @@ fi
 
 cleanup() {
   if [ -n "$INCOMING_DIR" ] && [ -d "$INCOMING_DIR" ]; then rm -rf "$INCOMING_DIR"; fi
+  if [ "$RELEASE_ACTIVATED" -eq 0 ] && [ -n "$NEW_RELEASE" ] && [ -d "$NEW_RELEASE" ]; then
+    rm -rf "$NEW_RELEASE"
+  fi
   rm -f "$SERVICE_BACKUP"
 }
 trap cleanup EXIT
@@ -60,11 +64,11 @@ if [ -e "$NEW_RELEASE" ]; then
   exit 2
 fi
 
-python3 -m venv "$INCOMING_DIR/.venv"
-"$INCOMING_DIR/.venv/bin/pip" install -q --upgrade pip
-"$INCOMING_DIR/.venv/bin/pip" install -q -r "$INCOMING_DIR/requirements.txt"
 mv "$INCOMING_DIR" "$NEW_RELEASE"
 INCOMING_DIR=""
+python3 -m venv "$NEW_RELEASE/.venv"
+"$NEW_RELEASE/.venv/bin/pip" install -q --upgrade pip
+"$NEW_RELEASE/.venv/bin/pip" install -q -r "$NEW_RELEASE/requirements.txt"
 
 if [ -f "$SERVICE_UNIT" ]; then cp -a "$SERVICE_UNIT" "$SERVICE_BACKUP"; fi
 install -m 0644 "$NEW_RELEASE/deploy/agentserver.service" "$SERVICE_UNIT"
@@ -104,4 +108,5 @@ if ! "$NEW_RELEASE/.venv/bin/python" "$NEW_RELEASE/scripts/smoke_release.py" \
   exit 1
 fi
 
+RELEASE_ACTIVATED=1
 echo "部署成功: $BUILD_SHA"
