@@ -1,14 +1,23 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+      - 'agent/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   verify:
+    name: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -17,7 +26,8 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          # Match the production host so bundled binary wheels are compatible.
+          python-version: '3.10'
           cache: pip
       - uses: actions/setup-node@v4
         with:
@@ -26,13 +36,22 @@ jobs:
           cache-dependency-path: |
             frontend/package-lock.json
             e2e/package-lock.json
-      - run: python -m pip install -r requirements.txt
-      - run: npm --prefix frontend ci
-      - run: python -m unittest discover -s tests -v
-      - run: npm --prefix frontend run build
-      - run: bash -n scripts/*.sh
-      - run: npm --prefix e2e ci
-      - run: npx --prefix e2e playwright install --with-deps chromium
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Build frontend
+        run: npm --prefix frontend run build
+      - name: Check shell scripts and whitespace
+        run: |
+          bash -n scripts/*.sh
+          git diff --check
+      - name: Install browser-test dependencies
+        run: npm --prefix e2e ci
+      - name: Install Chromium
+        run: npx --prefix e2e playwright install --with-deps chromium
       - name: Start integration server
         env:
           ADMIN_PASSWORD: e2e-test-password
@@ -50,12 +69,106 @@ jobs:
           exit 1
       - name: Run terminal compatibility regression
         run: npm --prefix e2e run contract
-      - name: Build immutable release artifact
+
+  build-release:
+    name: build release
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build immutable release
+        env:
+          BUNDLE_PYTHON_WHEELS: '1'
         run: scripts/build_release.sh
+      - id: metadata
+        name: Record artifact metadata
+        run: echo "artifact-name=agentserver-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: agentserver-${{ github.sha }}
+          name: ${{ steps.metadata.outputs.artifact-name }}
           path: |
-            dist/*.tar.gz
-            dist/*.sha256
+            dist/agentserver-*.tar.gz
+            dist/agentserver-*.tar.gz.sha256
           if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  deploy-production:
+    name: deploy production
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs:
+      - verify
+      - build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: agentserver-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ vars.PROD_BASE_URL }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-release.outputs.artifact-name }}
+          path: release
+      - name: Verify downloaded artifact
+        run: |
+          cd release
+          checksum_file=$(find . -maxdepth 1 -name 'agentserver-*.tar.gz.sha256' -print -quit)
+          test -n "$checksum_file"
+          sha256sum -c "${checksum_file#./}"
+      - name: Configure restricted production SSH key
+        env:
+          DEPLOY_KEY: ${{ secrets.PROD_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          install -m 0700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/agentserver_deploy"
+          chmod 0600 "$HOME/.ssh/agentserver_deploy"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/known_hosts"
+      - name: Deploy exact verified release
+        env:
+          PROD_HOST: ${{ vars.PROD_HOST }}
+          PROD_SSH_PORT: ${{ vars.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ vars.PROD_SSH_USER }}
+        run: |
+          tar -C release -czf - . | ssh \
+            -i "$HOME/.ssh/agentserver_deploy" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PROD_SSH_PORT" \
+            "$PROD_SSH_USER@$PROD_HOST" \
+            "deploy $GITHUB_SHA"
+      - name: Verify public production version
+        env:
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+        run: |
+          for attempt in $(seq 1 20); do
+            payload=$(curl -fsS --connect-timeout 5 --max-time 15 \
+              -H 'Cache-Control: no-cache' "$PROD_BASE_URL/api/version" || true)
+            if python3 -c 'import json,sys; raise SystemExit(json.loads(sys.argv[1]).get("build_sha") != sys.argv[2])' \
+              "$payload" "$GITHUB_SHA" 2>/dev/null; then
+              echo "Production is running $GITHUB_SHA"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Production version did not converge to $GITHUB_SHA" >&2
+          exit 1

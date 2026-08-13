@@ -300,4 +300,19 @@ GitHub Actions 会在每次 push 和 pull request 上执行这些检查，并运
 即使模拟旧后端省略终端的 `services` 字段，终端页也不得出现未捕获 JavaScript 错误。
 仓库设置中应将 `CI / verify` 配置为目标分支的 required status check，并禁止绕过保护规则。
 
+`main` 的 push 和手动触发还会在 `verify` 通过后构建唯一的 release artifact，并通过
+GitHub `production` Environment 的专用受限 SSH key 部署到生产服务器。该 key 在服务器
+的 `authorized_keys` 中绑定 `scripts/github_deploy_receiver.sh` forced command，不能打开
+交互式 root shell。服务器会再次校验 SHA-256 和 commit SHA，再执行原子切换、登录态 smoke
+和失败回滚。服务器 smoke 直接走 `https://agent.metakroma.com`，因此 Nginx、TLS、版本、
+登录或终端 API 任一失败都会触发回滚；GitHub runner 最后再从公网 `/api/version` 独立
+确认生产版本。
+
+生产 release 还会打包与服务器 Python 3.10 兼容的 wheelhouse，部署时使用 `--no-index`
+离线安装；同一个 commit 不会因为 PyPI 上游版本或网络变化得到不同依赖。
+
+Environment 需要以下配置：`PROD_HOST`、`PROD_SSH_PORT`、`PROD_SSH_USER`、
+`PROD_BASE_URL` variables，以及 `PROD_SSH_KEY`、`PROD_KNOWN_HOSTS` secrets。生产服务
+只监听 `127.0.0.1:18100`，公网流量继续由 Nginx HTTPS 入口代理。
+
 真实配置、token、数据库、日志、PID、SSH 密钥和前端依赖均被 `.gitignore` 排除。

@@ -32,6 +32,12 @@ mv "$SOURCE_DIR/frontend/dist" "$SOURCE_DIR/web_dist"
 printf '{"build_sha":"%s"}\n' "$BUILD_SHA" > "$SOURCE_DIR/web_dist/build.json"
 rm -rf "$SOURCE_DIR/frontend/node_modules"
 
+if [ "${BUNDLE_PYTHON_WHEELS:-0}" = "1" ]; then
+  python3 -m pip download --disable-pip-version-check \
+    --dest "$SOURCE_DIR/wheelhouse" \
+    --requirement "$SOURCE_DIR/requirements.txt"
+fi
+
 ARTIFACT="$OUTPUT_DIR/agentserver-${BUILD_SHA:0:12}.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$ARTIFACT" -C "$SOURCE_DIR" .
 python3 - "$ARTIFACT" <<'PY'
