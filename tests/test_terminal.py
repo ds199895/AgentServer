@@ -8,9 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.terminal import (
+    DetectedService,
+    ListeningProcess,
     TerminalManager,
     TerminalSession,
     TerminalStore,
+    parse_listener_scan,
     remote_shell_command,
 )
 
@@ -25,6 +28,38 @@ class RemoteShellCommandTests(unittest.TestCase):
             remote_shell_command("powershell"),
         )
         self.assertEqual(["cmd.exe", "/Q"], remote_shell_command("cmd"))
+
+
+class ListenerScanParserTests(unittest.TestCase):
+    def test_parses_ss_lsof_netstat_and_normalized_records(self) -> None:
+        ss = parse_listener_scan(
+            "__AGENTSERVER_LISTENERS__:ss\n"
+            'LISTEN 0 511 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=123,fd=20))\n'
+            'LISTEN 0 128 [::]:18080 [::]:* users:(("uvicorn",pid=456,fd=8))\n'
+            'LISTEN 0 128 192.168.1.3:9999 0.0.0.0:* users:(("private",pid=9,fd=1))\n'
+        )
+        self.assertEqual(
+            [ListeningProcess(3000, 123, "node"), ListeningProcess(18080, 456, "uvicorn")],
+            ss,
+        )
+
+        lsof = parse_listener_scan(
+            "__AGENTSERVER_LISTENERS__:lsof\n"
+            "p777\ncpython\nn127.0.0.1:8000\n"
+        )
+        self.assertEqual([ListeningProcess(8000, 777, "python")], lsof)
+
+        netstat = parse_listener_scan(
+            "__AGENTSERVER_LISTENERS__:netstat\n"
+            "tcp 0 0 0.0.0.0:5173 0.0.0.0:* LISTEN 88/node\n"
+        )
+        self.assertEqual([ListeningProcess(5173, 88, "node")], netstat)
+
+        records = parse_listener_scan(
+            "__AGENTSERVER_LISTENERS__:records\n"
+            "__AGENTSERVER_LISTENER__|8080|321|dotnet\n"
+        )
+        self.assertEqual([ListeningProcess(8080, 321, "dotnet")], records)
 
 
 class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -179,6 +214,51 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual({}, session.services)
 
+    async def test_detects_plain_and_chinese_health_check_urls(self) -> None:
+        session = TerminalSession(
+            id="chinese-health-output",
+            name="Remote device",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager.service_discovery_event.clear()
+        self.manager._append(
+            session,
+            "• 前端和后端服务均正常：\n"
+            "  - 前端 http://localhost:3000/：HTTP 200\n"
+            "  - 后端 http://localhost:18080/api/v1/healthz：HTTP 200\n"
+            "  - PostgreSQL：db: ok\n".encode(),
+        )
+
+        self.assertEqual([3000, 18080], list(session.services))
+        self.assertTrue(self.manager.service_discovery_event.is_set())
+        self.assertEqual("前端服务", session.services[3000].label)
+        self.assertEqual("后端服务", session.services[18080].label)
+
+    async def test_detects_plain_local_url_but_keeps_references_quiet(self) -> None:
+        session = TerminalSession(
+            id="plain-local-url",
+            name="Remote device",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._append(session, b"http://localhost:4321/\n")
+        self.manager._append(session, b"example: http://localhost:4322/\n")
+
+        self.assertEqual([4321], list(session.services))
+
     async def test_ignores_public_urls_and_tracks_service_lifecycle(self) -> None:
         session = TerminalSession(
             id="service-session",
@@ -250,6 +330,151 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(8, len(session.services))
         self.assertEqual([], session.as_dict()["services"])
 
+    async def test_process_scan_discovers_assigns_and_removes_service(self) -> None:
+        older = TerminalSession(
+            id="older-terminal",
+            name="Older",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=10,
+        )
+        newer = TerminalSession(
+            id="newer-terminal",
+            name="Newer",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=20,
+        )
+        self.manager.sessions = {older.id: older, newer.id: newer}
+        try:
+            removed = self.manager.sync_process_listeners(
+                "device-001", [ListeningProcess(3000, 123, "node")]
+            )
+            self.assertEqual([], removed)
+            self.assertNotIn(3000, older.services)
+            service = newer.services[3000]
+            self.assertEqual("process", service.source)
+            self.assertEqual("Node.js", service.label)
+            self.manager.update_service_status(newer.id, 3000, online=True)
+            self.assertEqual(
+                [3000], [item["port"] for item in newer.as_dict()["services"]]
+            )
+
+            self.assertEqual([], self.manager.sync_process_listeners("device-001", []))
+            self.assertIn(3000, newer.services)
+            self.assertEqual(
+                [(newer.id, 3000)],
+                self.manager.sync_process_listeners("device-001", []),
+            )
+            self.assertEqual("offline", newer.services[3000].status)
+            self.assertEqual("监听进程已停止", newer.services[3000].error)
+
+            self.manager.sync_process_listeners(
+                "device-001", [ListeningProcess(3000, 123, "node")]
+            )
+            self.assertEqual("checking", newer.services[3000].status)
+        finally:
+            older.exited_at = older.exited_at or 1
+            newer.exited_at = newer.exited_at or 1
+
+    async def test_process_scan_enriches_output_service_without_reassigning_it(self) -> None:
+        owner = TerminalSession(
+            id="output-owner",
+            name="Output owner",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=10,
+        )
+        newer = TerminalSession(
+            id="newer-terminal",
+            name="Newer",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=20,
+        )
+        self.manager.sessions = {owner.id: owner, newer.id: newer}
+        try:
+            self.manager._append(owner, b"http://localhost:5173/\n")
+
+            self.manager.sync_process_listeners(
+                "device-001", [ListeningProcess(5173, 88, "vite")]
+            )
+            self.assertIn(5173, owner.services)
+            self.assertNotIn(5173, newer.services)
+            self.assertEqual("hybrid", owner.services[5173].source)
+            self.assertEqual("Vite", owner.services[5173].label)
+
+            self.manager.sync_process_listeners("device-001", [], missing_threshold=1)
+            self.assertIn(5173, owner.services)
+            self.assertEqual("offline", owner.services[5173].status)
+            self.assertEqual("hybrid", owner.services[5173].source)
+        finally:
+            owner.exited_at = owner.exited_at or 1
+            newer.exited_at = newer.exited_at or 1
+
+    async def test_process_scan_deduplicates_same_port_across_terminals(self) -> None:
+        older = TerminalSession(
+            id="older-owner",
+            name="Older",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=10,
+        )
+        newer = TerminalSession(
+            id="newer-owner",
+            name="Newer",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=20,
+        )
+        older.services[3000] = DetectedService(
+            3000, "http://localhost:3000/", "Web 服务 :3000", status="online", source="process"
+        )
+        newer.services[3000] = DetectedService(
+            3000, "http://localhost:3000/", "Vite", status="online", source="output"
+        )
+        self.manager.sessions = {older.id: older, newer.id: newer}
+        try:
+            removed = self.manager.sync_process_listeners(
+                "device-001", [ListeningProcess(3000, 55, "vite")]
+            )
+            self.assertEqual([(older.id, 3000)], removed)
+            self.assertNotIn(3000, older.services)
+            self.assertEqual("hybrid", newer.services[3000].source)
+        finally:
+            older.exited_at = 1
+            newer.exited_at = 1
+
     async def test_multiple_clients_receive_the_same_live_output(self) -> None:
         session = self.manager.create("Shared")
         await self.wait_for_output(session.id, b"ready-marker")
@@ -310,8 +535,6 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         for process_id in process_ids:
             with self.assertRaises(ProcessLookupError):
                 os.kill(process_id, 0)
-
-
 class TerminalStoreTests(unittest.TestCase):
     def test_session_metadata_round_trip_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

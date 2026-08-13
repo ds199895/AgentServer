@@ -265,6 +265,12 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 | `SERVICE_PROBE_TIMEOUT` | 单次 SSH/HTTP 探活最长秒数，默认 6 |
 | `SERVICE_PROBE_FAILURES` | 连续失败多少次后标记停止并回收预览，默认 2 |
 | `SERVICE_PROBE_CONCURRENCY` | 同时执行的服务探活数，默认 3 |
+| `SERVICE_PROCESS_SCAN_INTERVAL` | 远端监听进程扫描间隔秒数，默认 10 |
+| `SERVICE_PROCESS_SCAN_TIMEOUT` | 单台设备监听扫描超时秒数，默认 5 |
+| `SERVICE_PROCESS_SCAN_CONCURRENCY` | 同时扫描的设备数，默认 3 |
+| `SERVICE_PROCESS_PROBE_TIMEOUT` | 进程来源候选的单协议 HTTP 探测秒数，默认 2 |
+| `SERVICE_PROCESS_MISSING_SCANS` | 连续多少轮未监听后自动下线，默认 2 |
+| `SERVICE_PROCESS_MIN_PORT` | 自动发现的最低监听端口，默认 1024 |
 
 ## API
 

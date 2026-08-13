@@ -39,11 +39,21 @@ LOCAL_SERVICE_PORT = re.compile(
 )
 SERVICE_URL_CONTEXT = re.compile(
     r"(?:^|\s)(?:local|network)\s*:|"
-    r"\b(?:listening|running|started|ready|available|serving)\b[^\r\n]{0,40}\b(?:at|on)\b",
+    r"\b(?:listening|running|started|ready|available|serving)\b[^\r\n]{0,40}\b(?:at|on)\b|"
+    r"(?:服务|前端|后端|监听|运行|启动|就绪|可用|正常|代理)[^\r\n]{0,80}",
+    re.IGNORECASE,
+)
+NON_SERVICE_URL_CONTEXT = re.compile(
+    r"(?:^|\s)(?:curl|wget|fetch|httpie)\s|"
+    r"\b(?:docs?|documentation|example|configuration|config)\b|"
+    r"(?:文档|示例|配置)(?:地址|链接|值|项)?\s*[:：]?",
     re.IGNORECASE,
 )
 MAX_DETECTED_SERVICES = 8
+MAX_PROCESS_SERVICE_CANDIDATES = 20
 SERVICE_REDISCOVERY_COOLDOWN = 5 * 60
+LISTENER_SCAN_MARKER = "__AGENTSERVER_LISTENERS__"
+LISTENER_RECORD_MARKER = "__AGENTSERVER_LISTENER__"
 REMOTE_SHELL_COMMANDS = {
     "system": [],
     "powershell": ["powershell.exe", "-NoLogo", "-NoExit"],
@@ -80,7 +90,128 @@ def service_product(line: str) -> str | None:
 
 def service_label(line: str, port: int) -> str:
     """Infer a concise product label without trusting terminal escape output."""
-    return service_product(line) or f"Web 服务 :{port}"
+    product = service_product(line)
+    if product:
+        return product
+    lowered = line.lower()
+    if "前端" in line or "frontend" in lowered:
+        return "前端服务"
+    if "后端" in line or "backend" in lowered or re.search(r"(?:^|\W)api(?:\W|$)", lowered):
+        return "后端服务"
+    return f"Web 服务 :{port}"
+
+
+@dataclass(frozen=True)
+class ListeningProcess:
+    port: int
+    pid: int | None = None
+    command: str = ""
+
+
+def process_service_label(command: str, port: int) -> str:
+    """Infer a useful service label from a listener's process detail."""
+    product = service_product(command)
+    if product:
+        return product
+    lowered = command.lower()
+    products = (
+        ("node", "Node.js"),
+        ("python", "Python"),
+        ("gunicorn", "Gunicorn"),
+        ("php", "PHP"),
+        ("dotnet", ".NET"),
+        ("java", "Java"),
+        ("ruby", "Ruby"),
+        ("rails", "Rails"),
+        ("go", "Go"),
+    )
+    for marker, label in products:
+        if marker in lowered:
+            return label
+    return f"Web 服务 :{port}"
+
+
+def _listener_port(address: str) -> int | None:
+    address = address.strip()
+    match = re.search(r"(?:\]|:|\.)(\d{1,5})$", address)
+    if not match:
+        return None
+    port = int(match.group(1))
+    return port if 1 <= port <= 65535 else None
+
+
+def _is_local_listener(address: str) -> bool:
+    normalized = address.strip().lower()
+    host = re.sub(r"(?:\]|:|\.)(\d{1,5})$", "", normalized).strip("[]")
+    return host in {"", "*", "0.0.0.0", "::", "::1"} or host.startswith("127.")
+
+
+def parse_listener_scan(output: str) -> list[ListeningProcess]:
+    """Parse normalized Windows records or POSIX ss/lsof/netstat output."""
+    lines = [line.strip() for line in output.replace("\r", "").split("\n") if line.strip()]
+    records: dict[int, ListeningProcess] = {}
+    mode = ""
+    lsof_pid: int | None = None
+    lsof_command = ""
+    for line in lines:
+        if line.startswith(f"{LISTENER_SCAN_MARKER}:"):
+            mode = line.split(":", 1)[1].strip().lower()
+            continue
+        if line.startswith(f"{LISTENER_RECORD_MARKER}|"):
+            parts = line.split("|", 3)
+            if len(parts) < 4 or not parts[1].isdigit():
+                continue
+            port = int(parts[1])
+            if not 1 <= port <= 65535:
+                continue
+            pid = int(parts[2]) if parts[2].isdigit() and int(parts[2]) > 0 else None
+            records[port] = ListeningProcess(port, pid, parts[3].strip())
+            continue
+        if mode == "lsof":
+            if line.startswith("p") and line[1:].isdigit():
+                lsof_pid = int(line[1:])
+            elif line.startswith("c"):
+                lsof_command = line[1:].strip()
+            elif line.startswith("n"):
+                address = line[1:].split("->", 1)[0]
+                port = _listener_port(address)
+                if port and _is_local_listener(address):
+                    records[port] = ListeningProcess(port, lsof_pid, lsof_command)
+            continue
+        fields = line.split()
+        if mode == "ss" and len(fields) >= 4 and fields[0].upper() == "LISTEN":
+            address = fields[3]
+            port = _listener_port(address)
+            if not port or not _is_local_listener(address):
+                continue
+            detail = " ".join(fields[5:])
+            pid_match = re.search(r"pid=(\d+)", detail)
+            command_match = re.search(r'\(\("([^"\\]+)', detail)
+            records[port] = ListeningProcess(
+                port,
+                int(pid_match.group(1)) if pid_match else None,
+                command_match.group(1) if command_match else detail,
+            )
+            continue
+        if mode == "netstat" and len(fields) >= 4 and fields[0].lower().startswith("tcp"):
+            state_index = next(
+                (index for index, field in enumerate(fields) if field.upper() in {"LISTEN", "LISTENING"}),
+                -1,
+            )
+            if state_index < 0:
+                continue
+            address = fields[3]
+            port = _listener_port(address)
+            if not port or not _is_local_listener(address):
+                continue
+            detail = fields[state_index + 1] if state_index + 1 < len(fields) else ""
+            pid_text, _, command = detail.partition("/")
+            records[port] = ListeningProcess(
+                port,
+                int(pid_text) if pid_text.isdigit() and int(pid_text) > 0 else None,
+                command,
+            )
+    return sorted(records.values(), key=lambda item: item.port)
 
 
 @dataclass(eq=False)
@@ -95,6 +226,11 @@ class DetectedService:
     error: str = ""
     failure_count: int = 0
     retry_after: float = 0
+    source: str = "output"
+    process_pid: int | None = None
+    process_detail: str = ""
+    process_seen_at: float | None = None
+    process_missing_count: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +242,9 @@ class DetectedService:
             "last_seen_at": self.last_seen_at,
             "last_checked_at": self.last_checked_at,
             "error": self.error,
+            "source": self.source,
+            "process_pid": self.process_pid,
+            "process_detail": self.process_detail,
         }
 
 
@@ -133,6 +272,7 @@ class TerminalSession:
     discovery_tail: str = ""
     discovery_label_hint: str = ""
     discovery_label_lines_left: int = 0
+    last_activity_at: float = field(default_factory=time.time)
 
     @property
     def active(self) -> bool:
@@ -252,6 +392,7 @@ class TerminalManager:
         self.sessions: dict[str, TerminalSession] = {}
         self._owned_pids: set[int] = set()
         self.loop = asyncio.get_running_loop()
+        self.service_discovery_event = asyncio.Event()
         if self.backend == "tmux":
             if not shutil.which(self.tmux_binary):
                 raise RuntimeError(f"tmux executable not found: {self.tmux_binary}")
@@ -660,6 +801,7 @@ class TerminalManager:
     def _append(self, session: TerminalSession, chunk: bytes) -> None:
         session.chunks.append(chunk)
         session.buffer_size += len(chunk)
+        session.last_activity_at = time.time()
         while session.buffer_size > self.scrollback_bytes and session.chunks:
             removed = session.chunks.popleft()
             session.buffer_size -= len(removed)
@@ -678,8 +820,8 @@ class TerminalManager:
         # tail as well; the port-keyed map keeps this idempotent.
         self._discover_services_in_line(session, session.discovery_tail, complete=False)
 
-    @staticmethod
     def _discover_services_in_line(
+        self,
         session: TerminalSession, line: str, *, complete: bool
     ) -> None:
         now = time.time()
@@ -693,8 +835,12 @@ class TerminalManager:
             else ""
         )
         has_service_context = bool(product or hint or SERVICE_URL_CONTEXT.search(line))
+        is_reference = bool(NON_SERVICE_URL_CONTEXT.search(line))
         candidates: dict[int, str] = {}
-        if has_service_context:
+        # Follow VS Code's output discovery behavior for local URLs: a URL is
+        # itself a candidate. Obvious command/documentation references remain
+        # excluded unless the line also contains a positive service signal.
+        if has_service_context or not is_reference:
             for match in LOCAL_SERVICE_URL.finditer(line):
                 port = int(match.group("port"))
                 if 1 <= port <= 65535:
@@ -704,7 +850,7 @@ class TerminalManager:
             if 1 <= port <= 65535:
                 candidates.setdefault(port, f"http://localhost:{port}/")
         for port, url in candidates.items():
-            label = product or hint or f"Web 服务 :{port}"
+            label = product or hint or service_label(line, port)
             existing = session.services.get(port)
             if existing:
                 existing.url = url
@@ -715,6 +861,7 @@ class TerminalManager:
                     existing.status = "checking"
                     existing.failure_count = 0
                     existing.error = ""
+                    self.service_discovery_event.set()
                 continue
             if len(session.services) >= MAX_DETECTED_SERVICES:
                 removable = sorted(
@@ -735,6 +882,7 @@ class TerminalManager:
                 detected_at=now,
                 last_seen_at=now,
             )
+            self.service_discovery_event.set()
         if complete and line.strip() and not product and session.discovery_label_lines_left:
             session.discovery_label_lines_left -= 1
             if session.discovery_label_lines_left == 0:
@@ -748,6 +896,120 @@ class TerminalManager:
             for service in session.services.values()
             if service.status != "offline"
         ]
+
+    def sync_process_listeners(
+        self,
+        device_id: str,
+        listeners: list[ListeningProcess],
+        *,
+        missing_threshold: int = 2,
+    ) -> list[tuple[str, int]]:
+        """Merge one device listener snapshot into terminal-owned services."""
+        sessions = [
+            session
+            for session in self.sessions.values()
+            if session.active and session.kind == "ssh" and session.device_id == device_id
+        ]
+        if not sessions:
+            return []
+        sessions.sort(key=lambda item: (item.last_activity_at, item.created_at), reverse=True)
+        listener_by_port = {listener.port: listener for listener in listeners}
+        known_by_port: dict[int, tuple[TerminalSession, DetectedService]] = {}
+        duplicate_services: list[tuple[TerminalSession, DetectedService]] = []
+        for session in sessions:
+            for service in session.services.values():
+                known = known_by_port.get(service.port)
+                if not known or (
+                    service.source != "process",
+                    service.last_seen_at,
+                    session.last_activity_at,
+                ) > (
+                    known[1].source != "process",
+                    known[1].last_seen_at,
+                    known[0].last_activity_at,
+                ):
+                    if known:
+                        duplicate_services.append(known)
+                    known_by_port[service.port] = (session, service)
+                else:
+                    duplicate_services.append((session, service))
+
+        now = time.time()
+        removed: list[tuple[str, int]] = []
+        for session, service in duplicate_services:
+            session.services.pop(service.port, None)
+            if service.status == "online":
+                removed.append((session.id, service.port))
+        for port, listener in listener_by_port.items():
+            known = known_by_port.get(port)
+            if known:
+                _session, service = known
+                previous_pid = service.process_pid
+                process_returned = service.process_seen_at is None
+                if service.source == "output":
+                    service.source = "hybrid"
+                service.process_pid = listener.pid
+                service.process_detail = listener.command
+                service.process_seen_at = now
+                service.process_missing_count = 0
+                if service.label.startswith("Web 服务"):
+                    service.label = process_service_label(listener.command, port)
+                process_restarted = (
+                    previous_pid is not None
+                    and listener.pid is not None
+                    and previous_pid != listener.pid
+                )
+                if service.status == "offline" and (
+                    process_restarted or process_returned or now >= service.retry_after
+                ):
+                    service.status = "checking"
+                    service.failure_count = 0
+                    service.retry_after = 0
+                    service.error = ""
+                    self.service_discovery_event.set()
+                continue
+
+            owner = sessions[0]
+            if len(owner.services) >= MAX_PROCESS_SERVICE_CANDIDATES:
+                removable = sorted(
+                    (service for service in owner.services.values() if service.status != "online"),
+                    key=lambda service: service.last_seen_at,
+                )
+                if not removable:
+                    continue
+                owner.services.pop(removable[0].port, None)
+            owner.services[port] = DetectedService(
+                port=port,
+                url=f"http://localhost:{port}/",
+                label=process_service_label(listener.command, port),
+                detected_at=now,
+                last_seen_at=now,
+                source="process",
+                process_pid=listener.pid,
+                process_detail=listener.command,
+                process_seen_at=now,
+            )
+            self.service_discovery_event.set()
+
+        for session in sessions:
+            for service in tuple(session.services.values()):
+                if service.source not in {"process", "hybrid"}:
+                    continue
+                if service.port in listener_by_port:
+                    continue
+                service.process_missing_count += 1
+                if service.process_missing_count < max(1, missing_threshold):
+                    continue
+                was_visible = service.status == "online"
+                service.status = "offline"
+                service.error = "监听进程已停止"
+                service.failure_count = 0
+                service.retry_after = now + SERVICE_REDISCOVERY_COOLDOWN
+                service.process_seen_at = None
+                service.process_missing_count = 0
+                if was_visible:
+                    removed.append((session.id, service.port))
+        return removed
 
     def update_service_status(
         self,

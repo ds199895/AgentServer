@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import os
 import re
+import shlex
 import sqlite3
 import socket
 from contextlib import asynccontextmanager
@@ -34,9 +36,12 @@ from .preview import (
     upstream_cookie,
 )
 from .terminal import (
+    LISTENER_SCAN_MARKER,
+    ListeningProcess,
     RESIZE_MESSAGE,
     SNAPSHOT_COMPLETE_MESSAGE,
     TerminalManager,
+    parse_listener_scan,
     remote_shell_command,
 )
 from .version import resolve_build_sha, verify_release_pair
@@ -425,6 +430,75 @@ def preview_tunnel_command(
     return command
 
 
+def listener_scan_command(device: dict[str, object]) -> list[str]:
+    """Build a read-only remote command that reports TCP listening processes."""
+    command = ssh_base_command(device)
+    remote_shell = str(device.get("remote_shell") or "system")
+    if remote_shell in {"powershell", "cmd"}:
+        script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { "
+            f"Write-Output '{LISTENER_SCAN_MARKER}:unsupported'; exit 0 }}; "
+            f"Write-Output '{LISTENER_SCAN_MARKER}:records'; "
+            "Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object { "
+            "$p=Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; "
+            "Write-Output ('__AGENTSERVER_LISTENER__|{0}|{1}|{2}' -f "
+            "$_.LocalPort,$_.OwningProcess,$p.ProcessName) }"
+        )
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        command.append(
+            f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
+        )
+        return command
+    script = (
+        "if command -v ss >/dev/null 2>&1; then "
+        f"printf '{LISTENER_SCAN_MARKER}:ss\\n'; ss -H -ltnp 2>/dev/null || ss -H -ltn 2>/dev/null; "
+        "elif command -v lsof >/dev/null 2>&1; then "
+        f"printf '{LISTENER_SCAN_MARKER}:lsof\\n'; lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null; "
+        "elif command -v netstat >/dev/null 2>&1; then "
+        f"printf '{LISTENER_SCAN_MARKER}:netstat\\n'; netstat -lntp 2>/dev/null || netstat -an 2>/dev/null; "
+        f"else printf '{LISTENER_SCAN_MARKER}:unsupported\\n'; fi"
+    )
+    command.append(f"sh -lc {shlex.quote(script)}")
+    return command
+
+
+async def scan_device_listeners(
+    device: dict[str, object],
+) -> tuple[list[ListeningProcess] | None, str]:
+    """Read one remote listener snapshot; None means the snapshot is unusable."""
+    timeout = max(1.0, float(os.getenv("SERVICE_PROCESS_SCAN_TIMEOUT", "5")))
+    process = await asyncio.create_subprocess_exec(
+        *listener_scan_command(device),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None, "远端监听端口扫描超时"
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(asyncio.CancelledError):
+                await process.wait()
+    output = stdout.decode(errors="replace")
+    detail = stderr.decode(errors="replace").strip()
+    if process.returncode != 0:
+        return None, detail or f"远端监听端口扫描退出 ({process.returncode})"
+    marker = re.search(rf"^{re.escape(LISTENER_SCAN_MARKER)}:([^\r\n]+)", output, re.MULTILINE)
+    if not marker or marker.group(1).strip().lower() == "unsupported":
+        return None, "远端缺少 ss、lsof 或 netstat"
+    minimum_port = max(1, int(os.getenv("SERVICE_PROCESS_MIN_PORT", "1024")))
+    listeners = [
+        listener for listener in parse_listener_scan(output) if listener.port >= minimum_port
+    ]
+    return listeners, ""
+
+
 def reserve_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -432,7 +506,7 @@ def reserve_loopback_port() -> int:
 
 
 async def probe_device_service(
-    device: dict[str, object], target_port: int, scheme: str
+    device: dict[str, object], target_port: int, scheme: str, *, timeout: float | None = None
 ) -> tuple[bool, str]:
     """Verify a discovered HTTP service through a short-lived SSH forward."""
     local_port = reserve_loopback_port()
@@ -442,8 +516,8 @@ async def probe_device_service(
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    deadline = asyncio.get_running_loop().time() + float(
-        os.getenv("SERVICE_PROBE_TIMEOUT", "6")
+    deadline = asyncio.get_running_loop().time() + (
+        timeout if timeout is not None else float(os.getenv("SERVICE_PROBE_TIMEOUT", "6"))
     )
     error = "服务端口当前不可访问"
     try:
@@ -481,19 +555,47 @@ async def probe_device_service(
 
 async def service_monitor_loop(app: FastAPI) -> None:
     interval = max(2.0, float(os.getenv("SERVICE_PROBE_INTERVAL", "10")))
+    process_interval = max(
+        interval, float(os.getenv("SERVICE_PROCESS_SCAN_INTERVAL", "10"))
+    )
+    process_missing_threshold = max(
+        1, int(os.getenv("SERVICE_PROCESS_MISSING_SCANS", "2"))
+    )
     threshold = max(1, int(os.getenv("SERVICE_PROBE_FAILURES", "2")))
     semaphore = asyncio.Semaphore(max(1, int(os.getenv("SERVICE_PROBE_CONCURRENCY", "3"))))
+    scan_semaphore = asyncio.Semaphore(
+        max(1, int(os.getenv("SERVICE_PROCESS_SCAN_CONCURRENCY", "3")))
+    )
+    discovery_event = app.state.terminals.service_discovery_event
+    next_process_scan = 0.0
 
-    async def check(session_id: str, device_id: str, port: int, url: str) -> None:
+    async def check(
+        session_id: str, device_id: str, port: int, url: str, source: str
+    ) -> None:
         async with semaphore:
             try:
                 device = await asyncio.to_thread(devices.get, device_id)
                 if not device or not device["frp_online"] or not device["ssh_available"]:
                     online, error = False, "设备 SSH 当前不可用"
                 else:
-                    online, error = await probe_device_service(
-                        device, port, "https" if url.lower().startswith("https://") else "http"
+                    scheme = "https" if url.lower().startswith("https://") else "http"
+                    probe_timeout = (
+                        max(1.0, float(os.getenv("SERVICE_PROCESS_PROBE_TIMEOUT", "2")))
+                        if source == "process"
+                        else None
                     )
+                    online, error = await probe_device_service(
+                        device, port, scheme, timeout=probe_timeout
+                    )
+                    if not online and source == "process" and scheme == "http":
+                        online, error = await probe_device_service(
+                            device, port, "https", timeout=probe_timeout
+                        )
+                        if online:
+                            session = app.state.terminals.get(session_id)
+                            service = session and session.services.get(port)
+                            if service:
+                                service.url = f"https://localhost:{port}/"
             except Exception as exc:
                 # One stale or malformed service must not terminate monitoring
                 # for all current and future terminal services.
@@ -510,8 +612,54 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     await app.state.previews.delete_for_service(session_id, port)
 
     while True:
+        # New terminal-output candidates should be checked immediately instead
+        # of waiting for the next periodic lifecycle probe.
+        discovery_event.clear()
+        now = asyncio.get_running_loop().time()
+        if now >= next_process_scan:
+            device_ids = sorted(
+                {
+                    str(session.device_id)
+                    for session in app.state.terminals.sessions.values()
+                    if session.active and session.kind == "ssh" and session.device_id
+                }
+            )
+
+            async def scan(device_id: str) -> tuple[str, list[ListeningProcess] | None]:
+                async with scan_semaphore:
+                    try:
+                        device = await asyncio.to_thread(devices.get, device_id)
+                        if not device or not device["frp_online"] or not device["ssh_available"]:
+                            return device_id, None
+                        listeners, _error = await scan_device_listeners(device)
+                        return device_id, listeners
+                    except Exception:
+                        return device_id, None
+
+            scan_results = await asyncio.gather(
+                *(scan(device_id) for device_id in device_ids),
+                return_exceptions=False,
+            )
+            for device_id, listeners in scan_results:
+                if listeners is None:
+                    continue
+                removed = app.state.terminals.sync_process_listeners(
+                    device_id,
+                    listeners,
+                    missing_threshold=process_missing_threshold,
+                )
+                for session_id, port in removed:
+                    with contextlib.suppress(Exception):
+                        await app.state.previews.delete_for_service(session_id, port)
+            next_process_scan = asyncio.get_running_loop().time() + process_interval
         candidates = [
-            (session.id, str(session.device_id), service.port, service.url)
+            (
+                session.id,
+                str(session.device_id),
+                service.port,
+                service.url,
+                service.source,
+            )
             for session, service in app.state.terminals.service_candidates()
         ]
         if candidates:
@@ -519,7 +667,10 @@ async def service_monitor_loop(app: FastAPI) -> None:
                 *(check(*candidate) for candidate in candidates),
                 return_exceptions=True,
             )
-        await asyncio.sleep(interval)
+        try:
+            await asyncio.wait_for(discovery_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 @app.post("/api/devices/{device_id}/terminals", status_code=201)
