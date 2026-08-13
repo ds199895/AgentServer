@@ -103,6 +103,7 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
             <span className="flex items-stretch">
               {group.sessions.map((session, sessionIndex) => {
                 const sessionActive = session.id === activeId
+                const onlineCount = session.services.filter((service) => service.status === 'online').length
                 return (
                   <span
                     key={session.id}
@@ -120,16 +121,18 @@ export function TerminalTabsBar({ sessions, activeId, cloningId, onSelect, onClo
                         sessionActive && 'text-primary hover:text-primary',
                       )}
                     >
-                      <SessionSprite session={session} pose={sessionIndex === 0 ? 'sit' : 'stand'} />
+                      <span className="relative my-auto flex-none">
+                        <SessionSprite session={session} pose={sessionIndex === 0 ? 'sit' : 'stand'} />
+                        {onlineCount > 0 && (
+                          <i
+                            aria-label={`${onlineCount} 个开发服务运行中`}
+                            className="absolute -top-1 -right-1.5 grid min-w-3 place-items-center rounded-full bg-primary px-[3px] font-mono text-[7px] leading-[11px] font-bold not-italic text-[#07120d] shadow-[0_1px_4px_#000c]"
+                          >
+                            {onlineCount}
+                          </i>
+                        )}
+                      </span>
                       <code className="font-mono text-[8px] max-md:hidden">{session.id.slice(0, 6)}</code>
-                      {session.services.some((service) => service.status === 'online') && (
-                        <i
-                          aria-label={`${session.services.filter((service) => service.status === 'online').length} 个开发服务运行中`}
-                          className="grid min-w-3.5 place-items-center rounded-full bg-primary px-1 font-mono text-[7px] font-bold not-italic text-[#07120d]"
-                        >
-                          {session.services.filter((service) => service.status === 'online').length}
-                        </i>
-                      )}
                     </button>
                     <button
                       aria-label={`关闭 ${group.name} 终端 ${session.id.slice(0, 8)}`}
