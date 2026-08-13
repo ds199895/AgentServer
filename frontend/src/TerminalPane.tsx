@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronUp, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
@@ -48,6 +48,7 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
   const restoreRef = useRef<(() => void) | null>(null)
+  const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const noticeTimerRef = useRef<number | undefined>(undefined)
   const [connection, setConnection] = useState<'connecting' | 'online' | 'offline'>(
@@ -58,6 +59,7 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
   const [pasteDraft, setPasteDraft] = useState('')
   const [notice, setNotice] = useState('')
   const [showAllServices, setShowAllServices] = useState(false)
+  const [scrolledUp, setScrolledUp] = useState(false)
   const [servicesCollapsed, setServicesCollapsed] = useState(
     () => window.matchMedia('(max-width: 767px), (pointer: coarse)').matches,
   )
@@ -306,33 +308,80 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
       }
     }
     host.addEventListener('contextmenu', onContextMenu, true)
-    // xterm 自身不处理触摸滚动，这里把单指拖动映射为 scrollLines，
-    // 与上面的自定义滚轮逻辑保持一致（手指上滑 = 查看更新的输出）。
+    // xterm 自身不处理触摸滚动。这里把单指拖动按像素平滑映射为 scrollLines，
+    // 松手后根据滑动速度做惯性衰减，模拟原生滚动列表的手感。
     let touchRemainder = 0
     let lastTouchY: number | null = null
-    const onTouchStart = (event: TouchEvent) => {
-      if (event.touches.length === 1) lastTouchY = event.touches[0].clientY
-    }
-    const onTouchMove = (event: TouchEvent) => {
-      if (lastTouchY === null || event.touches.length !== 1) return
-      event.preventDefault()
-      const y = event.touches[0].clientY
+    let lastTouchTime = 0
+    let touchVelocity = 0
+    let momentumFrame: number | undefined
+    const scrollPixels = (pixels: number) => {
       const pixelsPerLine = Math.max(
         1,
         (terminal.options.fontSize ?? 14) * (terminal.options.lineHeight ?? 1),
       )
-      touchRemainder += (lastTouchY - y) / pixelsPerLine
-      lastTouchY = y
+      touchRemainder += pixels / pixelsPerLine
       const lines = touchRemainder < 0 ? Math.ceil(touchRemainder) : Math.floor(touchRemainder)
       if (lines !== 0) {
         terminal.scrollLines(lines)
         touchRemainder -= lines
       }
     }
+    const stopMomentum = () => {
+      if (momentumFrame !== undefined) window.cancelAnimationFrame(momentumFrame)
+      momentumFrame = undefined
+      touchVelocity = 0
+    }
+    stopMomentumRef.current = stopMomentum
+    const onTouchStart = (event: TouchEvent) => {
+      stopMomentum()
+      if (event.touches.length === 1) {
+        lastTouchY = event.touches[0].clientY
+        lastTouchTime = performance.now()
+      }
+    }
+    const onTouchMove = (event: TouchEvent) => {
+      if (lastTouchY === null || event.touches.length !== 1) return
+      event.preventDefault()
+      const now = performance.now()
+      const y = event.touches[0].clientY
+      const delta = lastTouchY - y
+      const elapsed = now - lastTouchTime
+      if (elapsed > 0) {
+        // 指数平滑瞬时速度（px/ms），过滤个别触摸事件的抖动
+        touchVelocity = touchVelocity * 0.6 + (delta / elapsed) * 0.4
+      }
+      lastTouchY = y
+      lastTouchTime = now
+      scrollPixels(delta)
+    }
     const onTouchEnd = () => {
       lastTouchY = null
-      touchRemainder = 0
+      if (Math.abs(touchVelocity) < 0.06) {
+        touchVelocity = 0
+        return
+      }
+      let previous = performance.now()
+      const step = () => {
+        const now = performance.now()
+        const elapsed = Math.min(now - previous, 48)
+        previous = now
+        touchVelocity *= Math.pow(0.94, elapsed / 16.7)
+        if (Math.abs(touchVelocity) < 0.02) {
+          stopMomentum()
+          return
+        }
+        scrollPixels(touchVelocity * elapsed)
+        momentumFrame = window.requestAnimationFrame(step)
+      }
+      momentumFrame = window.requestAnimationFrame(step)
     }
+    // 跟踪滚动位置，用于显示「直达顶部 / 直达底部」按钮
+    const updateScrollState = () => {
+      const buffer = terminal.buffer.active
+      setScrolledUp(buffer.viewportY < buffer.baseY)
+    }
+    const scrollListener = terminal.onScroll(updateScrollState)
     host.addEventListener('touchstart', onTouchStart, { passive: true })
     host.addEventListener('touchmove', onTouchMove, { passive: false })
     host.addEventListener('touchend', onTouchEnd)
@@ -356,6 +405,9 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
       resizeObserver.disconnect()
+      stopMomentum()
+      scrollListener.dispose()
+      stopMomentumRef.current = null
       host.removeEventListener('contextmenu', onContextMenu, true)
       host.removeEventListener('touchstart', onTouchStart)
       host.removeEventListener('touchmove', onTouchMove)
@@ -396,6 +448,36 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
           <span className={cn('size-1.5 rounded-full bg-[#f0bb5a]', connection === 'offline' && 'bg-[#ed6876]')} />
           {connection === 'connecting' ? '正在连接' : '连接已断开，正在重试'}
         </div>
+      )}
+      {visible && scrolledUp && (
+        <>
+          <button
+            type="button"
+            aria-label="直达底部"
+            title="直达底部"
+            onClick={() => {
+              stopMomentumRef.current?.()
+              terminalRef.current?.scrollToBottom()
+              terminalRef.current?.focus()
+            }}
+            className="absolute top-3.5 left-4 z-20 grid size-8 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:top-2.5 max-md:left-2.5 max-md:size-7"
+          >
+            <ChevronsDown className="size-4 max-md:size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label="直达顶部"
+            title="直达顶部"
+            onClick={() => {
+              stopMomentumRef.current?.()
+              terminalRef.current?.scrollToTop()
+              terminalRef.current?.focus()
+            }}
+            className="absolute bottom-4 left-4 z-20 grid size-8 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:bottom-2 max-md:left-2.5 max-md:size-7"
+          >
+            <ChevronsUp className="size-4 max-md:size-3.5" />
+          </button>
+        </>
       )}
       {visible && onlineServices.length > 0 && servicesCollapsed && (
         <button
