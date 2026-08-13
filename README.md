@@ -29,6 +29,8 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 - 在浏览器中创建、切换和恢复多个 SSH/本地终端，支持断线重连与历史输出回放。
 - 使用独立 tmux 服务持久托管终端任务，Web 服务更新不会终止正在运行的任务。
 - 提供像素风房间 Canvas，将设备和终端会话映射为可交互的小人，并可从场景直接跳转终端。
+- 通过 SSH 临时隧道和隔离子域名预览设备本地开发服务，支持 HTTP、WebSocket 与 HMR。
+- 自动从终端输出识别 Vite、Next.js、Storybook 等本地 Web 服务，主动探活并提供一键预览；服务停止后自动关闭关联预览隧道。
 - 提供设备端一键安装脚本、登录鉴权、HTTPS 部署支持，以及桌面端和移动端基础适配。
 
 ### TODO
@@ -72,6 +74,8 @@ deploy/                     systemd 与生产环境示例
 frpc.example.toml           每台设备的 SSH 穿透模板
 frps.example.toml           frps 安全配置模板
 scripts/install_server.sh   Ubuntu 服务器安装脚本
+scripts/build_release.sh    从干净 commit 构建不可变发布制品
+scripts/deploy_release.sh   原子切换、smoke 与失败回滚
 ```
 
 生产环境中的终端分为两层：`agentserver-tmux.service` 持有真正的 shell、SSH 和 Codex
@@ -149,8 +153,23 @@ systemctl status agentserver-tmux.service
 systemctl status agentserver.service
 ```
 
-日常部署只需重启 `agentserver.service`，不要重启 `agentserver-tmux.service`。宿主机完整
+日常部署不要直接复制源码或 `web_dist`。应从干净的 Git commit 构建完整制品，再通过原子
+发布脚本切换版本；该过程只重启 `agentserver.service`，不要重启 `agentserver-tmux.service`。
+宿主机完整
 重启后 tmux 进程无法继续存在；此时保存的标签会显示为已退出，而不是伪装成仍在运行。
+
+```bash
+# 开发机或 CI：工作区必须完全干净
+scripts/build_release.sh
+scp dist/agentserver-<sha>.tar.gz* root@server:/tmp/
+
+# 服务器：校验、安装依赖、原子切换 current，失败自动回滚
+sudo /opt/agentserver/current/scripts/deploy_release.sh /tmp/agentserver-<sha>.tar.gz
+```
+
+每个制品同时携带后端 `BUILD_SHA`、前端编译版本和 `web_dist/build.json`。生产启动时三者
+不一致会拒绝启动；部署后 smoke 会检查版本、静态资源、登录和终端 API 契约。发布目录位于
+`/opt/agentserver/releases/<sha>`，`/opt/agentserver/current` 始终原子指向当前版本。
 
 把 `.pub` 内容加入每台设备目标 SSH 用户的 `~/.ssh/authorized_keys`。
 
@@ -194,6 +213,33 @@ systemctl enable --now frpc
 macOS 需要启用“系统设置 → 通用 → 共享 → 远程登录”；Windows 需要启用 OpenSSH
 Server；Linux 通常使用 `sshd`。
 
+## 设备开发服务预览
+
+AgentServer 可以通过设备现有的 SSH 入口建立临时本地转发，预览仅监听在设备
+`127.0.0.1` 上的 Vite、Next.js、Storybook 等开发服务。登录后可从设备列表或终端设备组
+点击“预览”，手动填写端口；预览面板支持刷新、响应式宽度、全屏、新窗口打开和停止隧道。
+
+终端启动开发服务并输出 `http://localhost:<port>`、`http://127.0.0.1:<port>` 或明确的
+`listening/running/ready ... port <port>` 提示后，AgentServer 会自动识别端口，并通过设备
+现有 SSH 入口主动检查它是否为可访问的 HTTP(S) 服务。终端右下角会显示“正在检查 / 运行中 /
+已停止”，运行中时可一键打开预览。相同终端和端口会复用已有预览；连续探测失败后，关联
+预览会自动关闭。手动填写端口的入口仍然保留，供未输出标准地址的服务使用。
+
+为保持根路径资源、前端路由和 HMR WebSocket 兼容，同时隔离不受信任的开发页面，生产
+环境必须使用独立泛域名，例如：
+
+```text
+*.preview.metakroma.com -> 101.43.103.46
+PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
+```
+
+泛域名证书通常需要 DNS-01 验证。可参考 `deploy/preview.nginx.example` 配置 Nginx。
+每个预览使用独立子域名和短时访问票据，不会收到 AgentServer 主站的登录 Cookie；隧道
+在关闭预览、删除设备或超过 `PREVIEW_IDLE_TIMEOUT` 无访问时自动回收。
+
+当前 `*.preview.metakroma.com` 证书通过手动 DNS-01 签发，不能无人值守自动续期。到期前
+需要更新 `_acme-challenge.preview.metakroma.com` TXT 记录并重新执行 ACME 验证。
+
 ## 关键环境变量
 
 | 变量 | 说明 |
@@ -213,6 +259,12 @@ Server；Linux 通常使用 `sshd`。
 | `TERMINAL_BACKEND` | `tmux` 可跨 AgentServer 部署保存进程；`direct` 为开发兼容模式 |
 | `TMUX_SOCKET` | 独立 tmux 服务的 socket，生产默认 `/var/lib/agentserver/tmux/agentserver.sock` |
 | `COOKIE_SECURE` | HTTPS 部署设为 `1` |
+| `PREVIEW_PUBLIC_ORIGIN` | 预览泛域名基础 Origin，生产为 `https://preview.metakroma.com` |
+| `PREVIEW_IDLE_TIMEOUT` | 预览无访问后的自动回收秒数，默认 1800 |
+| `SERVICE_PROBE_INTERVAL` | 自动发现服务的探活间隔秒数，默认 10，最小 2 |
+| `SERVICE_PROBE_TIMEOUT` | 单次 SSH/HTTP 探活最长秒数，默认 6 |
+| `SERVICE_PROBE_FAILURES` | 连续失败多少次后标记停止并回收预览，默认 2 |
+| `SERVICE_PROBE_CONCURRENCY` | 同时执行的服务探活数，默认 3 |
 
 ## API
 
@@ -222,8 +274,12 @@ Server；Linux 通常使用 `sshd`。
 - `POST /api/devices/sync`
 - `POST /api/devices/{id}/probe`
 - `POST /api/devices/{id}/terminals`
+- `POST /api/devices/{id}/previews`
 - `GET/POST /api/terminals`
 - `DELETE /api/terminals/{id}`
+- `GET /api/previews`
+- `POST /api/previews/{id}/ticket`
+- `DELETE /api/previews/{id}`
 - `WS /ws/terminal/{id}`
 - `GET /downloads/install-frpc-ssh.sh`
 - `GET /downloads/install-frpc-ssh.ps1`
@@ -239,5 +295,9 @@ python -m unittest discover -s tests -v
 npm --prefix frontend run build
 bash -n scripts/*.sh
 ```
+
+GitHub Actions 会在每次 push 和 pull request 上执行这些检查，并运行一个浏览器契约回归：
+即使模拟旧后端省略终端的 `services` 字段，终端页也不得出现未捕获 JavaScript 错误。
+仓库设置中应将 `CI / verify` 配置为目标分支的 required status check，并禁止绕过保护规则。
 
 真实配置、token、数据库、日志、PID、SSH 密钥和前端依赖均被 `.gitignore` 排除。

@@ -1,17 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
-import { api, type Device, type TerminalSession } from '@/api'
+import { api, frontendBuildSha, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
+import { Eyebrow } from '@/components/Eyebrow'
 import { Login } from '@/components/Login'
 import { PasswordDialog } from '@/components/PasswordDialog'
+import { PreviewDialog } from '@/components/PreviewDialog'
+import { PreviewPane } from '@/components/PreviewPane'
 import { TerminalEmpty } from '@/components/TerminalEmpty'
 import { TerminalRoomOverview } from '@/components/TerminalRoomOverview'
 import { TerminalTabsBar } from '@/components/TerminalTabsBar'
 import { Topbar, type MainPage } from '@/components/Topbar'
 import TerminalPane from '@/TerminalPane'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
@@ -55,21 +60,35 @@ export default function App() {
   const [username, setUsername] = useState<string | null | undefined>(undefined)
   const [devices, setDevices] = useState<Device[]>([])
   const [sessions, setSessions] = useState<TerminalSession[]>([])
+  const [previews, setPreviews] = useState<Preview[]>([])
   const [activeId, setActiveId] = useState<string | null>(() => routeFromLocation().terminalId)
   const [page, setPage] = useState<MainPage>(() => routeFromLocation().page)
   const [missingTerminalId, setMissingTerminalId] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
+  const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
+  const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [cloningId, setCloningId] = useState<string | null>(null)
+  const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
+  const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
   const [error, setError] = useState('')
+  const [startupError, setStartupError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
+  const activePreviewRef = useRef<{ preview: Preview; url: string } | null>(null)
 
   const load = useCallback(async () => {
-    const [nextDevices, nextSessions] = await Promise.all([api.devices(), api.terminals()])
+    const [nextDevices, nextSessions, nextPreviews] = await Promise.all([api.devices(), api.terminals(), api.previews()])
     setDevices(nextDevices)
     setSessions(nextSessions)
+    setPreviews(nextPreviews)
+    const currentPreview = activePreviewRef.current
+    if (currentPreview && !nextPreviews.some((item) => item.id === currentPreview.preview.id)) {
+      activePreviewRef.current = null
+      setActivePreview(null)
+      setError('开发服务已停止，关联预览隧道已自动关闭')
+    }
     const route = routeFromLocation()
     const routedSession = route.terminalId ? nextSessions.find((item) => item.id === route.terminalId) : undefined
     const rememberedSession = nextSessions.find((item) => item.id === lastTerminalIdRef.current)
@@ -94,7 +113,31 @@ export default function App() {
     }
   }, [])
 
-  useEffect(() => { api.me().then(({ username: name }) => { setUsername(name); return load() }).catch(() => setUsername(null)) }, [load])
+  useEffect(() => {
+    activePreviewRef.current = activePreview
+  }, [activePreview])
+
+  useEffect(() => {
+    api.version()
+      .then(({ build_sha: backendBuildSha }) => {
+        if (frontendBuildSha !== 'development' && frontendBuildSha !== backendBuildSha) {
+          throw new Error(`前后端版本不一致（前端 ${frontendBuildSha.slice(0, 12)}，后端 ${backendBuildSha.slice(0, 12)}）`)
+        }
+        return api.me()
+      })
+      .then(({ username: name }) => { setUsername(name); return load() })
+      .catch((reason: unknown) => {
+        if (reason instanceof Error && reason.message.startsWith('前后端版本不一致')) {
+          setStartupError(`${reason.message}。部署已被安全拦截，请刷新或回滚版本。`)
+          return
+        }
+        if (frontendBuildSha !== 'development') {
+          setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+          return
+        }
+        setUsername(null)
+      })
+  }, [load])
   useEffect(() => {
     if (!username) return
     const timer = window.setInterval(() => void load().catch(() => undefined), 5000)
@@ -151,8 +194,10 @@ export default function App() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法克隆终端') }
     finally { setCloningId(null) }
   }
-  const closeTerminal = async (session: TerminalSession) => {
-    if (!window.confirm(`关闭 ${session.name} (${session.id.slice(0, 8)})？`)) return
+  const closeTerminal = async () => {
+    const session = closeTarget
+    if (!session) return
+    setCloseTarget(null)
     await api.deleteTerminal(session.id)
     const remaining = sessions.filter((item) => item.id !== session.id)
     setSessions(remaining)
@@ -168,8 +213,44 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]) }
+  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); activePreviewRef.current = null; setActivePreview(null) }
+  const stopPreview = async (preview: Preview) => {
+    try {
+      await api.deletePreview(preview.id)
+      setPreviews((current) => current.filter((item) => item.id !== preview.id))
+      if (activePreview?.preview.id === preview.id) { activePreviewRef.current = null; setActivePreview(null) }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法关闭预览') }
+  }
+  const openDetectedService = async (session: TerminalSession, service: DetectedService) => {
+    if (!session.device_id || service.status !== 'online') return
+    setPreviewBusy({ terminalId: session.id, port: service.port })
+    setError('')
+    try {
+      const preview = await api.createPreview(
+        session.device_id,
+        service.port,
+        service.label,
+        session.id,
+      )
+      const { url } = await api.previewTicket(preview.id)
+      setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
+      activePreviewRef.current = { preview, url }
+      setActivePreview({ preview, url })
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法打开检测到的开发服务')
+      await load().catch(() => undefined)
+    } finally {
+      setPreviewBusy(null)
+    }
+  }
 
+  if (startupError) {
+    return (
+      <div className="grid h-full w-full place-items-center bg-background p-6 text-center text-sm text-[#ffadb5]">
+        <div className="max-w-xl rounded-xl border border-[#713640] bg-[#28171bdd] p-5">{startupError}</div>
+      </div>
+    )
+  }
   if (username === undefined) {
     return (
       <div className="grid h-full w-full place-items-center bg-background">
@@ -191,15 +272,16 @@ export default function App() {
         onShowPassword={() => setShowPassword(true)}
         onLogout={() => void logout()}
       />
-      <section className={cn('grid min-h-0 min-w-0', showTerminalTabs ? 'grid-rows-[44px_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
+      <section className={cn('grid min-h-0 min-w-0', showTerminalTabs ? 'grid-rows-[44px_minmax(0,1fr)] max-md:grid-rows-[auto_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
         {showTerminalTabs && (
           <TerminalTabsBar
             sessions={sessions}
             activeId={activeId}
             cloningId={cloningId}
             onSelect={(id) => showTerminal(id)}
-            onClose={(session) => void closeTerminal(session)}
+            onClose={setCloseTarget}
             onClone={(source) => void cloneTerminal(source)}
+            onPreview={(source) => setPreviewTarget({ deviceId: source.device_id || undefined, terminalId: source.id })}
           />
         )}
         <div className="relative min-h-0 min-w-0 overflow-auto">
@@ -209,7 +291,13 @@ export default function App() {
               !(page === 'terminals' && activeSession) && 'invisible pointer-events-none',
             )}>
               {sessions.map((session) => (
-                <TerminalPane key={session.id} sessionId={session.id} visible={page === 'terminals' && session.id === activeId} />
+                  <TerminalPane
+                    key={session.id}
+                    session={session}
+                    visible={page === 'terminals' && session.id === activeId}
+                    previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
+                    onPreviewService={(service) => void openDetectedService(session, service)}
+                  />
               ))}
             </div>
           )}
@@ -247,6 +335,7 @@ export default function App() {
               onSync={() => void sync()}
               onAdd={() => navigate('setup')}
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
+              onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
             />
           )}
         </div>
@@ -258,11 +347,57 @@ export default function App() {
         </button>
       )}
       {showPassword && <PasswordDialog onClose={() => setShowPassword(false)} />}
+      {closeTarget && (
+        <Dialog open onOpenChange={(open) => { if (!open) setCloseTarget(null) }}>
+          <DialogContent className="sm:max-w-[410px]">
+            <DialogHeader>
+              <Eyebrow>TERMINAL</Eyebrow>
+              <DialogTitle>关闭终端</DialogTitle>
+              <DialogDescription>
+                关闭 {closeTarget.name} ({closeTarget.id.slice(0, 8)})？后台会话将被终止，未保存的输出会丢失。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setCloseTarget(null)}>取消</Button>
+              <Button variant="destructive" onClick={() => void closeTerminal()}>关闭终端</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
       {deviceDialog && (
         <DeviceDialog
           device={deviceDialog === 'new' ? undefined : deviceDialog}
           onClose={() => setDeviceDialog(null)}
           onSaved={() => void load()}
+        />
+      )}
+      {previewTarget && (
+        <PreviewDialog
+          devices={devices}
+          sessions={sessions}
+          previews={previews}
+          initialDeviceId={previewTarget.deviceId}
+          initialTerminalId={previewTarget.terminalId}
+          onClose={() => setPreviewTarget(null)}
+          onCreated={(preview, url) => {
+            setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
+            activePreviewRef.current = { preview, url }
+            setActivePreview({ preview, url })
+            setPreviewTarget(null)
+          }}
+          onDeleted={(id) => {
+            setPreviews((current) => current.filter((item) => item.id !== id))
+            if (activePreview?.preview.id === id) { activePreviewRef.current = null; setActivePreview(null) }
+          }}
+        />
+      )}
+      {activePreview && (
+        <PreviewPane
+          preview={activePreview.preview}
+          authorizedUrl={activePreview.url}
+          topOffset={58 + (showTerminalTabs ? 44 : 0)}
+          onClose={() => setActivePreview(null)}
+          onStop={() => void stopPreview(activePreview.preview)}
         />
       )}
     </main>

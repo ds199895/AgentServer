@@ -23,6 +23,27 @@ from pathlib import Path
 
 RESIZE_MESSAGE = re.compile(r"^\x01\[(\d+),(\d+)\]$")
 SNAPSHOT_COMPLETE_MESSAGE = "\x01[snapshot-complete]"
+ANSI_ESCAPE = re.compile(
+    r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[@-_][0-?]*[ -/]*[@-~])"
+)
+LOCAL_SERVICE_URL = re.compile(
+    r"(?P<url>https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?|\[?::\]?)"
+    r":(?P<port>\d{1,5})(?:/[^\s\x00-\x1f<>'\"]*)?)",
+    re.IGNORECASE,
+)
+LOCAL_SERVICE_PORT = re.compile(
+    r"\b(?:listening|running|started|ready|available|serving)\b"
+    r"[^\r\n]{0,80}?(?:\bport\s*[:=]?\s*|(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\s*:)"
+    r"(?P<port>\d{2,5})\b",
+    re.IGNORECASE,
+)
+SERVICE_URL_CONTEXT = re.compile(
+    r"(?:^|\s)(?:local|network)\s*:|"
+    r"\b(?:listening|running|started|ready|available|serving)\b[^\r\n]{0,40}\b(?:at|on)\b",
+    re.IGNORECASE,
+)
+MAX_DETECTED_SERVICES = 8
+SERVICE_REDISCOVERY_COOLDOWN = 5 * 60
 REMOTE_SHELL_COMMANDS = {
     "system": [],
     "powershell": ["powershell.exe", "-NoLogo", "-NoExit"],
@@ -33,6 +54,59 @@ REMOTE_SHELL_COMMANDS = {
 def remote_shell_command(remote_shell: str) -> list[str]:
     """Return the SSH remote command for a validated device shell choice."""
     return list(REMOTE_SHELL_COMMANDS.get(remote_shell, ()))
+
+
+def service_product(line: str) -> str | None:
+    """Infer a known development-server product from one sanitized line."""
+    lowered = line.lower()
+    products = (
+        ("storybook", "Storybook"),
+        ("next.js", "Next.js"),
+        ("nextjs", "Next.js"),
+        ("vite", "Vite"),
+        ("astro", "Astro"),
+        ("webpack", "webpack"),
+        ("angular", "Angular"),
+        ("nuxt", "Nuxt"),
+        ("django", "Django"),
+        ("flask", "Flask"),
+        ("uvicorn", "Uvicorn"),
+    )
+    for marker, label in products:
+        if marker in lowered:
+            return label
+    return None
+
+
+def service_label(line: str, port: int) -> str:
+    """Infer a concise product label without trusting terminal escape output."""
+    return service_product(line) or f"Web 服务 :{port}"
+
+
+@dataclass(eq=False)
+class DetectedService:
+    port: int
+    url: str
+    label: str
+    status: str = "checking"
+    detected_at: float = field(default_factory=time.time)
+    last_seen_at: float = field(default_factory=time.time)
+    last_checked_at: float | None = None
+    error: str = ""
+    failure_count: int = 0
+    retry_after: float = 0
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "port": self.port,
+            "url": self.url,
+            "label": self.label,
+            "status": self.status,
+            "detected_at": self.detected_at,
+            "last_seen_at": self.last_seen_at,
+            "last_checked_at": self.last_checked_at,
+            "error": self.error,
+        }
 
 
 @dataclass(eq=False)
@@ -55,6 +129,10 @@ class TerminalSession:
     buffer_size: int = 0
     subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
     pending_input: bytearray = field(default_factory=bytearray)
+    services: dict[int, DetectedService] = field(default_factory=dict)
+    discovery_tail: str = ""
+    discovery_label_hint: str = ""
+    discovery_label_lines_left: int = 0
 
     @property
     def active(self) -> bool:
@@ -73,6 +151,11 @@ class TerminalSession:
             "created_at": self.created_at,
             "active": self.active,
             "return_code": self.return_code,
+            "services": [
+                service.as_dict()
+                for service in sorted(self.services.values(), key=lambda item: item.port)
+                if service.status == "online"
+            ],
         }
 
 
@@ -573,6 +656,122 @@ class TerminalManager:
         while session.buffer_size > self.scrollback_bytes and session.chunks:
             removed = session.chunks.popleft()
             session.buffer_size -= len(removed)
+        self._discover_services(session, chunk)
+
+    def _discover_services(self, session: TerminalSession, chunk: bytes) -> None:
+        if session.kind != "ssh" or not session.device_id:
+            return
+        text = chunk.decode("utf-8", errors="ignore")
+        combined = ANSI_ESCAPE.sub("", session.discovery_tail + text).replace("\r", "\n")
+        lines = combined.split("\n")
+        session.discovery_tail = lines[-1][-512:]
+        for line in lines[:-1]:
+            self._discover_services_in_line(session, line, complete=True)
+        # Many CLIs redraw a URL without a trailing newline. Parse the current
+        # tail as well; the port-keyed map keeps this idempotent.
+        self._discover_services_in_line(session, session.discovery_tail, complete=False)
+
+    @staticmethod
+    def _discover_services_in_line(
+        session: TerminalSession, line: str, *, complete: bool
+    ) -> None:
+        now = time.time()
+        product = service_product(line)
+        if product:
+            session.discovery_label_hint = product
+            session.discovery_label_lines_left = 2
+        hint = (
+            session.discovery_label_hint
+            if session.discovery_label_lines_left > 0
+            else ""
+        )
+        has_service_context = bool(product or hint or SERVICE_URL_CONTEXT.search(line))
+        candidates: dict[int, str] = {}
+        if has_service_context:
+            for match in LOCAL_SERVICE_URL.finditer(line):
+                port = int(match.group("port"))
+                if 1 <= port <= 65535:
+                    candidates[port] = match.group("url").rstrip(".,);]")
+        for match in LOCAL_SERVICE_PORT.finditer(line):
+            port = int(match.group("port"))
+            if 1 <= port <= 65535:
+                candidates.setdefault(port, f"http://localhost:{port}/")
+        for port, url in candidates.items():
+            label = product or hint or f"Web 服务 :{port}"
+            existing = session.services.get(port)
+            if existing:
+                existing.url = url
+                existing.last_seen_at = now
+                if existing.label.startswith("Web 服务"):
+                    existing.label = label
+                if existing.status == "offline" and now >= existing.retry_after:
+                    existing.status = "checking"
+                    existing.failure_count = 0
+                    existing.error = ""
+                continue
+            if len(session.services) >= MAX_DETECTED_SERVICES:
+                removable = sorted(
+                    (
+                        service
+                        for service in session.services.values()
+                        if service.status != "online"
+                    ),
+                    key=lambda service: service.last_seen_at,
+                )
+                if not removable:
+                    continue
+                session.services.pop(removable[0].port, None)
+            session.services[port] = DetectedService(
+                port=port,
+                url=url,
+                label=label,
+                detected_at=now,
+                last_seen_at=now,
+            )
+        if complete and line.strip() and not product and session.discovery_label_lines_left:
+            session.discovery_label_lines_left -= 1
+            if session.discovery_label_lines_left == 0:
+                session.discovery_label_hint = ""
+
+    def service_candidates(self) -> list[tuple[TerminalSession, DetectedService]]:
+        return [
+            (session, service)
+            for session in self.sessions.values()
+            if session.active and session.device_id
+            for service in session.services.values()
+            if service.status != "offline"
+        ]
+
+    def update_service_status(
+        self,
+        session_id: str,
+        port: int,
+        *,
+        online: bool,
+        error: str = "",
+        failure_threshold: int = 2,
+    ) -> tuple[DetectedService | None, bool]:
+        session = self.sessions.get(session_id)
+        service = session and session.services.get(port)
+        if not service:
+            return None, False
+        previous = service.status
+        service.last_checked_at = time.time()
+        if online:
+            service.status = "online"
+            service.error = ""
+            service.failure_count = 0
+        else:
+            service.failure_count += 1
+            service.error = error or "服务端口当前不可访问"
+            if service.failure_count >= max(1, failure_threshold):
+                service.status = "offline"
+            elif service.status != "online":
+                service.status = "checking"
+        became_offline = previous != "offline" and service.status == "offline"
+        if became_offline:
+            service.retry_after = time.time() + SERVICE_REDISCOVERY_COOLDOWN
+        return service, became_offline
 
     def _broadcast(self, session: TerminalSession, chunk: bytes) -> None:
         for queue in tuple(session.subscribers):

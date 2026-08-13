@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState } from 'react'
-import { Maximize2, XIcon } from 'lucide-react'
+import { Maximize2, Minus, XIcon } from 'lucide-react'
 
 import type { Device, TerminalSession } from '@/api'
 import { Eyebrow } from '@/components/Eyebrow'
@@ -12,6 +12,12 @@ const loadingFallback = (
     <span className="size-[7px] animate-world-pulse rounded-full bg-primary shadow-[0_0_10px_var(--color-primary)]" />
   </div>
 )
+
+const MOBILE_QUERY = '(max-width: 767.98px)'
+
+function isMobileViewport(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia(MOBILE_QUERY).matches
+}
 
 type Props = {
   devices: Device[]
@@ -26,8 +32,23 @@ type Props = {
 
 export function TerminalRoomOverview({ devices, sessions, busyId, activeSessionId, onOpen, onProbe, onEdit, onSelectTerminal }: Props) {
   const [expanded, setExpanded] = useState(false)
+  // 手机默认收起为小圆点，点击圆点直接打开弹窗，不经过悬浮窗。
+  const [collapsed, setCollapsed] = useState(isMobileViewport)
   return (
     <>
+      {collapsed ? (
+        <button
+          aria-label="打开设备房间总览"
+          title="打开设备房间总览"
+          onClick={() => {
+            if (isMobileViewport()) setExpanded(true)
+            else setCollapsed(false)
+          }}
+          className="absolute top-6 right-6 z-[7] grid size-7 cursor-pointer place-items-center rounded-full border border-[#365047] bg-[#06100ed9] shadow-[0_8px_25px_#000a] backdrop-blur-[7px] transition-transform hover:scale-110 max-md:top-3.5 max-md:right-3.5"
+        >
+          <i className="size-2 rounded-full bg-primary shadow-[0_0_8px_var(--color-primary)]" />
+        </button>
+      ) : (
       <div
         role="button"
         tabIndex={0}
@@ -49,10 +70,23 @@ export function TerminalRoomOverview({ devices, sessions, busyId, activeSessionI
           <i className="size-1.5 rounded-full bg-primary shadow-[0_0_8px_var(--color-primary)]" />
           {devices.filter((device) => device.frp_online).length}/{devices.length}
         </span>
+        <button
+          aria-label="收起设备房间总览"
+          title="收起为小圆点"
+          onClick={(event) => {
+            event.stopPropagation()
+            setCollapsed(true)
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          className="absolute top-[7px] right-[38px] z-[6] grid size-[25px] cursor-pointer place-items-center rounded-[7px] border border-[#365047] bg-[#06100ed9] text-[#b9c5ce] shadow-[0_5px_15px_#0008] backdrop-blur-[7px] transition-colors hover:text-primary"
+        >
+          <Minus className="size-3" />
+        </button>
         <span aria-hidden="true" className="pointer-events-none absolute top-[7px] right-[7px] z-[5] grid size-[25px] place-items-center rounded-[7px] border border-[#365047] bg-[#06100ed9] text-primary shadow-[0_5px_15px_#0008] backdrop-blur-[7px]">
           <Maximize2 className="size-3" />
         </span>
       </div>
+      )}
       <Dialog open={expanded} onOpenChange={setExpanded}>
         <DialogContent
           showCloseButton={false}

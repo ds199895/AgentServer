@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
+import { ChevronDown, ChevronUp, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
+import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
@@ -35,11 +37,14 @@ async function copyText(text: string): Promise<void> {
 }
 
 type Props = {
-  sessionId: string
+  session: TerminalSession
   visible: boolean
+  previewBusyPort?: number | null
+  onPreviewService?: (service: DetectedService) => void
 }
 
-export default function TerminalPane({ sessionId, visible }: Props) {
+export default function TerminalPane({ session, visible, previewBusyPort, onPreviewService }: Props) {
+  const sessionId = session.id
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
   const restoreRef = useRef<(() => void) | null>(null)
@@ -52,6 +57,12 @@ export default function TerminalPane({ sessionId, visible }: Props) {
   const [pastePanelOpen, setPastePanelOpen] = useState(false)
   const [pasteDraft, setPasteDraft] = useState('')
   const [notice, setNotice] = useState('')
+  const [showAllServices, setShowAllServices] = useState(false)
+  const [servicesCollapsed, setServicesCollapsed] = useState(
+    () => window.matchMedia('(max-width: 767px), (pointer: coarse)').matches,
+  )
+  const onlineServices = session.services.filter((service) => service.status === 'online')
+  const visibleServices = showAllServices ? onlineServices : onlineServices.slice(0, 3)
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -295,6 +306,37 @@ export default function TerminalPane({ sessionId, visible }: Props) {
       }
     }
     host.addEventListener('contextmenu', onContextMenu, true)
+    // xterm 自身不处理触摸滚动，这里把单指拖动映射为 scrollLines，
+    // 与上面的自定义滚轮逻辑保持一致（手指上滑 = 查看更新的输出）。
+    let touchRemainder = 0
+    let lastTouchY: number | null = null
+    const onTouchStart = (event: TouchEvent) => {
+      if (event.touches.length === 1) lastTouchY = event.touches[0].clientY
+    }
+    const onTouchMove = (event: TouchEvent) => {
+      if (lastTouchY === null || event.touches.length !== 1) return
+      event.preventDefault()
+      const y = event.touches[0].clientY
+      const pixelsPerLine = Math.max(
+        1,
+        (terminal.options.fontSize ?? 14) * (terminal.options.lineHeight ?? 1),
+      )
+      touchRemainder += (lastTouchY - y) / pixelsPerLine
+      lastTouchY = y
+      const lines = touchRemainder < 0 ? Math.ceil(touchRemainder) : Math.floor(touchRemainder)
+      if (lines !== 0) {
+        terminal.scrollLines(lines)
+        touchRemainder -= lines
+      }
+    }
+    const onTouchEnd = () => {
+      lastTouchY = null
+      touchRemainder = 0
+    }
+    host.addEventListener('touchstart', onTouchStart, { passive: true })
+    host.addEventListener('touchmove', onTouchMove, { passive: false })
+    host.addEventListener('touchend', onTouchEnd)
+    host.addEventListener('touchcancel', onTouchEnd)
     document.addEventListener('pointerdown', closeContextMenu)
     document.addEventListener('keydown', closeContextMenuOnEscape)
     const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fit))
@@ -315,6 +357,10 @@ export default function TerminalPane({ sessionId, visible }: Props) {
       window.cancelAnimationFrame(refreshFrame ?? 0)
       resizeObserver.disconnect()
       host.removeEventListener('contextmenu', onContextMenu, true)
+      host.removeEventListener('touchstart', onTouchStart)
+      host.removeEventListener('touchmove', onTouchMove)
+      host.removeEventListener('touchend', onTouchEnd)
+      host.removeEventListener('touchcancel', onTouchEnd)
       document.removeEventListener('pointerdown', closeContextMenu)
       document.removeEventListener('keydown', closeContextMenuOnEscape)
       document.removeEventListener('visibilitychange', restoreWhenPageReturns)
@@ -350,6 +396,77 @@ export default function TerminalPane({ sessionId, visible }: Props) {
           <span className={cn('size-1.5 rounded-full bg-[#f0bb5a]', connection === 'offline' && 'bg-[#ed6876]')} />
           {connection === 'connecting' ? '正在连接' : '连接已断开，正在重试'}
         </div>
+      )}
+      {visible && onlineServices.length > 0 && servicesCollapsed && (
+        <button
+          type="button"
+          aria-label="展开开发服务"
+          title="展开开发服务"
+          onClick={() => setServicesCollapsed(false)}
+          className="absolute right-4 bottom-4 z-20 flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-[#315a48] bg-[#102019ed] px-2.5 text-[9px] font-semibold text-primary shadow-[0_10px_30px_#000a] backdrop-blur-md hover:bg-[#193025] max-md:right-2 max-md:bottom-2 max-md:h-7 max-md:px-2"
+        >
+          <RadioTower className="size-3" />
+          服务 {onlineServices.length}
+          <ChevronUp className="size-3" />
+        </button>
+      )}
+      {visible && onlineServices.length > 0 && !servicesCollapsed && (
+        <aside
+          aria-label="检测到的开发服务"
+          className="absolute right-4 bottom-4 z-20 grid max-h-[min(310px,45%)] w-[min(300px,calc(100%-2rem))] gap-1.5 overflow-y-auto rounded-xl border border-[#30404b] bg-[#0c1319eF] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:right-2 max-md:bottom-2 max-md:max-h-[min(180px,30%)] max-md:w-[min(230px,62vw)] max-md:gap-1 max-md:rounded-lg max-md:p-1.5"
+        >
+          <div className="flex items-center gap-2 px-1 pb-0.5 text-[9px] font-semibold tracking-[0.09em] text-[#82919c] uppercase max-md:gap-1.5">
+            <RadioTower className="size-3 text-primary" />
+            <span className="min-w-0 flex-1 truncate">开发服务 · {onlineServices.length}</span>
+            <button
+              type="button"
+              aria-label="收起开发服务"
+              title="收起开发服务"
+              onClick={() => setServicesCollapsed(true)}
+              className="grid size-6 flex-none cursor-pointer place-items-center rounded-md text-[#71818c] hover:bg-[#1a2730] hover:text-primary max-md:size-5"
+            >
+              <ChevronDown className="size-3.5" />
+            </button>
+          </div>
+          {visibleServices.map((service) => {
+            const online = service.status === 'online'
+            const busy = previewBusyPort === service.port
+            return (
+              <div key={service.port} className="flex min-w-0 items-center gap-2 rounded-lg border border-[#25323c] bg-[#101820] px-2.5 py-2 max-md:gap-1.5 max-md:rounded-md max-md:px-2 max-md:py-1.5">
+                <Radio className={cn(
+                  'size-3.5 flex-none max-md:hidden',
+                  online && 'text-primary',
+                )} />
+                <div className="min-w-0 flex-1">
+                  <strong className="block truncate text-[10px] text-[#dce6ed]">{service.label}</strong>
+                  <small className="block truncate font-mono text-[8px] text-[#758590]">
+                    localhost:{service.port} · 运行中
+                  </small>
+                </div>
+                <button
+                  type="button"
+                  disabled={!online || busy}
+                  onClick={() => onPreviewService?.(service)}
+                  aria-label={`预览 ${service.label} localhost:${service.port}`}
+                  title="一键打开安全预览"
+                  className="grid h-7 flex-none cursor-pointer grid-cols-[auto_auto] items-center gap-1 rounded-md border border-[#315a48] bg-[#15251e] px-2 text-[9px] font-semibold text-primary hover:bg-[#1b3328] disabled:cursor-not-allowed disabled:border-[#2b353d] disabled:bg-[#151b20] disabled:text-[#59656e] max-md:size-7 max-md:grid-cols-1 max-md:px-0"
+                >
+                  {busy ? <LoaderCircle className="size-3 animate-spin" /> : <MonitorPlay className="size-3" />}
+                  <span className="max-md:hidden">{busy ? '打开中' : '预览'}</span>
+                </button>
+              </div>
+            )
+          })}
+          {onlineServices.length > 3 && (
+            <button
+              type="button"
+              onClick={() => setShowAllServices((value) => !value)}
+              className="h-7 cursor-pointer rounded-md border border-[#293641] bg-[#101820] px-2 text-[9px] text-[#84939e] hover:text-primary"
+            >
+              {showAllServices ? '收起' : `还有 ${onlineServices.length - 3} 个服务`}
+            </button>
+          )}
+        </aside>
       )}
       {contextMenu && visible && createPortal(
         <div

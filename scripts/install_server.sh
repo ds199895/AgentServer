@@ -57,6 +57,25 @@ python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
 
+# Keep source-based first installs working with the versioned service path.
+# Normal updates must use build_release.sh + deploy_release.sh instead.
+if [ ! -e "$APP_DIR/current" ]; then
+  ln -s . "$APP_DIR/current"
+fi
+if command -v git >/dev/null 2>&1 && git -C "$APP_DIR" rev-parse HEAD >/dev/null 2>&1; then
+  BUILD_SHA="$(git -C "$APP_DIR" rev-parse HEAD)"
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "错误: 首次安装需要 Node.js/npm 来构建带版本标识的前端" >&2
+    exit 2
+  fi
+  npm --prefix "$APP_DIR/frontend" ci
+  AGENTSERVER_BUILD_SHA="$BUILD_SHA" npm --prefix "$APP_DIR/frontend" run build
+  rm -rf "$APP_DIR/web_dist"
+  mv "$APP_DIR/frontend/dist" "$APP_DIR/web_dist"
+  printf '%s\n' "$BUILD_SHA" > "$APP_DIR/BUILD_SHA"
+  printf '{"build_sha":"%s"}\n' "$BUILD_SHA" > "$APP_DIR/web_dist/build.json"
+fi
+
 install -m 0644 deploy/agentserver.service /etc/systemd/system/agentserver.service
 install -m 0644 deploy/agentserver-tmux.service /etc/systemd/system/agentserver-tmux.service
 systemctl daemon-reload

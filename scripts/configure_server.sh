@@ -38,7 +38,7 @@ umask 077
 
 {
   echo "DATA_DIR=/var/lib/agentserver"
-  echo "WEB_DIST=/opt/agentserver/web_dist"
+  echo "WEB_DIST=/opt/agentserver/current/web_dist"
   echo "ENVIRONMENT=production"
   echo "ADMIN_USERNAME=admin"
   echo "ADMIN_PASSWORD=$admin_password"
