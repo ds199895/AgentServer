@@ -16,6 +16,7 @@ page.on('console', (message) => {
 
 try {
   await page.goto(base, { waitUntil: 'networkidle' })
+  await page.getByRole('button', { name: '进入控制台' }).waitFor()
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '进入控制台' }).click()
   await page.getByRole('navigation', { name: '主导航' }).waitFor()

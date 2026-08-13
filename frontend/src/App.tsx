@@ -118,25 +118,49 @@ export default function App() {
   }, [activePreview])
 
   useEffect(() => {
-    api.version()
-      .then(({ build_sha: backendBuildSha }) => {
+    let cancelled = false
+
+    const start = async () => {
+      try {
+        const { build_sha: backendBuildSha } = await api.version()
         if (frontendBuildSha !== 'development' && frontendBuildSha !== backendBuildSha) {
           throw new Error(`前后端版本不一致（前端 ${frontendBuildSha.slice(0, 12)}，后端 ${backendBuildSha.slice(0, 12)}）`)
         }
-        return api.me()
-      })
-      .then(({ username: name }) => { setUsername(name); return load() })
-      .catch((reason: unknown) => {
+      } catch (reason) {
+        if (cancelled) return
         if (reason instanceof Error && reason.message.startsWith('前后端版本不一致')) {
           setStartupError(`${reason.message}。部署已被安全拦截，请刷新或回滚版本。`)
           return
         }
-        if (frontendBuildSha !== 'development') {
-          setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+        setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+        return
+      }
+
+      let name: string
+      try {
+        const identity = await api.me()
+        name = identity.username
+      } catch (reason) {
+        if (cancelled) return
+        if (reason instanceof Error && 'status' in reason && reason.status === 401) {
+          setUsername(null)
           return
         }
-        setUsername(null)
-      })
+        setStartupError('无法确认登录状态，请检查网络连接后刷新页面。')
+        return
+      }
+
+      if (cancelled) return
+      setUsername(name)
+      try {
+        await load()
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : '无法加载控制台数据')
+      }
+    }
+
+    void start()
+    return () => { cancelled = true }
   }, [load])
   useEffect(() => {
     if (!username) return

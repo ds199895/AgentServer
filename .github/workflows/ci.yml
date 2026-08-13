@@ -44,6 +44,8 @@ jobs:
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
       - name: Build frontend
+        env:
+          AGENTSERVER_BUILD_SHA: ${{ github.sha }}
         run: npm --prefix frontend run build
       - name: Check shell scripts and whitespace
         run: |
@@ -58,6 +60,7 @@ jobs:
           ADMIN_PASSWORD: e2e-test-password
           DATA_DIR: /tmp/agentserver-ci-data
           WEB_DIST: frontend/dist
+          AGENTSERVER_BUILD_SHA: ${{ github.sha }}
           ENABLE_LOCAL_TERMINALS: '1'
           TERMINAL_CMD: /bin/sh
         run: |
