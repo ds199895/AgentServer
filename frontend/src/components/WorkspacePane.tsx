@@ -210,11 +210,19 @@ export function WorkspacePane({ session, onClose }: Props) {
   const [eventConnection, setEventConnection] = useState<EventConnection>('connecting')
   const currentPathRef = useRef('')
   const listingRequestRef = useRef(0)
+  const listingNavigationPendingRef = useRef(false)
   const fileRequestRef = useRef(0)
 
   const loadWorkspace = useCallback(async (path: string, quiet = false) => {
+    // Artifact events trigger a delayed background refresh. If the user has
+    // started an explicit navigation, a refresh of the previous currentPath
+    // must not invalidate or overwrite that newer directory request.
+    if (quiet && listingNavigationPendingRef.current) return
     const requestId = ++listingRequestRef.current
-    if (!quiet) setListingLoading(true)
+    if (!quiet) {
+      listingNavigationPendingRef.current = true
+      setListingLoading(true)
+    }
     setListingError('')
     try {
       const next = await api.workspace(session.id, path)
@@ -227,7 +235,10 @@ export function WorkspacePane({ session, onClose }: Props) {
       if (requestId !== listingRequestRef.current) return
       setListingError(reason instanceof Error ? reason.message : '无法读取工作区')
     } finally {
-      if (requestId === listingRequestRef.current) setListingLoading(false)
+      if (requestId === listingRequestRef.current && !quiet) {
+        listingNavigationPendingRef.current = false
+        setListingLoading(false)
+      }
     }
   }, [session.id])
 
