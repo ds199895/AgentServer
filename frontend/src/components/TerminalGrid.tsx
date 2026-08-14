@@ -1,19 +1,22 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-import type { DetectedService, TerminalSession } from '@/api'
+import type { DetectedService, Device, TerminalSession } from '@/api'
 import TerminalPane from '@/TerminalPane'
 import {
   MAX_RATIO,
   MIN_RATIO,
+  listLeaves,
   type LayoutDirection,
   type LayoutNode,
   type LeafNode,
   type SplitNode,
 } from '@/terminal-layout'
+import { buildTerminalDisplayMap } from '@/terminal-display'
 import { cn } from '@/lib/utils'
 
 type Props = {
   layout: LayoutNode | null
+  devices: Device[]
   sessions: TerminalSession[]
   /** page === 'terminals' — 离开终端页时所有 pane 隐藏但保持挂载 */
   pageVisible: boolean
@@ -27,6 +30,7 @@ type Props = {
   onFocusLeaf: (leafId: string) => void
   onRatio: (splitId: string, ratio: number) => void
   onSplit: (session: TerminalSession, leafId: string, direction: LayoutDirection) => void
+  onClosePane: (leafId: string) => void
   onPreviewService: (session: TerminalSession, service: DetectedService) => void
   onOpenWorkspace: (session: TerminalSession) => void
 }
@@ -36,6 +40,7 @@ type LeafPlacement = { leaf: LeafNode; rect: Rect }
 type SashPlacement = { split: SplitNode; rect: Rect }
 
 const FULL_RECT: Rect = { left: 0, top: 0, width: 1, height: 1 }
+const MAX_CACHED_TERMINALS = 8
 
 function collectPlacements(
   node: LayoutNode,
@@ -202,13 +207,14 @@ function SplitSash({
 }
 
 /**
- * 终端始终由同一个 sessions.map 扁平渲染。布局树只决定 wrapper 的几何和
- * 可见性；无论 leaf 被拆分、会话跨 leaf 移动还是响应式切换，React 的
- * parent + key 都保持不变，因此 xterm、WebSocket、选区和滚动位置都保留。
+ * 可见终端和最近使用的少量终端保持稳定挂载，因此日常切换仍保留
+ * xterm、选区和滚动位置。超出热缓存的隐藏会话会卸载 xterm/WS，
+ * 重新打开时依靠服务端快照恢复，避免数十个会话同时消耗浏览器资源。
  */
 export function TerminalGrid(props: Props) {
   const {
     layout,
+    devices,
     sessions,
     pageVisible,
     activeId,
@@ -219,27 +225,89 @@ export function TerminalGrid(props: Props) {
     onFocusLeaf,
     onRatio,
     onSplit,
+    onClosePane,
     onPreviewService,
     onOpenWorkspace,
   } = props
   const rootRef = useRef<HTMLDivElement>(null)
-  const { sessionPlacements, sashes } = useMemo(() => {
+  const { sessionPlacements, sashes, leafNumbers } = useMemo(() => {
     const placements = new Map<string, LeafPlacement>()
+    const numbers = new Map<string, number>()
     const nextSashes: SashPlacement[] = []
     if (layout) {
       const leaves: LeafPlacement[] = []
       collectPlacements(layout, FULL_RECT, leaves, nextSashes)
-      for (const placement of leaves) {
+      for (const [index, placement] of leaves.entries()) {
+        numbers.set(placement.leaf.id, index + 1)
         for (const sessionId of placement.leaf.tabs) placements.set(sessionId, placement)
       }
     }
-    return { sessionPlacements: placements, sashes: nextSashes }
+    return { sessionPlacements: placements, sashes: nextSashes, leafNumbers: numbers }
   }, [layout])
   const singleMode = forceSingle || !layout
+  const terminalDisplays = useMemo(() => buildTerminalDisplayMap(sessions), [sessions])
+  const visibleSessionIds = useMemo(() => {
+    const ids = new Set<string>()
+    if (!pageVisible) return ids
+    if (singleMode) {
+      if (activeId) ids.add(activeId)
+      return ids
+    }
+    if (layout) {
+      for (const leaf of listLeaves(layout)) {
+        if (leaf.activeTab) ids.add(leaf.activeTab)
+      }
+    }
+    return ids
+  }, [activeId, layout, pageVisible, singleMode])
+  const visibleKey = [...visibleSessionIds].join('\u0000')
+  const [cachedSessionIds, setCachedSessionIds] = useState<string[]>([])
+
+  useEffect(() => {
+    const validIds = new Set(sessions.map((session) => session.id))
+    const requiredIds = new Set(visibleSessionIds)
+    setCachedSessionIds((current) => {
+      const next = current.filter((id) => validIds.has(id) && !requiredIds.has(id))
+      for (const id of visibleSessionIds) next.push(id)
+      while (next.length > MAX_CACHED_TERMINALS) {
+        const removable = next.findIndex((id) => !requiredIds.has(id))
+        if (removable < 0) break
+        next.splice(removable, 1)
+      }
+      return next.length === current.length && next.every((id, index) => id === current[index])
+        ? current
+        : next
+    })
+  }, [sessions, visibleKey])
+
+  // The effect below maintains recency, but effects run after React commits.
+  // Trim the derived set as well so opening a cold terminal never creates a
+  // throwaway ninth xterm/WebSocket for one render while the cache is full.
+  const hiddenCacheBudget = Math.max(0, MAX_CACHED_TERMINALS - visibleSessionIds.size)
+  const hiddenCachedIds = hiddenCacheBudget > 0
+    ? cachedSessionIds
+        .filter((id) => !visibleSessionIds.has(id))
+        .slice(-hiddenCacheBudget)
+    : []
+  const mountedIds = new Set([
+    ...hiddenCachedIds,
+    ...visibleSessionIds,
+  ])
+  const mountedSessions = sessions.filter((session) => mountedIds.has(session.id))
 
   return (
-    <div ref={rootRef} className="relative h-full w-full min-h-0 min-w-0 overflow-hidden">
-      {sessions.map((session) => {
+    <div
+      ref={rootRef}
+      data-mounted-terminal-count={mountedSessions.length}
+      className="relative h-full w-full min-h-0 min-w-0 overflow-hidden"
+    >
+      {mountedSessions.map((session) => {
+        const currentDevice = session.device_id
+          ? devices.find((device) => device.id === session.device_id)
+          : null
+        const displaySession = currentDevice && currentDevice.name !== session.device_name
+          ? { ...session, device_name: currentDevice.name }
+          : session
         const placement = sessionPlacements.get(session.id)
         const rect = singleMode ? FULL_RECT : placement?.rect ?? FULL_RECT
         const visible = pageVisible && (singleMode
@@ -264,16 +332,21 @@ export function TerminalGrid(props: Props) {
             }}
             className={cn(
               'absolute min-h-0 min-w-0 overflow-hidden',
-              !singleMode && visible && leafId === focusedLeafId && 'ring-1 ring-inset ring-[#3d7a5c]',
+              !singleMode && visible && leafId === focusedLeafId && 'ring-2 ring-inset ring-[#4d9b74]',
             )}
           >
             <TerminalPane
-              session={session}
+              session={displaySession}
+              terminalLabel={terminalDisplays.get(session.id)?.label || session.name || '终端'}
+              workspaceLabel={session.workspace?.root || session.cwd || terminalDisplays.get(session.id)?.workspaceLabel || '默认目录'}
+              paneNumber={!singleMode && leafId ? (leafNumbers.get(leafId) ?? null) : null}
               visible={visible}
               focused={visible && session.id === activeId}
               previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
               canSplit={!singleMode && !splitting && Boolean(leafId)}
+              canClosePane={!singleMode && sashes.length > 0 && Boolean(leafId)}
               onSplit={(direction) => { if (leafId) onSplit(session, leafId, direction) }}
+              onClosePane={() => { if (leafId) onClosePane(leafId) }}
               onPreviewService={(service) => onPreviewService(session, service)}
               onOpenWorkspace={() => onOpenWorkspace(session)}
             />

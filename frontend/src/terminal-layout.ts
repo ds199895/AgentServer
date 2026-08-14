@@ -65,9 +65,85 @@ export function firstLeaf(root: LayoutNode): LeafNode {
   return root.type === 'leaf' ? root : firstLeaf(root.children[0])
 }
 
+export function listLeaves(root: LayoutNode): LeafNode[] {
+  if (root.type === 'leaf') return [root]
+  return [...listLeaves(root.children[0]), ...listLeaves(root.children[1])]
+}
+
 export function listSessionIds(root: LayoutNode): string[] {
   if (root.type === 'leaf') return root.tabs
   return [...listSessionIds(root.children[0]), ...listSessionIds(root.children[1])]
+}
+
+function appendTabsToFirstLeaf(
+  root: LayoutNode,
+  tabs: string[],
+): { root: LayoutNode; leafId: string } {
+  if (root.type === 'leaf') {
+    const existing = new Set(root.tabs)
+    const additions = tabs.filter((tab) => {
+      if (existing.has(tab)) return false
+      existing.add(tab)
+      return true
+    })
+    return {
+      root: additions.length > 0 ? { ...root, tabs: [...root.tabs, ...additions] } : root,
+      leafId: root.id,
+    }
+  }
+  const appended = appendTabsToFirstLeaf(root.children[0], tabs)
+  return {
+    root: appended.root === root.children[0]
+      ? root
+      : { ...root, children: [appended.root, root.children[1]] },
+    leafId: appended.leafId,
+  }
+}
+
+/**
+ * 关闭一个窗格但保留其中的会话。目标 leaf 的最近父 split 会坍缩，
+ * 其全部标签追加到兄弟子树的第一个 leaf，且不改变接收 leaf 的 activeTab。
+ * 根节点本身是唯一 leaf 或 leafId 无效时返回 null。
+ */
+export function closeLeaf(
+  root: LayoutNode,
+  leafId: string,
+): { root: LayoutNode; focusedLeafId: string } | null {
+  if (root.type === 'leaf') return null
+
+  const closeInNode = (
+    node: LayoutNode,
+  ): { root: LayoutNode; focusedLeafId: string } | null => {
+    if (node.type === 'leaf') return null
+    const [first, second] = node.children
+
+    if (first.type === 'leaf' && first.id === leafId) {
+      const receiver = appendTabsToFirstLeaf(second, first.tabs)
+      return { root: receiver.root, focusedLeafId: receiver.leafId }
+    }
+    if (second.type === 'leaf' && second.id === leafId) {
+      const receiver = appendTabsToFirstLeaf(first, second.tabs)
+      return { root: receiver.root, focusedLeafId: receiver.leafId }
+    }
+
+    const closedFirst = closeInNode(first)
+    if (closedFirst) {
+      return {
+        root: { ...node, children: [closedFirst.root, second] },
+        focusedLeafId: closedFirst.focusedLeafId,
+      }
+    }
+    const closedSecond = closeInNode(second)
+    if (closedSecond) {
+      return {
+        root: { ...node, children: [first, closedSecond.root] },
+        focusedLeafId: closedSecond.focusedLeafId,
+      }
+    }
+    return null
+  }
+
+  return closeInNode(root)
 }
 
 function setActiveTab(root: LayoutNode, leafId: string, sessionId: string): LayoutNode {
@@ -123,14 +199,13 @@ export type ActivateResult = { root: LayoutNode; leafId: string }
 
 /**
  * 让一个会话成为某个 leaf 的 activeTab,并返回应聚焦的 leaf。
- * - 会话已在树中且 move 为 false:仅在原 leaf 激活,结构不变。
- * - move 为 true:移动到指定 leaf(标签栏点击 = 把终端挪进聚焦窗格)。
+ * - 会话已在树中:仅在原 leaf 激活,结构和归属不变。
  * - 会话不在树中(新建):追加到指定 leaf 或第一个 leaf。
  */
 export function activateSession(
   root: LayoutNode | null,
   sessionId: string,
-  options: { leafId?: string | null; move?: boolean } = {},
+  options: { leafId?: string | null } = {},
 ): ActivateResult {
   if (!root) {
     const leaf = createLeaf([sessionId], sessionId)
@@ -138,10 +213,10 @@ export function activateSession(
   }
   const currentLeaf = leafOfSession(root, sessionId)
   const targetId = options.leafId && findLeaf(root, options.leafId) ? options.leafId : null
-  if (currentLeaf && (!options.move || !targetId || currentLeaf.id === targetId)) {
+  if (currentLeaf) {
     return { root: setActiveTab(root, currentLeaf.id, sessionId), leafId: currentLeaf.id }
   }
-  let next = currentLeaf ? removeSession(root, sessionId) : root
+  let next = root
   if (!next) {
     const leaf = createLeaf([sessionId], sessionId)
     return { root: leaf, leafId: leaf.id }

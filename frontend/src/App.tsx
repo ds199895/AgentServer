@@ -18,9 +18,11 @@ import { Topbar, type MainPage } from '@/components/Topbar'
 import { WorkspacePane } from '@/components/WorkspacePane'
 import {
   activateSession,
+  closeLeaf,
   findLeaf,
   firstLeaf,
   leafOfSession,
+  listLeaves,
   parseLayout,
   reconcile,
   removeSession,
@@ -39,8 +41,6 @@ const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
 
 type ShowTerminalOptions = {
   replace?: boolean
-  /** 顶部终端 Tab 像 VS Code 一样在当前活动窗格中打开。 */
-  targetFocusedLeaf?: boolean
 }
 
 function initialLayout(): { layout: LayoutNode | null; focusedLeafId: string | null } {
@@ -72,6 +72,22 @@ function storeTerminalId(id: string | null): void {
   } catch {
     // Routing still works when browser storage is unavailable.
   }
+}
+
+function focusTerminalInput(id: string): void {
+  const previousActiveElement = document.activeElement
+  window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+    const activeElement = document.activeElement
+    const focusIsStillAvailable =
+      activeElement === previousActiveElement ||
+      activeElement === document.body ||
+      activeElement === document.documentElement ||
+      (previousActiveElement instanceof Element && !previousActiveElement.isConnected)
+    if (!focusIsStillAvailable) return
+    const pane = [...document.querySelectorAll<HTMLElement>('[data-terminal-id]')]
+      .find((element) => element.dataset.terminalId === id)
+    pane?.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus({ preventScroll: true })
+  }))
 }
 
 function routeFromLocation(): { page: MainPage; terminalId: string | null } {
@@ -112,6 +128,7 @@ export default function App() {
   const [layout, setLayout] = useState<LayoutNode | null>(() => initialLayout().layout)
   const [focusedLeafId, setFocusedLeafId] = useState<string | null>(() => initialLayout().focusedLeafId)
   const [forceSingle, setForceSingle] = useState(isCoarseLayout)
+  const [focusMode, setFocusMode] = useState(false)
   const [splitting, setSplitting] = useState(false)
   const [error, setError] = useState('')
   const [startupError, setStartupError] = useState('')
@@ -268,6 +285,9 @@ export default function App() {
     return () => media.removeEventListener('change', onChange)
   }, [])
   useEffect(() => {
+    if (focusMode && (!layout || listLeaves(layout).length <= 1)) setFocusMode(false)
+  }, [focusMode, layout])
+  useEffect(() => {
     try {
       if (layout) window.localStorage.setItem(LAYOUT_KEY, serializeLayout(layout, focusedLeafId))
       else window.localStorage.removeItem(LAYOUT_KEY)
@@ -294,39 +314,26 @@ export default function App() {
   }, [load])
 
   const showTerminal = (id: string | null, options: ShowTerminalOptions = {}) => {
-    const { replace = false, targetFocusedLeaf = false } = options
+    const { replace = false } = options
     activeIdRef.current = id; setActiveId(id); setMissingTerminalId(null); setPage('terminals')
     setWorkspaceSessionId((current) => current === null ? null : id)
     lastTerminalIdRef.current = id
     storeTerminalId(id)
     if (id) {
-      // 顶部 Tab 以最后聚焦的窗格为目标，和 VS Code 的 active editor group
-      // 一致。移动端仍只激活会话原本所在的 leaf，避免单窗格模式暗中改坏
-      // 已持久化的桌面分屏结构。若目标已经显示在另一个窗格，则直接聚焦
-      // 那个窗格；一个 xterm 不能同时出现在两个位置，也不应移走唯一 Tab
-      // 导致现有分屏坍缩。
+      // 所有入口都遵循同一条 reveal 语义：已归属某个窗格的会话
+      // 只在原窗格激活并聚焦，不再因“从哪里点击”而暗中跨窗格搬移。
+      // 只有尚未进入布局的新会话才放入当前聚焦窗格。
       const root = layoutRef.current
       const currentLeaf = root ? leafOfSession(root, id) : null
-      const targetLeaf = root && focusedLeafIdRef.current
-        ? findLeaf(root, focusedLeafIdRef.current)
-        : null
-      const moveToTarget = Boolean(
-        targetFocusedLeaf &&
-        !forceSingle &&
-        currentLeaf &&
-        targetLeaf &&
-        currentLeaf.id !== targetLeaf.id &&
-        currentLeaf.activeTab !== id,
-      )
-      const activated = activateSession(layoutRef.current, id, {
-        leafId: focusedLeafIdRef.current,
-        move: moveToTarget,
-      })
+      const activated = currentLeaf
+        ? activateSession(root, id)
+        : activateSession(root, id, { leafId: focusedLeafIdRef.current })
       setLayoutState(activated.root)
       setFocusedLeafState(activated.leafId)
     }
     const path = id ? `/terminal/${encodeURIComponent(id)}` : '/terminals'
     if (window.location.pathname !== path) window.history[replace ? 'replaceState' : 'pushState']({}, '', path)
+    if (id) focusTerminalInput(id)
   }
   const focusLeaf = (leafId: string) => {
     if (focusedLeafIdRef.current === leafId) return
@@ -379,12 +386,33 @@ export default function App() {
       storeTerminalId(session.id)
       const path = `/terminal/${encodeURIComponent(session.id)}`
       if (window.location.pathname !== path) window.history.pushState({}, '', path)
+      focusTerminalInput(session.id)
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法拆分终端') }
     finally {
       splittingRef.current = false
       finishSessionMutation()
       setSplitting(false)
       void load().catch(() => undefined)
+    }
+  }
+  const closeTerminalPane = (leafId: string) => {
+    const root = layoutRef.current
+    if (!root) return
+    const result = closeLeaf(root, leafId)
+    if (!result) return
+    setLayoutState(result.root)
+    setFocusedLeafState(result.focusedLeafId)
+    const nextLeaf = findLeaf(result.root, result.focusedLeafId)
+    const nextId = nextLeaf?.activeTab ?? nextLeaf?.tabs[0] ?? null
+    activeIdRef.current = nextId
+    setActiveId(nextId)
+    lastTerminalIdRef.current = nextId
+    storeTerminalId(nextId)
+    setWorkspaceSessionId((current) => current === null ? null : nextId)
+    if (nextId) {
+      const path = `/terminal/${encodeURIComponent(nextId)}`
+      if (window.location.pathname !== path) window.history.replaceState({}, '', path)
+      focusTerminalInput(nextId)
     }
   }
   const navigate = (nextPage: MainPage, replace = false) => {
@@ -412,15 +440,16 @@ export default function App() {
     }
   }
   const cloneTerminal = async (source: TerminalSession) => {
-    if (!source.device_id) return
     beginSessionMutation()
     setCloningId(source.id); setError('')
     try {
-      const session = await api.createDeviceTerminal(
-        source.device_id,
-        source.device_name || source.name,
-        source.workspace?.root,
-      )
+      const session = source.device_id
+        ? await api.createDeviceTerminal(
+            source.device_id,
+            source.device_name || source.name,
+            source.workspace?.root,
+          )
+        : await api.createTerminal(source.name, source.workspace?.root)
       setSessions((current) => current.some((item) => item.id === session.id) ? current : [...current, session]); showTerminal(session.id)
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法克隆终端') }
     finally {
@@ -522,10 +551,19 @@ export default function App() {
       <section className={cn('grid min-h-0 min-w-0', showTerminalTabs ? 'grid-rows-[44px_minmax(0,1fr)] max-md:grid-rows-[auto_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
         {showTerminalTabs && (
           <TerminalTabsBar
+            devices={devices}
             sessions={sessions}
             activeId={activeId}
             cloningId={cloningId}
-            onSelect={(id) => showTerminal(id, { targetFocusedLeaf: true })}
+            layout={layout}
+            focusedLeafId={focusedLeafId}
+            focusMode={focusMode}
+            coarseMode={forceSingle}
+            onToggleFocusMode={() => {
+              setFocusMode((current) => !current)
+              if (activeId) focusTerminalInput(activeId)
+            }}
+            onSelect={(id) => showTerminal(id)}
             onClose={setCloseTarget}
             onClone={(source) => void cloneTerminal(source)}
             onPreview={(source) => setPreviewTarget({ deviceId: source.device_id || undefined, terminalId: source.id })}
@@ -539,11 +577,12 @@ export default function App() {
             )}>
               <TerminalGrid
                 layout={layout}
+                devices={devices}
                 sessions={sessions}
                 pageVisible={page === 'terminals'}
                 activeId={activeId}
                 focusedLeafId={focusedLeafId}
-                forceSingle={forceSingle}
+                forceSingle={forceSingle || focusMode}
                 previewBusy={previewBusy}
                 splitting={splitting}
                 onFocusLeaf={focusLeaf}
@@ -551,6 +590,7 @@ export default function App() {
                   if (layoutRef.current) setLayoutState(setRatio(layoutRef.current, splitId, ratio))
                 }}
                 onSplit={(session, leafId, direction) => void splitTerminal(session, leafId, direction)}
+                onClosePane={closeTerminalPane}
                 onPreviewService={(session, service) => void openDetectedService(session, service)}
                 onOpenWorkspace={(session) => setWorkspaceSessionId(session.id)}
               />

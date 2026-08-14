@@ -9,13 +9,20 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
 const pageErrors = []
 const consoleErrors = []
+const terminalDeleteRequests = []
 const contractName = `contract-check-${Date.now().toString(36)}`
 const switchName = `${contractName}-switch`
+const scalePrefix = `${contractName}-scale-`
 let terminalId = ''
 let switchTerminalId = ''
 page.on('pageerror', (error) => pageErrors.push(error.message))
 page.on('console', (message) => {
   if (message.type() === 'error') consoleErrors.push(message.text())
+})
+page.on('request', (request) => {
+  if (request.method() === 'DELETE' && request.url().includes('/api/terminals/')) {
+    terminalDeleteRequests.push(request.url())
+  }
 })
 
 try {
@@ -176,7 +183,7 @@ try {
 
   // A real split creates a second local terminal, mounts both panes, supports
   // keyboard sash adjustment, and survives a page reload through localStorage.
-  await page.getByRole('button', { name: '向右拆分终端' }).first().click()
+  await page.getByRole('button', { name: '新建同设备终端并向右分屏' }).first().click()
   await page.waitForFunction(() => {
     const hosts = [...document.querySelectorAll('.terminal-host')]
     return hosts.filter((host) => {
@@ -185,9 +192,9 @@ try {
     }).length >= 2
   })
 
-  // VS Code-style active group routing: clicking a pane makes it the target
-  // for the next global terminal Tab selection. Moving a hidden terminal into
-  // the right pane must leave the visible terminal in the left pane untouched.
+  // Every entry point uses the same reveal rule. A hidden terminal remains in
+  // its owning pane and focuses that pane; selecting it must never implicitly
+  // move it into whichever pane happened to be focused last.
   const primaryPane = page.locator(`[data-terminal-id="${terminalId}"]`)
   const visiblePanes = page.locator('[data-terminal-visible="true"]')
   const initialVisible = await visiblePanes.evaluateAll((nodes) => nodes.map((node) => ({
@@ -208,55 +215,67 @@ try {
   await page.waitForFunction((id) => (
     document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
   ), rightTerminalId)
-  await page.getByRole('button', {
-    name: `切换到 ${switchName} 终端 ${switchTerminalId.slice(0, 8)}`,
-  }).click()
-  await page.waitForFunction(({ primaryId, targetId }) => {
-    const primary = document.querySelector(`[data-terminal-id="${primaryId}"]`)
+  await page.getByRole('button', { name: '搜索终端' }).click()
+  const terminalSearch = page.getByRole('combobox')
+  await terminalSearch.fill(switchName)
+  await terminalSearch.press('Enter')
+  await page.waitForFunction(({ targetId, rightId }) => {
+    const right = document.querySelector(`[data-terminal-id="${rightId}"]`)
     const target = document.querySelector(`[data-terminal-id="${targetId}"]`)
-    if (!primary || !target) return false
-    const primaryRect = primary.getBoundingClientRect()
+    if (!right || !target) return false
+    const rightRect = right.getBoundingClientRect()
     const targetRect = target.getBoundingClientRect()
     return (
-      primary.getAttribute('data-terminal-visible') === 'true' &&
+      right.getAttribute('data-terminal-visible') === 'true' &&
       target.getAttribute('data-terminal-visible') === 'true' &&
       target.getAttribute('data-terminal-focused') === 'true' &&
-      primaryRect.left < targetRect.left
+      targetRect.left < rightRect.left
     )
-  }, { primaryId: terminalId, targetId: switchTerminalId })
-  if (await rightPane.getAttribute('data-terminal-visible') !== 'false') {
-    throw new Error('previous right terminal did not become an inactive tab')
+  }, { targetId: switchTerminalId, rightId: rightTerminalId })
+  if (await rightPane.getAttribute('data-terminal-visible') !== 'true') {
+    throw new Error('revealing a hidden terminal unexpectedly replaced the other pane')
   }
   const targetPane = page.locator(`[data-terminal-id="${switchTerminalId}"]`)
   if (
     !rightLeafId ||
-    await targetPane.getAttribute('data-terminal-leaf-id') !== rightLeafId ||
+    await targetPane.getAttribute('data-terminal-leaf-id') === rightLeafId ||
     await rightPane.getAttribute('data-terminal-leaf-id') !== rightLeafId
   ) {
-    throw new Error('selected terminal was not placed in the focused right pane')
+    throw new Error('selected terminal was implicitly moved into the focused right pane')
   }
-  // A Tab that is already visible focuses its existing pane instead of moving
-  // the sole terminal out of that pane and collapsing the split.
-  await page.getByRole('button', {
-    name: `切换到 ${contractName} 终端 ${terminalId.slice(0, 8)}`,
-  }).click()
+  await page.getByRole('button', { name: new RegExp(`^\u5207\u6362\u5230 .* ${terminalId.slice(0, 8)}$`) }).click()
   await page.waitForFunction((id) => (
     document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
   ), terminalId)
-  if (await targetPane.getAttribute('data-terminal-visible') !== 'true') {
-    throw new Error('focusing an already visible terminal collapsed or replaced the other pane')
+  if (
+    await targetPane.getAttribute('data-terminal-visible') !== 'false' ||
+    await rightPane.getAttribute('data-terminal-visible') !== 'true'
+  ) {
+    throw new Error('switching a pane-local tab changed the other visible pane')
   }
+
+  // Focus mode is a view-only toggle: it temporarily shows one terminal and
+  // restores the persisted split without changing pane membership.
+  await page.getByRole('button', { name: '聚焦当前终端' }).click()
+  await page.waitForFunction(() => (
+    document.querySelectorAll('[data-terminal-visible="true"]').length === 1
+  ))
+  await page.getByRole('button', { name: '恢复分屏' }).click()
+  await page.waitForFunction(() => (
+    document.querySelectorAll('[data-terminal-visible="true"]').length === 2
+  ))
 
   const separator = page.getByRole('separator', { name: '调整左右终端宽度' }).first()
   await separator.focus()
   await page.keyboard.press('End')
-  if ((await separator.getAttribute('aria-valuenow')) !== '85') {
-    throw new Error('split separator End key did not select the maximum ratio')
-  }
+  await page.waitForFunction(() => (
+    document.querySelector('[role="separator"][aria-label="调整左右终端宽度"]')?.getAttribute('aria-valuenow') === '85'
+  ))
+  await separator.focus()
   await page.keyboard.press('Home')
-  if ((await separator.getAttribute('aria-valuenow')) !== '15') {
-    throw new Error('split separator Home key did not select the minimum ratio')
-  }
+  await page.waitForFunction(() => (
+    document.querySelector('[role="separator"][aria-label="调整左右终端宽度"]')?.getAttribute('aria-valuenow') === '15'
+  ))
   await page.reload({ waitUntil: 'networkidle' })
   await page.getByRole('separator', { name: '调整左右终端宽度' }).waitFor()
   await page.waitForFunction(() => {
@@ -266,6 +285,72 @@ try {
       return rect.width > 0 && rect.height > 0
     }).length >= 2
   })
+
+  // A larger session pool must remain searchable without mounting one xterm
+  // and WebSocket per hidden terminal. The result list itself must scroll.
+  await page.evaluate(async ({ prefix, count }) => {
+    await Promise.all(Array.from({ length: count }, async (_, index) => {
+      const response = await fetch('/api/terminals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `${prefix}${index + 1}` }),
+      })
+      if (!response.ok) throw new Error(`failed to create scale terminal ${index + 1}: ${response.status}`)
+    }))
+  }, { prefix: scalePrefix, count: 18 })
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('separator', { name: '调整左右终端宽度' }).waitFor()
+  const mountedTerminalCount = Number(await page.locator('[data-mounted-terminal-count]').getAttribute('data-mounted-terminal-count'))
+  if (!Number.isFinite(mountedTerminalCount) || mountedTerminalCount > 8) {
+    throw new Error(`hidden terminal cache mounted ${mountedTerminalCount} terminals, expected at most 8`)
+  }
+  await page.getByRole('button', { name: '搜索终端' }).click()
+  await page.getByRole('combobox').fill(scalePrefix)
+  await page.waitForFunction((expected) => document.querySelectorAll('[role="option"]').length === expected, 18)
+  const searchListMetrics = await page.getByRole('listbox', { name: '终端搜索结果' }).evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }))
+  if (searchListMetrics.scrollHeight <= searchListMetrics.clientHeight || !['auto', 'scroll'].includes(searchListMetrics.overflowY)) {
+    throw new Error(`terminal search results are not scrollable: ${JSON.stringify(searchListMetrics)}`)
+  }
+  await page.keyboard.press('Escape')
+
+  // Visible groups expand automatically, but remain an explicit user choice.
+  // Collapsing a busy group must actually hide its chips instead of immediately
+  // reopening it, and the responsive search dialog must stay usable on phones.
+  const localGroup = page.locator('section[aria-label^="本机，"]').first()
+  const localGroupToggle = localGroup.locator('button[aria-expanded]').first()
+  await localGroupToggle.click()
+  if (await localGroupToggle.getAttribute('aria-expanded') !== 'false') {
+    throw new Error('the visible terminal group could not be collapsed')
+  }
+  if (await localGroup.getByRole('button', { name: /^切换到 / }).count() !== 0) {
+    throw new Error('collapsed terminal group still exposes session chips')
+  }
+  await localGroupToggle.click()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: '搜索终端' }).click()
+  await page.getByRole('combobox').fill(scalePrefix)
+  await page.waitForFunction((expected) => document.querySelectorAll('[role="option"]').length === expected, 18)
+  const mobileDialog = await page.getByRole('dialog').boundingBox()
+  if (!mobileDialog || mobileDialog.x < 0 || mobileDialog.x + mobileDialog.width > 390) {
+    throw new Error(`terminal search dialog overflows the mobile viewport: ${JSON.stringify(mobileDialog)}`)
+  }
+  const mobileSearchListMetrics = await page.getByRole('listbox', { name: '终端搜索结果' }).evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }))
+  if (
+    mobileSearchListMetrics.scrollHeight <= mobileSearchListMetrics.clientHeight ||
+    !['auto', 'scroll'].includes(mobileSearchListMetrics.overflowY)
+  ) {
+    throw new Error(`mobile terminal search results are not scrollable: ${JSON.stringify(mobileSearchListMetrics)}`)
+  }
+  await page.keyboard.press('Escape')
+  await page.setViewportSize({ width: 1280, height: 800 })
 
   await page.getByRole('button', { name: '打开工作区文件' }).first().click()
   const workspacePane = page.getByRole('complementary', { name: /工作区/ })
@@ -278,6 +363,47 @@ try {
   await workspacePane.getByRole('img', { name: 'favicon.png' }).waitFor()
   await workspacePane.getByRole('button', { name: /Artifacts/ }).click()
   await workspacePane.getByText('不可变').first().waitFor()
+
+  // Closing a pane is a layout-only operation. The backend terminal remains
+  // available after the split geometry collapses.
+  await workspacePane.getByRole('button', { name: '关闭工作区' }).click()
+  const receiverLeafId = await primaryPane.getAttribute('data-terminal-leaf-id')
+  await rightPane.getByRole('button', { name: '关闭窗格（保留终端）' }).click()
+  await page.waitForFunction(() => document.querySelectorAll('[role="separator"]').length === 0)
+  if (
+    !receiverLeafId ||
+    await rightPane.getAttribute('data-terminal-leaf-id') !== receiverLeafId
+  ) {
+    throw new Error('closing a pane did not retain its terminal in the receiving leaf')
+  }
+  if (terminalDeleteRequests.some((url) => url.endsWith(`/api/terminals/${rightTerminalId}`))) {
+    throw new Error('closing a pane issued a terminal DELETE request')
+  }
+  const retainedAfterPaneClose = await page.evaluate(async (sessionId) => {
+    const response = await fetch('/api/terminals')
+    if (!response.ok) return false
+    const currentSessions = await response.json()
+    return currentSessions.some((session) => session.id === sessionId)
+  }, rightTerminalId)
+  if (!retainedAfterPaneClose) throw new Error('closing a pane terminated its backend session')
+  await page.getByRole('button', { name: '搜索终端' }).click()
+  await page.getByRole('combobox').fill(rightTerminalId)
+  await page.getByRole('combobox').press('Enter')
+  await page.waitForFunction(({ sessionId, leafId }) => {
+    const pane = document.querySelector(`[data-terminal-id="${sessionId}"]`)
+    return (
+      pane?.getAttribute('data-terminal-visible') === 'true' &&
+      pane.getAttribute('data-terminal-focused') === 'true' &&
+      pane.getAttribute('data-terminal-leaf-id') === leafId &&
+      document.querySelectorAll('[role="separator"]').length === 0
+    )
+  }, { sessionId: rightTerminalId, leafId: receiverLeafId })
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.waitForFunction((sessionId) => (
+    document.querySelector(`[data-terminal-id="${sessionId}"]`)?.getAttribute('data-terminal-visible') === 'true' &&
+    document.querySelectorAll('[role="separator"]').length === 0
+  ), rightTerminalId)
+
   await page.waitForTimeout(500)
   if (pageErrors.length) throw new Error(`page errors: ${pageErrors.join(' | ')}`)
   const meaningfulConsoleErrors = consoleErrors.filter(
@@ -286,9 +412,9 @@ try {
   if (meaningfulConsoleErrors.length) {
     throw new Error(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
   }
-  console.log('terminal split, active-pane routing, workspace, file range, artifact, and read-image contracts passed')
+  console.log('terminal search/reveal, split focus/close, workspace, file range, artifact, and read-image contracts passed')
 } finally {
-  await page.evaluate(async ({ sessionId, switchSessionId, name, alternateName }) => {
+  await page.evaluate(async ({ sessionId, switchSessionId, name, alternateName, scaleNamePrefix }) => {
     const response = await fetch('/api/terminals')
     if (!response.ok) return
     const sessions = await response.json()
@@ -296,7 +422,8 @@ try {
       session.id === sessionId ||
       session.id === switchSessionId ||
       session.name === name ||
-      session.name === alternateName
+      session.name === alternateName ||
+      session.name.startsWith(scaleNamePrefix)
     ))
     await Promise.all(owned.map((session) => (
       fetch(`/api/terminals/${encodeURIComponent(session.id)}`, { method: 'DELETE' })
@@ -306,6 +433,7 @@ try {
     switchSessionId: switchTerminalId,
     name: contractName,
     alternateName: switchName,
+    scaleNamePrefix: scalePrefix,
   }).catch(() => {})
   await browser.close()
 }

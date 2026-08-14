@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from 'react'
+import { lazy, Suspense, useMemo, useState } from 'react'
 import { Activity, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
 import type { Device, TerminalSession } from '@/api'
@@ -34,6 +34,16 @@ type Props = {
 
 export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onPreview }: Props) {
   const [view, setView] = useState<'world' | 'list'>('world')
+  const sessionsByDevice = useMemo(() => {
+    const result = new Map<string, TerminalSession[]>()
+    for (const session of sessions) {
+      if (!session.device_id) continue
+      const current = result.get(session.device_id)
+      if (current) current.push(session)
+      else result.set(session.device_id, [session])
+    }
+    return result
+  }, [sessions])
   const online = devices.filter((device) => device.frp_online).length
   const sshReady = devices.filter((device) => device.ssh_available).length
   const metrics: Array<[string, number]> = [
@@ -103,7 +113,10 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
               </TableRow>
             </TableHeader>
             <TableBody>
-              {devices.map((device) => (
+              {devices.map((device) => {
+                const deviceSessions = sessionsByDevice.get(device.id) || []
+                const recentSession = [...deviceSessions].reverse().find((session) => session.active) || deviceSessions.at(-1)
+                return (
                 <TableRow key={device.id}>
                   <TableCell>
                     <div className="flex min-w-[190px] items-center gap-[11px] max-md:min-w-0">
@@ -132,10 +145,32 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end gap-[5px]">
-                      <Button variant="outline" size="xs" aria-label={`打开 ${device.name} 终端`} className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={busyId === device.id || !device.ssh_available} onClick={() => onOpen(device)}>
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        aria-label={recentSession ? `继续 ${device.name} 最近的终端` : `新建 ${device.name} 终端`}
+                        title={recentSession ? `继续最近终端（共 ${deviceSessions.length} 个）` : '新建终端'}
+                        className="max-md:size-7 max-md:rounded-md max-md:px-0"
+                        disabled={!recentSession && (busyId === device.id || !device.ssh_available)}
+                        onClick={() => recentSession ? onSelectTerminal(recentSession.id) : onOpen(device)}
+                      >
                         <Terminal />
-                        <span className="max-md:hidden">终端</span>
+                        <span className="max-md:hidden">{recentSession ? `继续·${deviceSessions.length}` : '新建'}</span>
                       </Button>
+                      {recentSession && (
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          aria-label={`在 ${device.name} 新建终端`}
+                          title="新建一个独立终端"
+                          className="max-md:size-7 max-md:rounded-md max-md:px-0"
+                          disabled={busyId === device.id || !device.ssh_available}
+                          onClick={() => onOpen(device)}
+                        >
+                          <Plus />
+                          <span className="max-md:hidden">新建</span>
+                        </Button>
+                      )}
                       <Button variant="outline" size="xs" aria-label={`预览 ${device.name} 的开发服务`} className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={!device.ssh_available} onClick={() => onPreview(device)}>
                         <MonitorPlay />
                         <span className="max-md:hidden">预览</span>
@@ -155,7 +190,8 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                     </div>
                   </TableCell>
                 </TableRow>
-              ))}
+                )
+              })}
               {!devices.length && (
                 <TableRow>
                   <TableCell colSpan={7}>

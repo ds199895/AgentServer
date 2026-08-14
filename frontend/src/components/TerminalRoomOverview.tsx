@@ -44,7 +44,7 @@ export function TerminalRoomOverview({ devices, sessions, busyId, activeSessionI
             if (isMobileViewport()) setExpanded(true)
             else setCollapsed(false)
           }}
-          className="absolute top-6 right-6 z-[7] grid size-7 cursor-pointer place-items-center rounded-full border border-[#365047] bg-[#06100ed9] shadow-[0_8px_25px_#000a] backdrop-blur-[7px] transition-transform hover:scale-110 max-md:top-3.5 max-md:right-3.5"
+          className="absolute top-[60px] right-6 z-[7] grid size-7 cursor-pointer place-items-center rounded-full border border-[#365047] bg-[#06100ed9] shadow-[0_8px_25px_#000a] backdrop-blur-[7px] transition-transform hover:scale-110 max-md:top-[50px] max-md:right-3.5"
         >
           <i className="size-2 rounded-full bg-primary shadow-[0_0_8px_var(--color-primary)]" />
         </button>
@@ -61,7 +61,7 @@ export function TerminalRoomOverview({ devices, sessions, busyId, activeSessionI
             setExpanded(true)
           }
         }}
-        className="absolute top-6 right-6 z-[7] aspect-video w-[clamp(190px,20vw,280px)] cursor-zoom-in overflow-hidden rounded-[10px] border border-[#365047] bg-[#05090e] shadow-[0_16px_45px_#000b,0_0_0_1px_#77f2b40c] outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-0.5 hover:border-[#62b58e] hover:shadow-[0_18px_50px_#000d,0_0_0_2px_#77f2b426] focus-visible:-translate-y-0.5 focus-visible:border-[#62b58e] focus-visible:shadow-[0_18px_50px_#000d,0_0_0_2px_#77f2b426] max-md:top-3.5 max-md:right-3.5 max-md:w-[min(190px,46vw)]"
+        className="absolute top-[60px] right-6 z-[7] aspect-video w-[clamp(190px,20vw,280px)] cursor-zoom-in overflow-hidden rounded-[10px] border border-[#365047] bg-[#05090e] shadow-[0_16px_45px_#000b,0_0_0_1px_#77f2b40c] outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-0.5 hover:border-[#62b58e] hover:shadow-[0_18px_50px_#000d,0_0_0_2px_#77f2b426] focus-visible:-translate-y-0.5 focus-visible:border-[#62b58e] focus-visible:shadow-[0_18px_50px_#000d,0_0_0_2px_#77f2b426] max-md:top-[50px] max-md:right-3.5 max-md:w-[min(190px,46vw)]"
       >
         <Suspense fallback={loadingFallback}>
           <DeviceWorld compact devices={devices} sessions={sessions} busyId={busyId} activeSessionId={activeSessionId} onOpen={onOpen} onProbe={onProbe} onEdit={onEdit} onSelectTerminal={onSelectTerminal} />

@@ -51,6 +51,10 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   const [coarsePointer] = useState(() => window.matchMedia('(pointer: coarse)').matches)
   const selectedDevice = useMemo(() => devices.find((device) => device.id === selectedId) || null, [devices, selectedId])
   const selectedSessions = useMemo(() => sessions.filter((session) => session.device_id === selectedId), [sessions, selectedId])
+  const selectedRecentSession = useMemo(
+    () => [...selectedSessions].reverse().find((session) => session.active) || selectedSessions.at(-1) || null,
+    [selectedSessions],
+  )
   const selectedSession = useMemo(() => sessions.find((session) => session.id === selectedSessionId) || null, [sessions, selectedSessionId])
   const selectedSessionDevice = useMemo(() => devices.find((device) => device.id === selectedSession?.device_id) || null, [devices, selectedSession])
   const sceneVersion = useMemo(() => [
@@ -781,7 +785,16 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
             <span className="grid gap-1 rounded-[7px] border border-[#22313b] bg-[#0b1117] p-2"><small className="text-[8px] text-[#63727e]">端口</small><strong className="truncate font-mono text-[10px] text-[#cdd7de]">{selectedDevice.remote_port}</strong></span>
           </div>
           <div className="flex gap-[7px] max-md:flex-wrap">
-            <Button size="sm" className="h-auto px-3 py-[9px] text-[10px] font-bold" disabled={busyId === selectedDevice.id || !selectedDevice.ssh_available} onClick={() => onOpen(selectedDevice)}>打开终端</Button>
+            {selectedRecentSession && (
+              <Button
+                size="sm"
+                className="h-auto px-3 py-[9px] text-[10px] font-bold"
+                onClick={() => onSelectTerminal(selectedRecentSession.id)}
+              >
+                继续最近终端
+              </Button>
+            )}
+            <Button variant={selectedSessions.length > 0 ? 'outline' : 'default'} size="sm" className="h-auto px-3 py-[9px] text-[10px] font-bold" disabled={busyId === selectedDevice.id || !selectedDevice.ssh_available} onClick={() => onOpen(selectedDevice)}>新建终端</Button>
             <Button variant="outline" size="sm" className="h-auto px-3 py-[9px] text-[10px]" onClick={() => onProbe(selectedDevice)}>检测</Button>
             <Button variant="outline" size="sm" className="h-auto px-3 py-[9px] text-[10px]" onClick={() => onEdit(selectedDevice)}>编辑</Button>
           </div>
