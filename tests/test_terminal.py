@@ -929,13 +929,29 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 session = manager.create("Artifact integration")
                 self.assertGreaterEqual(session.artifact_fd, 0)
 
-                # Do not echo the injected shell command into the rendered pane;
-                # only the command's deliberate output should reach the client.
+                # Establish a real rendered-channel barrier before the burst.
+                # tmux attach starts asynchronously; a fixed sleep can let the raw
+                # pipe win before the attach PTY has delivered its initial redraw.
+                # The octal command form keeps the sentinel out of any input echo,
+                # so observing it proves the command ran and the client read it.
+                ready_marker = b"attach-client-ready"
+                ready_escape = "".join(f"\\{byte:03o}" for byte in ready_marker) + "\\n"
                 manager._tmux_run(
-                    "send-keys", "-t", session.tmux_name or "", "-l", "stty -echo"
+                    "send-keys",
+                    "-t",
+                    session.tmux_name or "",
+                    "-l",
+                    f"stty -echo; printf {shlex.quote(ready_escape)}",
                 )
                 manager._tmux_run("send-keys", "-t", session.tmux_name or "", "Enter")
-                await asyncio.sleep(0.1)
+                ready_deadline = asyncio.get_running_loop().time() + 5
+                rendered = b""
+                while asyncio.get_running_loop().time() < ready_deadline:
+                    rendered = b"".join(session.chunks)
+                    if ready_marker in rendered:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertIn(ready_marker, rendered)
                 session.chunks.clear()
                 session.buffer_size = 0
 
@@ -948,11 +964,16 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     f"__AGENTSERVER_ARTIFACT__:{payload}:AGENTSERVER_END__"
                 )
                 burst = 80
+                # Keep the exact-once normal-output probe after the long burst.
+                # Before it, tmux may coalesce redraws or scroll the earlier line;
+                # the separate FIFO unit test already proves raw bytes are not
+                # broadcast, while this probe exercises the real attach path.
                 script = (
-                    "printf '%s\\n' ordinary-output-once; "
                     "i=0; while [ \"$i\" -lt "
                     f"{burst} ]; do printf '%s\\r\\033[2K' {shlex.quote(marker)}; "
-                    "i=$((i+1)); done; printf '%s\\n' artifact-burst-complete"
+                    "i=$((i+1)); done; "
+                    "printf '%s\\n' artifact-burst-complete; "
+                    "printf '%s\\n' ordinary-output-once"
                 )
                 manager._tmux_run(
                     "send-keys", "-t", session.tmux_name or "", "-l", script
@@ -963,7 +984,13 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 rendered = b""
                 while asyncio.get_running_loop().time() < deadline:
                     rendered = b"".join(session.chunks)
-                    if len(events) >= burst and b"artifact-burst-complete" in rendered:
+                    # The raw pipe and the rendered attach client are independent;
+                    # wait for the complete success condition on both channels.
+                    if (
+                        len(events) >= burst
+                        and b"artifact-burst-complete" in rendered
+                        and b"ordinary-output-once" in rendered
+                    ):
                         break
                     await asyncio.sleep(0.02)
 
@@ -975,18 +1002,26 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     all(event["source"] == "terminal-marker" for event in events)
                 )
                 self.assertIn(b"artifact-burst-complete", rendered)
-                self.assertEqual(1, rendered.count(b"ordinary-output-once"))
-            finally:
-                if manager is not None and session is not None:
-                    await manager.delete(session.id)
-                if manager is not None:
-                    await manager.close()
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [tmux_binary, "-S", str(socket_path), "kill-server"],
-                    check=False,
-                    capture_output=True,
+                self.assertEqual(
+                    1,
+                    rendered.count(b"ordinary-output-once"),
+                    rendered[-4096:],
                 )
+            finally:
+                try:
+                    if manager is not None and session is not None:
+                        await manager.delete(session.id)
+                finally:
+                    try:
+                        if manager is not None:
+                            await manager.close()
+                    finally:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            [tmux_binary, "-S", str(socket_path), "kill-server"],
+                            check=False,
+                            capture_output=True,
+                        )
 
 
 if __name__ == "__main__":
