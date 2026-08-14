@@ -9,6 +9,7 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
 const pageErrors = []
 const consoleErrors = []
+const contractName = `contract-check-${Date.now().toString(36)}`
 let terminalId = ''
 page.on('pageerror', (error) => pageErrors.push(error.message))
 page.on('console', (message) => {
@@ -22,11 +23,11 @@ try {
   await page.getByRole('button', { name: '进入控制台' }).click()
   await page.getByRole('navigation', { name: '主导航' }).waitFor()
 
-  terminalId = await page.evaluate(async () => {
+  terminalId = await page.evaluate(async (name) => {
     const response = await fetch('/api/terminals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'contract-check' }),
+      body: JSON.stringify({ name }),
     })
     if (!response.ok) throw new Error(`failed to create terminal: ${response.status}`)
     const session = await response.json()
@@ -35,7 +36,7 @@ try {
       throw new Error(`created terminal has no workspace: ${session.workspace?.error || 'unknown error'}`)
     }
     return session.id
-  })
+  }, contractName)
 
   await page.evaluate(async (sessionId) => {
     const request = async (path, init) => {
@@ -158,6 +159,37 @@ try {
 
   await page.goto(`${base}/terminals`, { waitUntil: 'networkidle' })
   await page.locator('.terminal-host').first().waitFor({ timeout: 10000 })
+
+  // A real split creates a second local terminal, mounts both panes, supports
+  // keyboard sash adjustment, and survives a page reload through localStorage.
+  await page.getByRole('button', { name: '向右拆分终端' }).first().click()
+  await page.waitForFunction(() => {
+    const hosts = [...document.querySelectorAll('.terminal-host')]
+    return hosts.filter((host) => {
+      const rect = host.getBoundingClientRect()
+      return rect.width > 0 && rect.height > 0
+    }).length >= 2
+  })
+  const separator = page.getByRole('separator', { name: '调整左右终端宽度' }).first()
+  await separator.focus()
+  await page.keyboard.press('End')
+  if ((await separator.getAttribute('aria-valuenow')) !== '85') {
+    throw new Error('split separator End key did not select the maximum ratio')
+  }
+  await page.keyboard.press('Home')
+  if ((await separator.getAttribute('aria-valuenow')) !== '15') {
+    throw new Error('split separator Home key did not select the minimum ratio')
+  }
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('separator', { name: '调整左右终端宽度' }).waitFor()
+  await page.waitForFunction(() => {
+    const hosts = [...document.querySelectorAll('.terminal-host')]
+    return hosts.filter((host) => {
+      const rect = host.getBoundingClientRect()
+      return rect.width > 0 && rect.height > 0
+    }).length >= 2
+  })
+
   await page.getByRole('button', { name: '打开工作区文件' }).first().click()
   const workspacePane = page.getByRole('complementary', { name: /工作区/ })
   await workspacePane.waitFor()
@@ -177,12 +209,16 @@ try {
   if (meaningfulConsoleErrors.length) {
     throw new Error(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
   }
-  console.log('terminal, workspace, file range, artifact, and read-image contracts passed')
+  console.log('terminal split, workspace, file range, artifact, and read-image contracts passed')
 } finally {
-  if (terminalId) {
-    await page.evaluate(async (sessionId) => {
-      await fetch(`/api/terminals/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
-    }, terminalId).catch(() => {})
-  }
+  await page.evaluate(async ({ sessionId, name }) => {
+    const response = await fetch('/api/terminals')
+    if (!response.ok) return
+    const sessions = await response.json()
+    const owned = sessions.filter((session) => session.id === sessionId || session.name === name)
+    await Promise.all(owned.map((session) => (
+      fetch(`/api/terminals/${encodeURIComponent(session.id)}`, { method: 'DELETE' })
+    )))
+  }, { sessionId: terminalId, name: contractName }).catch(() => {})
   await browser.close()
 }

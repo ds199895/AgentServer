@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, Columns2, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower, Rows2 } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
@@ -39,15 +39,21 @@ async function copyText(text: string): Promise<void> {
 type Props = {
   session: TerminalSession
   visible: boolean
+  /** 当前全局聚焦的 pane；仅它可以在恢复渲染时自动聚焦 xterm。 */
+  focused?: boolean
   previewBusyPort?: number | null
+  /** 是否显示拆分按钮(移动端与单窗格回退时为 false) */
+  canSplit?: boolean
+  onSplit?: (direction: 'row' | 'column') => void
   onPreviewService?: (service: DetectedService) => void
   onOpenWorkspace?: () => void
 }
 
-export default function TerminalPane({ session, visible, previewBusyPort, onPreviewService, onOpenWorkspace }: Props) {
+export default function TerminalPane({ session, visible, focused = false, previewBusyPort, canSplit = false, onSplit, onPreviewService, onOpenWorkspace }: Props) {
   const sessionId = session.id
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
+  const focusedRef = useRef(focused)
   const restoreRef = useRef<(() => void) | null>(null)
   const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
@@ -126,7 +132,8 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
 
   useEffect(() => {
     visibleRef.current = visible
-  }, [visible])
+    focusedRef.current = focused
+  }, [visible, focused])
 
   useEffect(() => {
     if (!hostRef.current) return
@@ -166,10 +173,17 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
       const copyShortcut = key === 'c' && (event.metaKey || (event.ctrlKey && event.shiftKey))
       const pasteShortcut = key === 'v' && (event.metaKey || (event.ctrlKey && event.shiftKey))
       if (copyShortcut) {
+        // xterm 对返回 false 仅停止内部处理,不取消浏览器默认行为。
+        // Linux 上 Ctrl+Shift+C 默认打开 DevTools 审查模式,必须自行 preventDefault。
+        event.preventDefault()
         void copySelection()
         return false
       }
       if (pasteShortcut) {
+        // Linux 上 Ctrl+Shift+V 是浏览器「以纯文本粘贴」默认行为,会在 xterm 的
+        // textarea 上再派发一次 paste 事件(xterm 内部也监听了它),导致粘贴两次。
+        // preventDefault 取消默认行为,只走下方 readText 这一条路径。
+        event.preventDefault()
         void pasteClipboard()
         return false
       }
@@ -231,7 +245,16 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
           if (!visibleRef.current || disposed) return
           terminal.clearTextureAtlas()
           terminal.refresh(0, terminal.rows - 1)
-          terminal.focus()
+          // ResizeObserver、WS onopen 和 visibilitychange 都可能在用户已经
+          // 聚焦分隔条/按钮后触发。只允许当前 pane 在页面没有交互焦点，或
+          // 焦点本来就在自己的 xterm 内时恢复焦点，避免键盘操作被异步抢走。
+          const activeElement = document.activeElement
+          const mayRestoreFocus =
+            !activeElement ||
+            activeElement === document.body ||
+            activeElement === document.documentElement ||
+            hostRef.current?.contains(activeElement)
+          if (focusedRef.current && mayRestoreFocus) terminal.focus()
         })
       })
     }
@@ -429,6 +452,7 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
 
   useEffect(() => {
     visibleRef.current = visible
+    focusedRef.current = focused
     if (visible) {
       restoreRef.current?.()
     } else {
@@ -436,7 +460,7 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
       setPastePanelOpen(false)
       setPasteDraft('')
     }
-  }, [visible])
+  }, [visible, focused])
 
   return (
     <div className={cn(
@@ -456,8 +480,33 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
           <span className="max-md:hidden">文件</span>
         </button>
       )}
+      {visible && canSplit && (
+        <div className="absolute top-3.5 right-4 z-20 flex gap-1.5 max-md:hidden">
+          <button
+            type="button"
+            onClick={() => onSplit?.('row')}
+            aria-label="向右拆分终端"
+            title="向右拆分(同设备新终端)"
+            className="grid size-8 cursor-pointer place-items-center rounded-lg border border-[#30404b] bg-[#101820cc] text-[#9eacb6] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
+          >
+            <Columns2 className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => onSplit?.('column')}
+            aria-label="向下拆分终端"
+            title="向下拆分(同设备新终端)"
+            className="grid size-8 cursor-pointer place-items-center rounded-lg border border-[#30404b] bg-[#101820cc] text-[#9eacb6] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
+          >
+            <Rows2 className="size-3.5" />
+          </button>
+        </div>
+      )}
       {connection !== 'online' && (
-        <div className="absolute top-3.5 right-4 flex items-center gap-[7px] rounded-md border border-[#34404b] bg-[#131a21dd] px-[9px] py-1.5 font-mono text-[9px] text-[#8b98a4]">
+        <div className={cn(
+          'absolute right-4 flex items-center gap-[7px] rounded-md border border-[#34404b] bg-[#131a21dd] px-[9px] py-1.5 font-mono text-[9px] text-[#8b98a4]',
+          canSplit ? 'top-[54px] max-md:top-3.5' : 'top-3.5',
+        )}>
           <span className={cn('size-1.5 rounded-full bg-[#f0bb5a]', connection === 'offline' && 'bg-[#ed6876]')} />
           {connection === 'connecting' ? '正在连接' : '连接已断开，正在重试'}
         </div>
@@ -621,7 +670,10 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
         document.body,
       )}
       {notice && connection === 'online' && (
-        <div className="absolute top-3.5 right-4 flex items-center gap-[7px] rounded-md border border-[#315a48] bg-[#12241ddd] px-[9px] py-1.5 font-mono text-[9px] text-primary">
+        <div className={cn(
+          'absolute right-4 flex items-center gap-[7px] rounded-md border border-[#315a48] bg-[#12241ddd] px-[9px] py-1.5 font-mono text-[9px] text-primary',
+          canSplit ? 'top-[54px] max-md:top-3.5' : 'top-3.5',
+        )}>
           {notice}
         </div>
       )}

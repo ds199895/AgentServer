@@ -213,17 +213,17 @@ export const api = {
   syncDevices: () => request<{ last_sync_at: number }>('/api/devices/sync', { method: 'POST' }),
   probeDevice: (id: string) =>
     request<{ available: boolean; error: string }>(`/api/devices/${id}/probe`, { method: 'POST' }),
-  createDeviceTerminal: async (id: string, name?: string) => {
+  createDeviceTerminal: async (id: string, name?: string, workspaceRoot?: string) => {
     const session = await request<TerminalSessionPayload>(`/api/devices/${id}/terminals`, {
       method: 'POST',
-      body: JSON.stringify({ name: name || null }),
+      body: JSON.stringify({ name: name || null, workspace_root: workspaceRoot || null }),
     })
     return normalizeTerminalSession(session)
   },
-  createTerminal: async (name?: string) => {
+  createTerminal: async (name?: string, workspaceRoot?: string) => {
     const session = await request<TerminalSessionPayload>('/api/terminals', {
       method: 'POST',
-      body: JSON.stringify({ name: name || null }),
+      body: JSON.stringify({ name: name || null, workspace_root: workspaceRoot || null }),
     })
     return normalizeTerminalSession(session)
   },

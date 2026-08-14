@@ -18,6 +18,7 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 - SSH 使用密钥、`BatchMode`、Keepalive 和独立 `known_hosts`，首次连接默认 TOFU 固定主机密钥。
 - PBKDF2 密码、HttpOnly 签名 Cookie，并要求显式配置初始管理员密码。
 - 支持多个并行 SSH/本地终端和断线后输出回放。
+- 桌面端支持左右/上下递归分屏、拖拽或键盘调整比例并持久化布局；移动端自动回退为单窗格而不破坏桌面布局。
 - 生产环境使用独立 tmux 服务托管终端，并在 SQLite 保存会话元数据；部署重启后原标签可自动恢复。
 - 每个终端绑定独立的只读工作区：本地终端使用受根目录约束的文件系统访问，SSH 终端通过同一设备身份使用 SFTP。
 - 浏览器内置文件浏览与 Artifact 面板，可预览图片、受限文本和 PDF；HTML、SVG 与未知格式只提供下载。
@@ -31,6 +32,7 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 
 - 集中管理 FRP 设备，自动同步在线状态并检测 SSH 可用性。
 - 在浏览器中创建、切换和恢复多个 SSH/本地终端，支持断线重连与历史输出回放。
+- 支持在同一设备或本地工作区中创建递归终端分屏，并保持已有 xterm 连接、选区与滚动位置。
 - 使用独立 tmux 服务持久托管终端任务，Web 服务更新不会终止正在运行的任务。
 - 提供像素风房间 Canvas，将设备和终端会话映射为可交互的小人，并可从场景直接跳转终端。
 - 通过 SSH 临时隧道和隔离子域名预览设备本地开发服务，支持 HTTP、WebSocket 与 HMR。
@@ -411,10 +413,10 @@ bash -n scripts/*.sh
 ```
 
 GitHub Actions 会在每次 push 和 pull request 上执行这些检查，并运行一个浏览器契约回归：
-契约会创建真实本地终端，验证工作区列表、短时授权、带 `terminal_id` 的 Range 内容读取、
-Artifact 写入与持久快照、`read-image` 模型块和不可变附件，并在真实页面中打开文本、图片与
-Artifact 面板；同时模拟旧后端省略终端的 `services` 字段，终端页不得出现未捕获 JavaScript
-错误。
+契约会创建真实本地终端，实际左右分屏、用键盘调整比例并在刷新后恢复布局；随后验证工作区
+列表、短时授权、带 `terminal_id` 的 Range 内容读取、Artifact 写入与持久快照、`read-image`
+模型块和不可变附件，并在真实页面中打开文本、图片与 Artifact 面板；同时模拟旧后端省略终端
+的 `services` 字段，终端页不得出现未捕获 JavaScript 错误。
 仓库设置中应将 `CI / verify` 配置为目标分支的 required status check，并禁止绕过保护规则。
 
 `main` 的 push 和手动触发还会在 `verify` 通过后构建唯一的 release artifact，并通过
