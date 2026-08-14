@@ -14,6 +14,7 @@ import { TerminalEmpty } from '@/components/TerminalEmpty'
 import { TerminalRoomOverview } from '@/components/TerminalRoomOverview'
 import { TerminalTabsBar } from '@/components/TerminalTabsBar'
 import { Topbar, type MainPage } from '@/components/Topbar'
+import { WorkspacePane } from '@/components/WorkspacePane'
 import TerminalPane from '@/TerminalPane'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -72,6 +73,7 @@ export default function App() {
   const [cloningId, setCloningId] = useState<string | null>(null)
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
   const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
+  const [workspaceSessionId, setWorkspaceSessionId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [startupError, setStartupError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
@@ -176,6 +178,7 @@ export default function App() {
         storeTerminalId(route.terminalId)
       }
       setActiveId(route.terminalId)
+      setWorkspaceSessionId((current) => current === null ? null : route.terminalId)
       setMissingTerminalId(null)
       setPage(route.page)
       void load().catch(() => undefined)
@@ -186,6 +189,7 @@ export default function App() {
 
   const showTerminal = (id: string | null, replace = false) => {
     activeIdRef.current = id; setActiveId(id); setMissingTerminalId(null); setPage('terminals')
+    setWorkspaceSessionId((current) => current === null ? null : id)
     lastTerminalIdRef.current = id
     storeTerminalId(id)
     const path = id ? `/terminal/${encodeURIComponent(id)}` : '/terminals'
@@ -198,6 +202,7 @@ export default function App() {
       return
     }
     activeIdRef.current = null; setActiveId(null); setMissingTerminalId(null); setPage(nextPage)
+    setWorkspaceSessionId(null)
     const path = nextPage === 'setup' ? '/setup' : '/'
     if (window.location.pathname !== path) window.history[replace ? 'replaceState' : 'pushState']({}, '', path)
   }
@@ -225,6 +230,7 @@ export default function App() {
     await api.deleteTerminal(session.id)
     const remaining = sessions.filter((item) => item.id !== session.id)
     setSessions(remaining)
+    if (workspaceSessionId === session.id) setWorkspaceSessionId(null)
     if (activeIdRef.current === session.id) {
       const sameDevice = session.device_id
         ? remaining.filter((item) => item.device_id === session.device_id)
@@ -237,7 +243,7 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); activePreviewRef.current = null; setActivePreview(null) }
+  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
   const stopPreview = async (preview: Preview) => {
     try {
       await api.deletePreview(preview.id)
@@ -284,6 +290,7 @@ export default function App() {
   }
   if (username === null) return <Login onLogin={(name) => { setUsername(name); void load() }} />
   const activeSession = sessions.find((item) => item.id === activeId)
+  const workspaceSession = sessions.find((item) => item.id === workspaceSessionId)
   const showTerminalTabs = page === 'terminals' && sessions.length > 0
   return (
     <main className="grid h-full w-full grid-rows-[58px_minmax(0,1fr)] bg-background">
@@ -321,8 +328,12 @@ export default function App() {
                     visible={page === 'terminals' && session.id === activeId}
                     previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
                     onPreviewService={(service) => void openDetectedService(session, service)}
+                    onOpenWorkspace={() => setWorkspaceSessionId(session.id)}
                   />
               ))}
+              {page === 'terminals' && activeSession && workspaceSession?.id === activeSession.id && (
+                <WorkspacePane key={workspaceSession.id} session={workspaceSession} onClose={() => setWorkspaceSessionId(null)} />
+              )}
             </div>
           )}
           {page === 'terminals' && activeSession && (

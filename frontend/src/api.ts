@@ -11,6 +11,11 @@ export type TerminalSession = {
   device_name: string | null
   remote_port: number | null
   services: DetectedService[]
+  workspace?: {
+    kind: 'local' | 'sftp' | string
+    root: string
+    platform: 'posix' | 'windows' | string
+  }
 }
 
 export type DetectedService = {
@@ -65,6 +70,82 @@ export type Preview = {
   active: boolean
   error: string
   url: string | null
+}
+
+export type WorkspaceEntry = {
+  name: string
+  path: string
+  kind: 'file' | 'directory' | 'symlink' | 'other'
+  size: number
+  modified_at: number
+  version: string
+}
+
+export type WorkspaceBreadcrumb = {
+  name: string
+  path: string
+}
+
+export type WorkspaceListing = {
+  path: string
+  root: string
+  provider: string
+  parent: string | null
+  parent_path: string | null
+  entries: WorkspaceEntry[]
+  breadcrumbs: WorkspaceBreadcrumb[]
+  truncated: boolean
+}
+
+export type FileGrant = {
+  id: string
+  terminal_id: string
+  name: string
+  path: string
+  media_type: string
+  size: number
+  kind: 'file'
+  version: string
+  etag: string
+  preview_mode: 'image' | 'text' | 'pdf' | 'download'
+  inline_safe: boolean
+  modified_at: number
+  expires_at: number
+  image_width: number | null
+  image_height: number | null
+  /** Client-side override used for durable, content-addressed attachments. */
+  content_url?: string
+  immutable?: boolean
+}
+
+export type ArtifactAttachment = {
+  id: string
+  media_type: string
+  size: number
+  width: number
+  height: number
+  name?: string
+}
+
+export type ArtifactEvent = {
+  sequence?: number
+  id: string
+  type: string
+  event: string
+  owner?: string
+  terminal_id?: string
+  name: string
+  path: string
+  media_type?: string | null
+  size?: number | null
+  kind: string
+  version: string
+  source?: string
+  created_at: number
+  timestamp: number
+  message?: string
+  schema_version?: number
+  attachment: ArtifactAttachment | null
 }
 
 export const frontendBuildSha = __AGENTSERVER_BUILD_SHA__
@@ -148,6 +229,25 @@ export const api = {
   },
   deleteTerminal: (id: string) =>
     request<{ ok: boolean }>(`/api/terminals/${id}`, { method: 'DELETE' }),
+  workspace: (id: string, path = '') => {
+    const query = new URLSearchParams()
+    query.set('path', path)
+    return request<WorkspaceListing>(`/api/terminals/${encodeURIComponent(id)}/workspace?${query}`)
+  },
+  resolveFile: (id: string, path: string) =>
+    request<FileGrant>(`/api/terminals/${encodeURIComponent(id)}/files/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+  fileContentUrl: (grant: Pick<FileGrant, 'id' | 'terminal_id' | 'content_url'>) => {
+    if (grant.content_url) return grant.content_url
+    const query = new URLSearchParams({ terminal_id: grant.terminal_id })
+    return `/api/files/${encodeURIComponent(grant.id)}/content?${query}`
+  },
+  attachmentContentUrl: (terminalId: string, attachmentId: string) =>
+    `/api/terminals/${encodeURIComponent(terminalId)}/attachments/${encodeURIComponent(attachmentId)}`,
+  artifacts: (id: string) =>
+    request<ArtifactEvent[]>(`/api/terminals/${encodeURIComponent(id)}/artifacts`),
   previews: () => request<Preview[]>('/api/previews'),
   createPreview: (deviceId: string, port: number, label?: string, terminalId?: string) =>
     request<Preview>(`/api/devices/${deviceId}/previews`, {

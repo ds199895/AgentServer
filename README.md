@@ -19,6 +19,10 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 - PBKDF2 密码、HttpOnly 签名 Cookie，并要求显式配置初始管理员密码。
 - 支持多个并行 SSH/本地终端和断线后输出回放。
 - 生产环境使用独立 tmux 服务托管终端，并在 SQLite 保存会话元数据；部署重启后原标签可自动恢复。
+- 每个终端绑定独立的只读工作区：本地终端使用受根目录约束的文件系统访问，SSH 终端通过同一设备身份使用 SFTP。
+- 浏览器内置文件浏览与 Artifact 面板，可预览图片、受限文本和 PDF；HTML、SVG 与未知格式只提供下载。
+- 持久化结构化 Artifact 事件，并通过 WebSocket 实时推送 Agent 新建或更新的文件。
+- `read-image` 将验证后的图片保存为 SHA-256 内容寻址附件，返回可供模型消费和会话回放的结构化内容块。
 - 提供 systemd 服务、frpc/frps 示例和服务器安装脚本。
 
 ## Roadmap
@@ -50,24 +54,86 @@ Server 和一个 frpc 服务；设备列表、在线/离线记录、SSH 探测�
 
 ## 架构
 
+工作区、事件和模型内容之间采用可替换的 provider/adapter 边界，思路借鉴
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的“Everything is a
+Plugin”，但不引入其运行时依赖：AgentServer 仍以现有 FastAPI、TerminalManager 和 React
+界面为宿主。
+
 ```text
 Device A: sshd + frpc ─┐
 Device B: sshd + frpc ─┼──> frps ──> AgentServer ──> Browser/xterm.js
 Device C: sshd + frpc ─┘       │           │
-                               │           └── SQLite device history
+                               │           ├── TerminalManager ── PTY/tmux/SSH
+                               │           ├── WorkspaceService ─ Local/SFTP ─ Browser file pane
+                               │           ├── ArtifactEventStore ──────────── Browser event pane
+                               │           └── AttachmentStore (SHA-256) ───── read-image/model blocks
                                └── local-only Dashboard API
 ```
 
 FRP 只负责 TCP 传输。每台设备仍需启用 OpenSSH Server，并将 AgentServer 的 SSH 公钥
 加入目标账户的 `authorized_keys`。
 
+### 工作区、Artifact 与图片附件
+
+终端会话除了 PTY 数据通道，还保存一个归属于“登录用户 + 终端 ID”的 `WorkspaceBinding`。
+本地终端默认把 `TERMINAL_CWD` 作为根目录；创建终端时可通过 `workspace_root` 选择其下的
+子目录。SSH 终端默认根为远端登录目录 `.`，也可指定远端目录，并通过与终端相同的设备、
+私钥和 `known_hosts` 建立按需 SFTP 连接。工作区接口只读，不会把服务器本地路径误当作
+SSH 终端的远端路径。远端自定义 `workspace_root` 只约束文件面板，不会暗中向已经启动的
+交互 shell 注入 `cd`；没有可靠 cwd 协议时，API 会把远端 `current_path` 保持为空。
+
+当前认证和设备管理仍采用**单管理员控制面**：`owner` 绑定用于阻止终端、文件授权和附件在
+会话之间串用，并为将来扩展多租户保留边界，但设备与预览资源尚未宣称支持互不信任的多用户
+租户。若需要开放给多个独立用户，必须先把设备和预览的所有权也纳入授权链路。
+
+文件读取分为两步：先把根目录相对路径解析为短时、不可猜测的 `FileGrant`，再携带该授权
+及 `terminal_id` 读取内容。授权绑定用户、终端、工作区实例和文件版本；过期、文件变化或
+重新绑定都会失效。路径拒绝绝对地址、`..` 和符号链接，读取有字节/条目上限并支持 HTTP
+`Range`。服务端依据实际内容嗅探类型，响应始终带 `nosniff`；HTML、SVG 和未知内容不会
+内联到主站上下文。
+
+本地提供器用设备号、inode、纳秒级 mtime/ctime 和大小复核版本。SFTP v3 通常只暴露秒级
+mtime 和大小，因此远端授权还会保存并在每次读取时复核一个有界内容探针；它是短时、
+version-checked 的授权，不是完整文件快照。若远端文件在同一秒被等长改写、且探针覆盖部分
+保持不变，协议元数据无法证明后半段未变化；对必须严格不可变的图片回放，应使用
+`read-image` 生成 SHA-256 附件。
+
+`ArtifactEvent` 是独立于 xterm 字节流的版本化事件，持久保存于 SQLite，并通过
+`/ws/events/{terminal_id}` 先发送快照、再发送实时增量。带登录 Cookie 的 Agent 适配器可
+调用 HTTP API；运行在 PTY 内、没有 HTTP 凭据的 Agent 可以输出以下纯文本标记。它可穿过
+生产环境的 tmux；结尾的回车与擦行序列只用于避免在终端中留下长标记：
+
+```text
+__AGENTSERVER_ARTIFACT__:<无填充的 base64url(JSON)>:AGENTSERVER_END__ CR ESC [ 2 K
+```
+
+JSON 至少包含根目录相对的 `path`，并可包含 `type`、`name`、`media_type`、`size`、
+`kind` 和 `version`。这条消息只登记元数据，不绕过文件网关；用户打开文件时仍会生成新的
+短时授权。生产 `tmux` 后端通过 `pipe-pane` 把应用原始 pane 输出送入每会话独立的私有
+FIFO，机器解析不依赖 attach 客户端的屏幕 redraw；即使标记在一次刷新前被擦除也不会漏掉，
+普通 shell 输出仍只向浏览器广播一次。`direct` 后端直接解析 PTY 字节流。两种后端都兼容
+`ESC ] 633 ; artifact ; <base64url> BEL` OSC 形式；终端来源事件先进入有界队列，每个终端
+最多接收每秒 20 条，再由后台线程写入 SQLite，避免文件事件阻塞 PTY 数据通道。
+
+工作区文件引用表示“这个路径当前的内容”，适合快速浏览；`read-image` 则读取并验证真实
+图片格式、字节数和像素数，把 PNG/JPEG/GIF/WebP 保存到 `DATA_DIR/attachments`，生成
+`sha256:<digest>` 的不可变 `AttachmentRef`，随后才提交带附件引用的 Artifact 事件。附件
+只有被同一用户、同一终端的持久事件引用时才能读取，因此会话回放不依赖原文件仍然存在，
+也不会把短时文件授权或图片 base64 写入事件日志。`POST .../read-image` 同时返回显式标记为
+`openai-responses` 的 `model_content`：其中的 `input_image` 是只存在于本次鉴权响应中的 data
+URL，可由 OpenAI Responses 兼容适配器直接作为输入内容提交。AgentServer 不会向任意外部
+CLI 自动注入工具；Codex、Claude 等独立 Agent 仍需一个适配器来调用此端点并把返回内容交给
+各自模型 API。
+
 ## 目录
 
 ```text
 app/auth.py                 用户、密码与 Cookie 签名
+app/artifacts.py            Artifact 事件日志、内容寻址图片附件与 read-image 内容块
 app/devices.py              设备库、FRP 同步和 SSH Banner 探测
 app/terminal.py             本地/SSH PTY 生命周期与 WebSocket 广播
 app/main.py                 FastAPI API、生命周期和 SSH 启动参数
+app/workspace.py            根目录约束的 Local/SFTP 文件提供器与短时文件授权
 frontend/                   React、TypeScript、Tailwind CSS、shadcn/ui、xterm.js 源码
 web_dist/                   已构建的生产前端，服务器无需 Node.js
 deploy/                     systemd 与生产环境示例
@@ -256,9 +322,18 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 | `SSH_PRIVATE_KEY` | 用于登录设备的私钥 |
 | `SSH_KNOWN_HOSTS` | 独立主机密钥库 |
 | `SSH_STRICT_HOST_KEY` | 默认 `accept-new`；完成首次固定后可改为 `yes` |
+| `SSH_CONNECT_TIMEOUT` | SSH 终端工作区建立 SFTP 连接的超时秒数，默认 10 |
+| `SFTP_OPERATION_TIMEOUT` | SFTP stat/list/read 单次远端操作超时秒数，默认 15；超时后断开并允许重连 |
 | `ENABLE_LOCAL_TERMINALS` | 集中部署建议设为 `0` |
 | `TERMINAL_BACKEND` | `tmux` 可跨 AgentServer 部署保存进程；`direct` 为开发兼容模式 |
 | `TMUX_SOCKET` | 独立 tmux 服务的 socket，生产默认 `/var/lib/agentserver/tmux/agentserver.sock` |
+| `FILE_GRANT_TTL` | 文件解析授权的有效秒数，默认 120 |
+| `MAX_WORKSPACE_FILE_BYTES` | 可生成预览授权的最大文件字节数，默认 32 MiB |
+| `MAX_WORKSPACE_READ_BYTES` | 单次完整或 Range 响应的最大字节数，默认 32 MiB |
+| `MAX_WORKSPACE_LIST_ENTRIES` | 单次目录列表最大条目数，默认 1000 |
+| `MAX_IMAGE_ATTACHMENT_BYTES` | `read-image` 可持久化的最大图片字节数，默认 5 MiB |
+| `MAX_IMAGE_ATTACHMENT_PIXELS` | 图片允许的最大像素总数，默认 4000 万 |
+| `ARTIFACT_INGEST_QUEUE_SIZE` | 终端输出 Artifact 待持久化队列上限，默认 1024 |
 | `COOKIE_SECURE` | HTTPS 部署设为 `1` |
 | `PREVIEW_PUBLIC_ORIGIN` | 预览泛域名基础 Origin，生产为 `https://preview.metakroma.com` |
 | `PREVIEW_IDLE_TIMEOUT` | 预览无访问后的自动回收秒数，默认 1800 |
@@ -280,20 +355,52 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 - `PUT/DELETE /api/devices/{id}`
 - `POST /api/devices/sync`
 - `POST /api/devices/{id}/probe`
-- `POST /api/devices/{id}/terminals`
+- `POST /api/devices/{id}/terminals`（可选 `workspace_root` 指定远端 SFTP 根）
 - `POST /api/devices/{id}/previews`
-- `GET/POST /api/terminals`
+- `GET/POST /api/terminals`（创建本地终端时可选 `workspace_root`，且必须位于 `TERMINAL_CWD` 内）
 - `DELETE /api/terminals/{id}`
+- `GET /api/terminals/{id}/workspace?path={relative_path}`
+- `POST /api/terminals/{id}/files/resolve`，请求体为 `{"path":"relative/file.png"}`
+- `GET /api/files/{grant_id}/content?terminal_id={id}`（支持 `Range` 与 `If-None-Match`）
+- `GET/POST /api/terminals/{id}/artifacts`（GET 可选 `after_sequence`）
+- `POST /api/terminals/{id}/read-image`，请求体为 `{"path":"relative/image.png"}`
+- `GET /api/terminals/{id}/attachments/{sha256_id}`
 - `GET /api/previews`
 - `POST /api/previews/{id}/ticket`
 - `DELETE /api/previews/{id}`
 - `WS /ws/terminal/{id}`
+- `WS /ws/events/{id}`
 - `GET /downloads/install-frpc-ssh.sh`
 - `GET /downloads/install-frpc-ssh.ps1`
 - `GET /downloads/frpc.example.toml`
 - `GET /downloads/agentserver-ssh-key.pub`
 
 除健康检查与登录外，设备、下载、终端和 WebSocket 接口都要求有效登录 Cookie。
+文件授权和附件读取还会校验 Cookie 所属用户与终端所有者，越权查询统一表现为不存在。
+
+HTTP Agent 适配器可用以下请求登记 Artifact；服务端会补充事件 ID、单调递增的
+`sequence`、`created_at` 和 `schema_version`：
+
+```http
+POST /api/terminals/TERMINAL_ID/artifacts
+Content-Type: application/json
+
+{
+  "type": "created",
+  "path": "output/chart.png",
+  "name": "chart.png",
+  "media_type": "image/png",
+  "size": 12345,
+  "kind": "file",
+  "version": "agent-defined-version",
+  "source": "my-agent"
+}
+```
+
+`read-image` 的成功响应同时包含持久事件、工作区文件引用、不可变附件引用，以及用于浏览器
+回放的 `content`。另有 `model_content_format: "openai-responses"` 和可直接提交给 Responses
+适配器的 `model_content`；其 `input_image.image_url` 内含本次响应限定的图片数据。普通浏览
+预览仍使用短时 `FileGrant`，不会产生模型图片输入成本或把 base64 写进 SQLite。
 
 ## 验证
 
@@ -304,7 +411,10 @@ bash -n scripts/*.sh
 ```
 
 GitHub Actions 会在每次 push 和 pull request 上执行这些检查，并运行一个浏览器契约回归：
-即使模拟旧后端省略终端的 `services` 字段，终端页也不得出现未捕获 JavaScript 错误。
+契约会创建真实本地终端，验证工作区列表、短时授权、带 `terminal_id` 的 Range 内容读取、
+Artifact 写入与持久快照、`read-image` 模型块和不可变附件，并在真实页面中打开文本、图片与
+Artifact 面板；同时模拟旧后端省略终端的 `services` 字段，终端页不得出现未捕获 JavaScript
+错误。
 仓库设置中应将 `CI / verify` 配置为目标分支的 required status check，并禁止绕过保护规则。
 
 `main` 的 push 和手动触发还会在 `verify` 通过后构建唯一的 release artifact，并通过

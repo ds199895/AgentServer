@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
@@ -41,9 +41,10 @@ type Props = {
   visible: boolean
   previewBusyPort?: number | null
   onPreviewService?: (service: DetectedService) => void
+  onOpenWorkspace?: () => void
 }
 
-export default function TerminalPane({ session, visible, previewBusyPort, onPreviewService }: Props) {
+export default function TerminalPane({ session, visible, previewBusyPort, onPreviewService, onOpenWorkspace }: Props) {
   const sessionId = session.id
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
@@ -443,6 +444,18 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
       visible ? 'block' : 'hidden',
     )}>
       <div ref={hostRef} className="terminal-host" />
+      {visible && (
+        <button
+          type="button"
+          onClick={onOpenWorkspace}
+          aria-label="打开工作区文件"
+          title="打开文件与 Artifacts"
+          className="absolute top-3.5 left-4 z-20 flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-[#30404b] bg-[#101820cc] px-2.5 text-[9px] font-semibold text-[#9eacb6] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary max-md:top-2.5 max-md:left-2.5 max-md:size-7 max-md:justify-center max-md:px-0"
+        >
+          <FolderOpen className="size-3.5" />
+          <span className="max-md:hidden">文件</span>
+        </button>
+      )}
       {connection !== 'online' && (
         <div className="absolute top-3.5 right-4 flex items-center gap-[7px] rounded-md border border-[#34404b] bg-[#131a21dd] px-[9px] py-1.5 font-mono text-[9px] text-[#8b98a4]">
           <span className={cn('size-1.5 rounded-full bg-[#f0bb5a]', connection === 'offline' && 'bg-[#ed6876]')} />
@@ -460,7 +473,7 @@ export default function TerminalPane({ session, visible, previewBusyPort, onPrev
               terminalRef.current?.scrollToBottom()
               terminalRef.current?.focus()
             }}
-            className="absolute top-3.5 left-4 z-20 grid size-8 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:top-2.5 max-md:left-2.5 max-md:size-7"
+            className="absolute top-3.5 left-[88px] z-20 grid size-8 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_8px_24px_#0009] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:top-2.5 max-md:left-11 max-md:size-7"
           >
             <ChevronsDown className="size-4 max-md:size-3.5" />
           </button>

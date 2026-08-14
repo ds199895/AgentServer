@@ -8,10 +8,11 @@ import re
 import shlex
 import sqlite3
 import socket
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -23,6 +24,17 @@ from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect as websocket_connect
 
+from .artifacts import (
+    ArtifactEventStore,
+    AttachmentAccessDenied,
+    AttachmentIntegrityError,
+    AttachmentStore,
+    ImageValidationError,
+    ImageSupportUnavailable,
+    WorkspaceFileRef as ArtifactFileRef,
+    build_openai_responses_image_content,
+    build_read_image_result,
+)
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
 from .preview import (
@@ -45,6 +57,23 @@ from .terminal import (
     remote_shell_command,
 )
 from .version import resolve_build_sha, verify_release_pair
+from .workspace import (
+    FileGrant,
+    LocalWorkspaceProvider,
+    SftpWorkspaceProvider,
+    WorkspaceAccessDenied,
+    WorkspaceConfigurationError,
+    WorkspaceError,
+    WorkspaceFileChanged,
+    WorkspaceGrantNotFound,
+    WorkspaceInvalidRange,
+    WorkspaceNotDirectory,
+    WorkspaceNotFile,
+    WorkspaceNotFound,
+    WorkspaceService,
+    WorkspaceTooLarge,
+    WorkspaceUnavailable,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,10 +83,11 @@ COOKIE_NAME = "agentserver_session"
 BUILD_SHA = resolve_build_sha(ROOT)
 
 users = UserStore(DATA_DIR / "agent_server.db")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
 if len(admin_password) < 8:
     raise RuntimeError("ADMIN_PASSWORD must be explicitly set to at least 8 characters")
-users.ensure_user(os.getenv("ADMIN_USERNAME", "admin"), admin_password)
+users.ensure_user(ADMIN_USERNAME, admin_password)
 session_secret = load_or_create_secret(DATA_DIR)
 signer = SessionSigner(session_secret)
 preview_signer = SessionSigner(session_secret, max_age=120)
@@ -79,6 +109,82 @@ DOWNLOAD_FILES = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    artifact_events = ArtifactEventStore(DATA_DIR / "agent_server.db")
+    attachments = AttachmentStore(
+        DATA_DIR / "attachments",
+        max_image_bytes=int(
+            os.getenv("MAX_IMAGE_ATTACHMENT_BYTES", str(5 * 1024 * 1024))
+        ),
+        max_image_pixels=int(os.getenv("MAX_IMAGE_ATTACHMENT_PIXELS", "40000000")),
+    )
+    artifact_ingest_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(
+        maxsize=max(1, int(os.getenv("ARTIFACT_INGEST_QUEUE_SIZE", "1024")))
+    )
+    artifact_rate_windows: dict[str, deque[float]] = {}
+    artifact_ingest_stats = {"dropped": 0, "failed": 0}
+
+    async def artifact_ingest_worker() -> None:
+        while True:
+            values = await artifact_ingest_queue.get()
+            try:
+                await asyncio.to_thread(artifact_events.append, **values)
+            except Exception:
+                artifact_ingest_stats["failed"] += 1
+            finally:
+                artifact_ingest_queue.task_done()
+
+    def record_terminal_artifact(session, payload: dict[str, object]) -> None:
+        if not session.owner:
+            return
+        path = payload.get("path")
+        if not isinstance(path, str) or not path or len(path) > 4096:
+            return
+        size = payload.get("size")
+        now = asyncio.get_running_loop().time()
+        window = artifact_rate_windows.setdefault(session.id, deque())
+        while window and window[0] <= now - 1:
+            window.popleft()
+        if len(window) >= 20 or artifact_ingest_queue.full():
+            artifact_ingest_stats["dropped"] += 1
+            return
+        window.append(now)
+        artifact_ingest_queue.put_nowait(
+            {
+                "owner": session.owner,
+                "terminal_id": session.id,
+                "event_type": str(payload.get("type") or "created")[:80],
+                "file": ArtifactFileRef(
+                    path=path,
+                    name=str(payload.get("name") or "")[:255],
+                    media_type=(
+                        str(payload["media_type"])[:255]
+                        if payload.get("media_type")
+                        else None
+                    ),
+                    size=size if isinstance(size, int) and size >= 0 else None,
+                    kind=str(payload.get("kind") or "file")[:40],
+                ),
+                "source": str(payload.get("source") or "terminal-output")[:80],
+                "version": str(payload.get("version") or "")[:255],
+            }
+        )
+
+    app.state.artifacts = artifact_events
+    app.state.attachments = attachments
+    app.state.artifact_ingest_queue = artifact_ingest_queue
+    app.state.artifact_ingest_stats = artifact_ingest_stats
+    app.state.artifact_rate_windows = artifact_rate_windows
+    app.state.workspaces = WorkspaceService(
+        grant_ttl=float(os.getenv("FILE_GRANT_TTL", "120")),
+        max_file_bytes=int(
+            os.getenv("MAX_WORKSPACE_FILE_BYTES", str(32 * 1024 * 1024))
+        ),
+        max_read_bytes=int(
+            os.getenv("MAX_WORKSPACE_READ_BYTES", str(32 * 1024 * 1024))
+        ),
+        max_list_entries=int(os.getenv("MAX_WORKSPACE_LIST_ENTRIES", "1000")),
+        max_image_pixels=int(os.getenv("MAX_IMAGE_ATTACHMENT_PIXELS", "40000000")),
+    )
     app.state.terminals = TerminalManager(
         command=os.getenv("TERMINAL_CMD", "codex"),
         cwd=os.getenv("TERMINAL_CWD", str(ROOT)),
@@ -94,8 +200,20 @@ async def lifespan(app: FastAPI):
         tmux_socket=Path(
             os.getenv("TMUX_SOCKET", str(DATA_DIR / "tmux" / "agentserver.sock"))
         ),
+        default_owner=ADMIN_USERNAME,
+        artifact_callback=record_terminal_artifact,
     )
     app.state.devices = devices
+    for session in tuple(app.state.terminals.sessions.values()):
+        if not session.owner:
+            continue
+        try:
+            await bind_terminal_workspace(app, session)
+        except WorkspaceError:
+            # A stale device or root must not prevent terminal recovery. The
+            # workspace endpoint will return the precise configuration error.
+            pass
+    app.state.artifact_ingest_task = asyncio.create_task(artifact_ingest_worker())
     app.state.previews = PreviewManager(
         idle_timeout=float(os.getenv("PREVIEW_IDLE_TIMEOUT", "1800"))
     )
@@ -127,7 +245,14 @@ async def lifespan(app: FastAPI):
     app.state.service_monitor_task.cancel()
     await asyncio.gather(app.state.service_monitor_task, return_exceptions=True)
     await app.state.previews.close()
+    await asyncio.to_thread(app.state.workspaces.close)
     await app.state.terminals.close()
+    try:
+        await asyncio.wait_for(artifact_ingest_queue.join(), timeout=2)
+    except asyncio.TimeoutError:
+        pass
+    app.state.artifact_ingest_task.cancel()
+    await asyncio.gather(app.state.artifact_ingest_task, return_exceptions=True)
 
 
 app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
@@ -153,12 +278,32 @@ class CreateTerminalBody(BaseModel):
     name: str | None = Field(default=None, max_length=80)
     cols: int = Field(default=120, ge=2, le=500)
     rows: int = Field(default=32, ge=1, le=300)
+    workspace_root: str | None = Field(default=None, max_length=2048)
 
 
 class CreatePreviewBody(BaseModel):
     port: int = Field(ge=1, le=65535)
     label: str | None = Field(default=None, max_length=80)
     terminal_id: str | None = Field(default=None, max_length=80)
+
+
+class ArtifactBody(BaseModel):
+    type: str = Field(default="created", min_length=1, max_length=80)
+    path: str = Field(min_length=1, max_length=4096)
+    name: str = Field(default="", max_length=255)
+    media_type: str | None = Field(default=None, max_length=255)
+    size: int | None = Field(default=None, ge=0)
+    kind: str = Field(default="file", min_length=1, max_length=40)
+    version: str = Field(default="", max_length=255)
+    source: str = Field(default="agent-api", min_length=1, max_length=80)
+
+
+class ReadImageBody(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class ResolveFileBody(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
 
 
 class DeviceCreateBody(BaseModel):
@@ -195,12 +340,107 @@ def preview_manager(request: Request) -> PreviewManager:
     return request.app.state.previews
 
 
+def workspace_service(request: Request) -> WorkspaceService:
+    return request.app.state.workspaces
+
+
+async def bind_terminal_workspace(application: FastAPI, session):
+    service: WorkspaceService = application.state.workspaces
+    try:
+        return service.binding(session.owner, session.id)
+    except WorkspaceNotFound:
+        pass
+
+    try:
+        if session.workspace_kind == "local":
+            provider = await asyncio.to_thread(
+                LocalWorkspaceProvider,
+                session.workspace_root or session.cwd,
+            )
+        elif session.workspace_kind == "sftp":
+            if not session.device_id:
+                raise WorkspaceConfigurationError("SSH terminal has no device binding")
+            device = await asyncio.to_thread(devices.get, session.device_id)
+            if not device:
+                raise WorkspaceConfigurationError("terminal device no longer exists")
+            provider = SftpWorkspaceProvider.from_device(
+                session.workspace_root or ".",
+                device,
+                data_dir=DATA_DIR,
+            )
+        else:
+            raise WorkspaceConfigurationError(
+                f"unsupported workspace provider: {session.workspace_kind}"
+            )
+    except WorkspaceError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise WorkspaceConfigurationError(
+            f"workspace provider configuration failed: {error}"
+        ) from error
+    try:
+        return await asyncio.to_thread(service.bind, session.owner, session.id, provider)
+    except BaseException:
+        await asyncio.to_thread(provider.close)
+        raise
+
+
+def workspace_http_error(error: WorkspaceError) -> HTTPException:
+    headers: dict[str, str] | None = None
+    if isinstance(error, (WorkspaceNotFound, WorkspaceGrantNotFound)):
+        status_code = 404
+    elif isinstance(error, WorkspaceAccessDenied):
+        status_code = 403
+    elif isinstance(error, WorkspaceInvalidRange):
+        status_code = 416
+        if error.total is not None:
+            headers = {"Content-Range": f"bytes */{error.total}"}
+    elif isinstance(error, (WorkspaceNotDirectory, WorkspaceNotFile)):
+        status_code = 422
+    elif isinstance(error, WorkspaceTooLarge):
+        status_code = 413
+    elif isinstance(error, WorkspaceFileChanged):
+        status_code = 409
+    elif isinstance(error, (WorkspaceConfigurationError, WorkspaceUnavailable)):
+        status_code = 503
+    else:
+        status_code = 500
+    return HTTPException(status_code=status_code, detail=str(error), headers=headers)
+
+
+def file_grant_payload(grant: FileGrant) -> dict[str, object]:
+    return {
+        "id": grant.id,
+        "terminal_id": grant.terminal_id,
+        "path": grant.path,
+        "name": grant.name,
+        "media_type": grant.media_type,
+        "size": grant.size,
+        "kind": "file",
+        "version": grant.etag,
+        "etag": grant.etag,
+        "preview_mode": grant.preview_kind,
+        "inline_safe": grant.inline_safe,
+        "modified_at": grant.modified_at,
+        "expires_at": grant.expires_at,
+        "image_width": grant.image_width,
+        "image_height": grant.image_height,
+    }
+
+
 @app.get("/api/health")
 async def health(request: Request) -> dict[str, object]:
     monitor: FrpMonitor | None = request.app.state.frp_monitor
+    artifact_queue = getattr(request.app.state, "artifact_ingest_queue", None)
+    artifact_stats = getattr(request.app.state, "artifact_ingest_stats", {})
     return {
         "status": "ok",
         "frp": monitor.status() if monitor else {"configured": False},
+        "artifacts": {
+            "queued": artifact_queue.qsize() if artifact_queue else 0,
+            "dropped": int(artifact_stats.get("dropped", 0)),
+            "failed": int(artifact_stats.get("failed", 0)),
+        },
     }
 
 
@@ -261,9 +501,9 @@ async def download_client_file(
 @app.get("/api/terminals")
 async def list_terminals(
     manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> list[dict[str, object]]:
-    return manager.list()
+    return manager.list(username)
 
 
 @app.get("/api/devices")
@@ -677,8 +917,9 @@ async def service_monitor_loop(app: FastAPI) -> None:
 async def create_device_terminal(
     device_id: str,
     body: CreateTerminalBody,
+    request: Request,
     manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> dict[str, object]:
     device = await asyncio.to_thread(devices.get, device_id)
     if not device:
@@ -696,8 +937,29 @@ async def create_device_terminal(
             device_id=device_id,
             device_name=str(device["name"]),
             remote_port=int(device["remote_port"]),
+            owner=username,
+            workspace_root=(body.workspace_root or ".").strip() or ".",
+            workspace_platform=(
+                "windows"
+                if str(device.get("remote_shell") or "system") in {"powershell", "cmd"}
+                else "posix"
+            ),
         )
-        return session.as_dict()
+        payload = session.as_dict()
+        try:
+            binding = await bind_terminal_workspace(request.app, session)
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "binding_id": binding.id,
+                "available": True,
+            }
+        except WorkspaceError as error:
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "available": False,
+                "error": str(error),
+            }
+        return payload
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -705,13 +967,54 @@ async def create_device_terminal(
 @app.post("/api/terminals", status_code=201)
 async def create_terminal(
     body: CreateTerminalBody,
+    request: Request,
     manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> dict[str, object]:
     if os.getenv("ENABLE_LOCAL_TERMINALS", "1") != "1":
         raise HTTPException(status_code=403, detail="服务器已禁用本地终端")
     try:
-        return manager.create(body.name, body.cols, body.rows).as_dict()
+        workspace_root = manager.cwd
+        if body.workspace_root:
+            candidate = Path(body.workspace_root).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(manager.cwd) / candidate
+            candidate = candidate.resolve()
+            try:
+                candidate.relative_to(Path(manager.cwd))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="本地工作区必须位于 TERMINAL_CWD 内",
+                ) from exc
+            if not candidate.is_dir():
+                raise HTTPException(
+                    status_code=422,
+                    detail="本地工作区目录不存在",
+                )
+            workspace_root = str(candidate)
+        session = manager.create(
+            body.name,
+            body.cols,
+            body.rows,
+            owner=username,
+            workspace_root=workspace_root,
+        )
+        payload = session.as_dict()
+        try:
+            binding = await bind_terminal_workspace(request.app, session)
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "binding_id": binding.id,
+                "available": True,
+            }
+        except WorkspaceError as error:
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "available": False,
+                "error": str(error),
+            }
+        return payload
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -721,12 +1024,303 @@ async def delete_terminal(
     session_id: str,
     request: Request,
     manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> dict[str, bool]:
+    if not manager.get_for_owner(session_id, username):
+        raise HTTPException(status_code=404, detail="Terminal not found")
     await request.app.state.previews.delete_for_terminal(session_id)
+    await asyncio.to_thread(request.app.state.workspaces.unbind, username, session_id)
     if not await manager.delete(session_id):
         raise HTTPException(status_code=404, detail="Terminal not found")
+    request.app.state.artifact_rate_windows.pop(session_id, None)
     return {"ok": True}
+
+
+@app.get("/api/terminals/{session_id}/workspace")
+async def list_workspace(
+    session_id: str,
+    request: Request,
+    path: str = "",
+    manager: TerminalManager = Depends(terminal_manager),
+    service: WorkspaceService = Depends(workspace_service),
+    username: str = Depends(current_user),
+) -> dict[str, object]:
+    session = manager.get_for_owner(session_id, username)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    try:
+        binding = await bind_terminal_workspace(request.app, session)
+        requested_path = path or "."
+        directory = await asyncio.to_thread(
+            service.stat, username, session_id, requested_path
+        )
+        if directory.kind != "directory":
+            raise WorkspaceNotDirectory(
+                f'workspace path "{directory.path}" is not a directory'
+            )
+        entries = await asyncio.to_thread(
+            service.list, username, session_id, directory.path
+        )
+        # SFTP canonicalizes a configured root lazily on first I/O.
+        binding = await asyncio.to_thread(service.binding, username, session_id)
+    except WorkspaceError as error:
+        raise workspace_http_error(error) from error
+
+    relative_path = "" if directory.path == "." else directory.path
+    parts = [part for part in relative_path.split("/") if part]
+    breadcrumbs: list[dict[str, str]] = [{"name": "工作区", "path": ""}]
+    for index, part in enumerate(parts):
+        breadcrumbs.append(
+            {"name": part, "path": "/".join(parts[: index + 1])}
+        )
+    parent_path = "/".join(parts[:-1]) if parts else None
+    return {
+        "path": relative_path,
+        "root": binding.root,
+        "provider": binding.provider_kind,
+        "parent": parent_path,
+        "parent_path": parent_path,
+        "breadcrumbs": breadcrumbs,
+        "truncated": False,
+        "entries": [
+            {
+                "name": entry.name,
+                "path": "" if entry.path == "." else entry.path,
+                "kind": entry.kind,
+                "size": entry.size,
+                "modified_at": entry.modified_at,
+                "version": entry.etag,
+            }
+            for entry in entries
+        ],
+    }
+
+
+@app.post("/api/terminals/{session_id}/files/resolve")
+async def resolve_workspace_file(
+    session_id: str,
+    body: ResolveFileBody,
+    request: Request,
+    manager: TerminalManager = Depends(terminal_manager),
+    service: WorkspaceService = Depends(workspace_service),
+    username: str = Depends(current_user),
+) -> dict[str, object]:
+    session = manager.get_for_owner(session_id, username)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    try:
+        await bind_terminal_workspace(request.app, session)
+        grant = await asyncio.to_thread(
+            service.grant, username, session_id, body.path
+        )
+    except WorkspaceError as error:
+        raise workspace_http_error(error) from error
+    return file_grant_payload(grant)
+
+
+@app.get("/api/files/{grant_id}/content")
+async def read_workspace_file(
+    grant_id: str,
+    terminal_id: str,
+    request: Request,
+    manager: TerminalManager = Depends(terminal_manager),
+    service: WorkspaceService = Depends(workspace_service),
+    username: str = Depends(current_user),
+) -> Response:
+    session = manager.get_for_owner(terminal_id, username)
+    if not session:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        await bind_terminal_workspace(request.app, session)
+        result = await asyncio.to_thread(
+            service.read,
+            grant_id,
+            username,
+            terminal_id,
+            range_header=request.headers.get("range"),
+            if_none_match=request.headers.get("if-none-match"),
+        )
+    except WorkspaceError as error:
+        raise workspace_http_error(error) from error
+    return Response(
+        content=result.body,
+        status_code=result.status_code,
+        headers=result.headers,
+    )
+
+
+@app.post("/api/terminals/{session_id}/read-image")
+async def read_image_tool(
+    session_id: str,
+    body: ReadImageBody,
+    request: Request,
+    manager: TerminalManager = Depends(terminal_manager),
+    service: WorkspaceService = Depends(workspace_service),
+    username: str = Depends(current_user),
+) -> dict[str, object]:
+    session = manager.get_for_owner(session_id, username)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    try:
+        await bind_terminal_workspace(request.app, session)
+        grant = await asyncio.to_thread(
+            service.grant, username, session_id, body.path
+        )
+        if not grant.media_type.startswith("image/"):
+            raise WorkspaceNotFile("read_image only accepts raster image files")
+        if grant.size > request.app.state.attachments.max_image_bytes:
+            raise WorkspaceTooLarge(
+                "image exceeds the durable attachment byte limit"
+            )
+        resolved = await asyncio.to_thread(
+            service.read, grant.id, username, session_id
+        )
+    except WorkspaceError as error:
+        raise workspace_http_error(error) from error
+    try:
+        attachment = await asyncio.to_thread(
+            request.app.state.attachments.save_image,
+            resolved.body,
+            declared_media_type=grant.media_type,
+            name=grant.name,
+        )
+    except ImageValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ImageSupportUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+    file_ref = ArtifactFileRef(
+        path=grant.path,
+        name=grant.name,
+        media_type=attachment.media_type,
+        size=attachment.size,
+    )
+    event = await asyncio.to_thread(
+        request.app.state.artifacts.append,
+        owner=username,
+        terminal_id=session_id,
+        event_type="read_image",
+        file=file_ref,
+        source="read-image-tool",
+        version=grant.etag,
+        attachment=attachment,
+    )
+    attachment_url = (
+        f"/api/terminals/{quote(session_id, safe='')}/attachments/"
+        f"{quote(attachment.id, safe='')}"
+    )
+    content = build_read_image_result(file_ref, attachment)
+    content[1]["url"] = attachment_url
+    model_payload = await asyncio.to_thread(
+        request.app.state.attachments.read_authorized,
+        request.app.state.artifacts,
+        owner=username,
+        terminal_id=session_id,
+        attachment_id=attachment.id,
+    )
+    return {
+        "event": event.as_dict(),
+        "file": file_ref.as_dict(),
+        "attachment": {**attachment.as_dict(), "url": attachment_url},
+        "content": content,
+        "model_content_format": "openai-responses",
+        "model_content": build_openai_responses_image_content(
+            file_ref, model_payload
+        ),
+    }
+
+
+@app.get("/api/terminals/{session_id}/artifacts")
+async def list_artifacts(
+    session_id: str,
+    request: Request,
+    after_sequence: int = 0,
+    manager: TerminalManager = Depends(terminal_manager),
+    username: str = Depends(current_user),
+) -> list[dict[str, object]]:
+    if not manager.get_for_owner(session_id, username):
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    if after_sequence < 0:
+        raise HTTPException(status_code=422, detail="after_sequence must not be negative")
+    if after_sequence:
+        events = await asyncio.to_thread(
+            request.app.state.artifacts.snapshot,
+            owner=username,
+            terminal_id=session_id,
+            after_sequence=after_sequence,
+            limit=500,
+        )
+    else:
+        events = await asyncio.to_thread(
+            request.app.state.artifacts.recent,
+            owner=username,
+            terminal_id=session_id,
+            limit=500,
+        )
+    return [event.as_dict() for event in events]
+
+
+@app.post("/api/terminals/{session_id}/artifacts", status_code=201)
+async def create_artifact(
+    session_id: str,
+    body: ArtifactBody,
+    request: Request,
+    manager: TerminalManager = Depends(terminal_manager),
+    username: str = Depends(current_user),
+) -> dict[str, object]:
+    if not manager.get_for_owner(session_id, username):
+        raise HTTPException(status_code=404, detail="Terminal not found")
+    event = await asyncio.to_thread(
+        request.app.state.artifacts.append,
+        owner=username,
+        terminal_id=session_id,
+        event_type=body.type,
+        file=ArtifactFileRef(
+            path=body.path,
+            name=body.name,
+            media_type=body.media_type,
+            size=body.size,
+            kind=body.kind,
+        ),
+        source=body.source,
+        version=body.version,
+    )
+    return event.as_dict()
+
+
+@app.get("/api/terminals/{session_id}/attachments/{attachment_id:path}")
+async def read_attachment(
+    session_id: str,
+    attachment_id: str,
+    request: Request,
+    manager: TerminalManager = Depends(terminal_manager),
+    username: str = Depends(current_user),
+) -> Response:
+    if not manager.get_for_owner(session_id, username):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    try:
+        payload = await asyncio.to_thread(
+            request.app.state.attachments.read_authorized,
+            request.app.state.artifacts,
+            owner=username,
+            terminal_id=session_id,
+            attachment_id=attachment_id,
+        )
+    except (AttachmentAccessDenied, AttachmentIntegrityError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Attachment not found") from exc
+    digest = payload.ref.id.removeprefix("sha256:")
+    filename = payload.ref.name or f"image-{digest[:12]}"
+    return Response(
+        content=payload.data,
+        media_type=payload.ref.media_type,
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+            "ETag": f'"{digest}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
 
 
 def preview_api_payload(preview) -> dict[str, object]:
@@ -751,7 +1345,7 @@ async def create_preview(
     body: CreatePreviewBody,
     manager: PreviewManager = Depends(preview_manager),
     terminal_manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> dict[str, object]:
     if not preview_origin:
         raise HTTPException(
@@ -764,7 +1358,7 @@ async def create_preview(
     if not device["frp_online"] or not device["ssh_available"]:
         raise HTTPException(status_code=409, detail="设备 SSH 当前不可用")
     if body.terminal_id:
-        terminal = terminal_manager.get(body.terminal_id)
+        terminal = terminal_manager.get_for_owner(body.terminal_id, username)
         if not terminal or terminal.device_id != device_id:
             raise HTTPException(status_code=422, detail="终端不属于所选设备")
         detected = terminal.services.get(body.port)
@@ -1051,6 +1645,48 @@ async def proxy_preview_websocket(
             await websocket.close(code=1011)
 
 
+@app.websocket("/ws/events/{session_id}")
+async def artifact_socket(websocket: WebSocket, session_id: str) -> None:
+    username = signer.verify(websocket.cookies.get(COOKIE_NAME))
+    if not username:
+        await websocket.close(code=4401)
+        return
+    manager: TerminalManager = websocket.app.state.terminals
+    if not manager.get_for_owner(session_id, username):
+        await websocket.close(code=4404)
+        return
+
+    subscription = websocket.app.state.artifacts.subscribe(
+        owner=username,
+        terminal_id=session_id,
+        snapshot_limit=500,
+    )
+
+    async def send_events() -> None:
+        await websocket.send_json([event.as_dict() for event in subscription.snapshot])
+        async for event in subscription:
+            await websocket.send_json(event.as_dict())
+
+    async def receive_until_disconnect() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+    try:
+        await websocket.accept()
+        sender = asyncio.create_task(send_events())
+        receiver = asyncio.create_task(receive_until_disconnect())
+        done, pending = await asyncio.wait(
+            {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+    finally:
+        await subscription.aclose()
+
+
 @app.websocket("/ws/terminal/{session_id}")
 async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
     username = signer.verify(websocket.cookies.get(COOKIE_NAME))
@@ -1059,7 +1695,7 @@ async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
         return
 
     manager: TerminalManager = websocket.app.state.terminals
-    if not manager.get(session_id):
+    if not manager.get_for_owner(session_id, username):
         await websocket.close(code=4404)
         return
 
