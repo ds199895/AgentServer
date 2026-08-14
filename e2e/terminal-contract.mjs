@@ -10,7 +10,9 @@ const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
 const pageErrors = []
 const consoleErrors = []
 const contractName = `contract-check-${Date.now().toString(36)}`
+const switchName = `${contractName}-switch`
 let terminalId = ''
+let switchTerminalId = ''
 page.on('pageerror', (error) => pageErrors.push(error.message))
 page.on('console', (message) => {
   if (message.type() === 'error') consoleErrors.push(message.text())
@@ -37,6 +39,18 @@ try {
     }
     return session.id
   }, contractName)
+
+  switchTerminalId = await page.evaluate(async (name) => {
+    const response = await fetch('/api/terminals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+    if (!response.ok) throw new Error(`failed to create switch target: ${response.status}`)
+    const session = await response.json()
+    if (!session.id) throw new Error('switch target has no id')
+    return session.id
+  }, switchName)
 
   await page.evaluate(async (sessionId) => {
     const request = async (path, init) => {
@@ -170,6 +184,69 @@ try {
       return rect.width > 0 && rect.height > 0
     }).length >= 2
   })
+
+  // VS Code-style active group routing: clicking a pane makes it the target
+  // for the next global terminal Tab selection. Moving a hidden terminal into
+  // the right pane must leave the visible terminal in the left pane untouched.
+  const primaryPane = page.locator(`[data-terminal-id="${terminalId}"]`)
+  const visiblePanes = page.locator('[data-terminal-visible="true"]')
+  const initialVisible = await visiblePanes.evaluateAll((nodes) => nodes.map((node) => ({
+    id: node.getAttribute('data-terminal-id'),
+    left: node.getBoundingClientRect().left,
+  })).sort((first, second) => first.left - second.left))
+  if (initialVisible.length !== 2 || initialVisible[0].id !== terminalId) {
+    throw new Error(`unexpected initial split placement: ${JSON.stringify(initialVisible)}`)
+  }
+  const rightTerminalId = initialVisible[1].id
+  const rightPane = page.locator(`[data-terminal-id="${rightTerminalId}"]`)
+  const rightLeafId = await rightPane.getAttribute('data-terminal-leaf-id')
+  await primaryPane.locator('.terminal-host').click({ position: { x: 80, y: 80 } })
+  await page.waitForFunction((id) => (
+    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
+  ), terminalId)
+  await rightPane.locator('.terminal-host').click({ position: { x: 80, y: 80 } })
+  await page.waitForFunction((id) => (
+    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
+  ), rightTerminalId)
+  await page.getByRole('button', {
+    name: `切换到 ${switchName} 终端 ${switchTerminalId.slice(0, 8)}`,
+  }).click()
+  await page.waitForFunction(({ primaryId, targetId }) => {
+    const primary = document.querySelector(`[data-terminal-id="${primaryId}"]`)
+    const target = document.querySelector(`[data-terminal-id="${targetId}"]`)
+    if (!primary || !target) return false
+    const primaryRect = primary.getBoundingClientRect()
+    const targetRect = target.getBoundingClientRect()
+    return (
+      primary.getAttribute('data-terminal-visible') === 'true' &&
+      target.getAttribute('data-terminal-visible') === 'true' &&
+      target.getAttribute('data-terminal-focused') === 'true' &&
+      primaryRect.left < targetRect.left
+    )
+  }, { primaryId: terminalId, targetId: switchTerminalId })
+  if (await rightPane.getAttribute('data-terminal-visible') !== 'false') {
+    throw new Error('previous right terminal did not become an inactive tab')
+  }
+  const targetPane = page.locator(`[data-terminal-id="${switchTerminalId}"]`)
+  if (
+    !rightLeafId ||
+    await targetPane.getAttribute('data-terminal-leaf-id') !== rightLeafId ||
+    await rightPane.getAttribute('data-terminal-leaf-id') !== rightLeafId
+  ) {
+    throw new Error('selected terminal was not placed in the focused right pane')
+  }
+  // A Tab that is already visible focuses its existing pane instead of moving
+  // the sole terminal out of that pane and collapsing the split.
+  await page.getByRole('button', {
+    name: `切换到 ${contractName} 终端 ${terminalId.slice(0, 8)}`,
+  }).click()
+  await page.waitForFunction((id) => (
+    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
+  ), terminalId)
+  if (await targetPane.getAttribute('data-terminal-visible') !== 'true') {
+    throw new Error('focusing an already visible terminal collapsed or replaced the other pane')
+  }
+
   const separator = page.getByRole('separator', { name: '调整左右终端宽度' }).first()
   await separator.focus()
   await page.keyboard.press('End')
@@ -209,16 +286,26 @@ try {
   if (meaningfulConsoleErrors.length) {
     throw new Error(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
   }
-  console.log('terminal split, workspace, file range, artifact, and read-image contracts passed')
+  console.log('terminal split, active-pane routing, workspace, file range, artifact, and read-image contracts passed')
 } finally {
-  await page.evaluate(async ({ sessionId, name }) => {
+  await page.evaluate(async ({ sessionId, switchSessionId, name, alternateName }) => {
     const response = await fetch('/api/terminals')
     if (!response.ok) return
     const sessions = await response.json()
-    const owned = sessions.filter((session) => session.id === sessionId || session.name === name)
+    const owned = sessions.filter((session) => (
+      session.id === sessionId ||
+      session.id === switchSessionId ||
+      session.name === name ||
+      session.name === alternateName
+    ))
     await Promise.all(owned.map((session) => (
       fetch(`/api/terminals/${encodeURIComponent(session.id)}`, { method: 'DELETE' })
     )))
-  }, { sessionId: terminalId, name: contractName }).catch(() => {})
+  }, {
+    sessionId: terminalId,
+    switchSessionId: switchTerminalId,
+    name: contractName,
+    alternateName: switchName,
+  }).catch(() => {})
   await browser.close()
 }

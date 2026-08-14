@@ -37,6 +37,12 @@ import { cn } from '@/lib/utils'
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
 const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
 
+type ShowTerminalOptions = {
+  replace?: boolean
+  /** 顶部终端 Tab 像 VS Code 一样在当前活动窗格中打开。 */
+  targetFocusedLeaf?: boolean
+}
+
 function initialLayout(): { layout: LayoutNode | null; focusedLeafId: string | null } {
   try {
     const persisted = parseLayout(window.localStorage.getItem(LAYOUT_KEY))
@@ -287,19 +293,35 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPopState)
   }, [load])
 
-  const showTerminal = (id: string | null, replace = false) => {
+  const showTerminal = (id: string | null, options: ShowTerminalOptions = {}) => {
+    const { replace = false, targetFocusedLeaf = false } = options
     activeIdRef.current = id; setActiveId(id); setMissingTerminalId(null); setPage('terminals')
     setWorkspaceSessionId((current) => current === null ? null : id)
     lastTerminalIdRef.current = id
     storeTerminalId(id)
     if (id) {
-      // Existing sessions stay in their pane. This preserves desktop splits
-      // when selecting a tab (including while the UI is in mobile single-pane
-      // mode). Only a brand-new session is appended to the focused pane.
-      const currentLeaf = layoutRef.current ? leafOfSession(layoutRef.current, id) : null
-      const activated = currentLeaf
-        ? activateSession(layoutRef.current, id)
-        : activateSession(layoutRef.current, id, { leafId: focusedLeafIdRef.current })
+      // 顶部 Tab 以最后聚焦的窗格为目标，和 VS Code 的 active editor group
+      // 一致。移动端仍只激活会话原本所在的 leaf，避免单窗格模式暗中改坏
+      // 已持久化的桌面分屏结构。若目标已经显示在另一个窗格，则直接聚焦
+      // 那个窗格；一个 xterm 不能同时出现在两个位置，也不应移走唯一 Tab
+      // 导致现有分屏坍缩。
+      const root = layoutRef.current
+      const currentLeaf = root ? leafOfSession(root, id) : null
+      const targetLeaf = root && focusedLeafIdRef.current
+        ? findLeaf(root, focusedLeafIdRef.current)
+        : null
+      const moveToTarget = Boolean(
+        targetFocusedLeaf &&
+        !forceSingle &&
+        currentLeaf &&
+        targetLeaf &&
+        currentLeaf.id !== targetLeaf.id &&
+        currentLeaf.activeTab !== id,
+      )
+      const activated = activateSession(layoutRef.current, id, {
+        leafId: focusedLeafIdRef.current,
+        move: moveToTarget,
+      })
       setLayoutState(activated.root)
       setFocusedLeafState(activated.leafId)
     }
@@ -368,7 +390,7 @@ export default function App() {
   const navigate = (nextPage: MainPage, replace = false) => {
     if (nextPage === 'terminals') {
       const preferredSession = sessions.find((item) => item.id === lastTerminalIdRef.current) || sessions[0]
-      showTerminal(preferredSession?.id ?? null, replace)
+      showTerminal(preferredSession?.id ?? null, { replace })
       return
     }
     activeIdRef.current = null; setActiveId(null); setMissingTerminalId(null); setPage(nextPage)
@@ -423,7 +445,7 @@ export default function App() {
         const nextLeaf = nextLayout
           ? (focusedLeafIdRef.current && findLeaf(nextLayout, focusedLeafIdRef.current)) || firstLeaf(nextLayout)
           : null
-        showTerminal(nextLeaf?.activeTab ?? nextLeaf?.tabs[0] ?? null, true)
+        showTerminal(nextLeaf?.activeTab ?? nextLeaf?.tabs[0] ?? null, { replace: true })
       } else if (nextLayout && focusedLeafIdRef.current && !findLeaf(nextLayout, focusedLeafIdRef.current)) {
         setFocusedLeafState(firstLeaf(nextLayout).id)
       }
@@ -503,7 +525,7 @@ export default function App() {
             sessions={sessions}
             activeId={activeId}
             cloningId={cloningId}
-            onSelect={(id) => showTerminal(id)}
+            onSelect={(id) => showTerminal(id, { targetFocusedLeaf: true })}
             onClose={setCloseTarget}
             onClone={(source) => void cloneTerminal(source)}
             onPreview={(source) => setPreviewTarget({ deviceId: source.device_id || undefined, terminalId: source.id })}

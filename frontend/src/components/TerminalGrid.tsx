@@ -249,7 +249,12 @@ export function TerminalGrid(props: Props) {
         return (
           <div
             key={session.id}
+            data-terminal-id={session.id}
+            data-terminal-leaf-id={leafId ?? undefined}
+            data-terminal-visible={visible ? 'true' : 'false'}
+            data-terminal-focused={visible && session.id === activeId ? 'true' : 'false'}
             onPointerDownCapture={() => { if (visible && leafId) onFocusLeaf(leafId) }}
+            onFocusCapture={() => { if (visible && leafId) onFocusLeaf(leafId) }}
             style={{
               left: percent(rect.left),
               top: percent(rect.top),
