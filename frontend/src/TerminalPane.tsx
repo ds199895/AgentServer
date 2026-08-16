@@ -2,18 +2,40 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, Keyboard, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
+const textEncoder = new TextEncoder()
+
 type TerminalContextMenu = {
   x: number
   y: number
   hasSelection: boolean
 }
+
+type VirtualKey = {
+  label: string
+  title: string
+  data: string
+  className: string
+}
+
+const VIRTUAL_KEYS: VirtualKey[] = [
+  { label: 'Shift', title: 'Shift / 反向 Tab', data: '\x1b[Z', className: 'col-start-1 row-start-1' },
+  { label: 'Ctrl', title: 'Ctrl+C', data: '\x03', className: 'col-start-2 row-start-1' },
+  { label: 'Alt', title: 'Alt / Meta 前缀', data: '\x1b', className: 'col-start-3 row-start-1' },
+  { label: 'Esc', title: 'Escape', data: '\x1b', className: 'col-start-1 row-start-2' },
+  { label: '↑', title: '方向键上', data: '\x1b[A', className: 'col-start-2 row-start-2' },
+  { label: 'Enter', title: 'Enter', data: '\r', className: 'col-start-3 row-start-2' },
+  { label: '←', title: '方向键左', data: '\x1b[D', className: 'col-start-1 row-start-3' },
+  { label: '↓', title: '方向键下', data: '\x1b[B', className: 'col-start-2 row-start-3' },
+  { label: '→', title: '方向键右', data: '\x1b[C', className: 'col-start-3 row-start-3' },
+  { label: 'Tab', title: 'Tab', data: '\t', className: 'col-start-1 row-start-4 col-span-3' },
+]
 
 async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
@@ -73,6 +95,7 @@ export default function TerminalPane({
   )
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null)
   const [pastePanelOpen, setPastePanelOpen] = useState(false)
+  const [virtualKeyboardOpen, setVirtualKeyboardOpen] = useState(false)
   const [pasteDraft, setPasteDraft] = useState('')
   const [notice, setNotice] = useState('')
   const [showAllServices, setShowAllServices] = useState(false)
@@ -140,6 +163,13 @@ export default function TerminalPane({
     if (!pasteDraft) return
     terminalRef.current?.paste(pasteDraft)
     closePastePanel()
+  }
+
+  const sendVirtualKey = (key: VirtualKey) => {
+    const terminal = terminalRef.current
+    if (!terminal) return
+    terminal.input(key.data, true)
+    terminal.focus()
   }
 
   const selectAll = () => {
@@ -261,7 +291,9 @@ export default function TerminalPane({
         fit()
         refreshFrame = window.requestAnimationFrame(() => {
           if (!visibleRef.current || disposed) return
-          terminal.clearTextureAtlas()
+          // clearTextureAtlas() is a no-op unless a WebGL/canvas renderer is
+          // loaded; its only effect there is the full refresh below, so calling
+          // both repainted every row twice. WebGL recovers via onContextLoss.
           terminal.refresh(0, terminal.rows - 1)
           // ResizeObserver、WS onopen 和 visibilitychange 都可能在用户已经
           // 聚焦分隔条/按钮后触发。只允许当前 pane 在页面没有交互焦点，或
@@ -324,7 +356,7 @@ export default function TerminalPane({
 
     const input = terminal.onData((data) => {
       if (!replayingSnapshot && socket?.readyState === WebSocket.OPEN) {
-        socket.send(new TextEncoder().encode(data))
+        socket.send(textEncoder.encode(data))
       }
     })
     const host = hostRef.current
@@ -476,6 +508,7 @@ export default function TerminalPane({
     } else {
       setContextMenu(null)
       setPastePanelOpen(false)
+      setVirtualKeyboardOpen(false)
       setPasteDraft('')
     }
   }, [visible, focused])
@@ -579,6 +612,52 @@ export default function TerminalPane({
             <ChevronsUp className="size-4 max-md:size-3.5" />
           </button>
         </>
+      )}
+      {visible && (
+        <div
+          className={cn(
+            'absolute right-4 z-30 grid justify-items-end gap-2 max-md:right-2',
+            onlineServices.length > 0 ? 'bottom-16 max-md:bottom-11' : 'bottom-4 max-md:bottom-2',
+            !servicesCollapsed && onlineServices.length > 0 && 'max-md:bottom-[calc(30%+1rem)]',
+          )}
+        >
+          {virtualKeyboardOpen && (
+            <div className="grid w-[min(236px,calc(100vw-1rem))] grid-cols-3 grid-rows-4 gap-1.5 rounded-xl border border-[#30404b] bg-[#0c1319ef] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:w-[min(218px,calc(100vw-1rem))] max-md:gap-1 max-md:rounded-lg max-md:p-1.5">
+              {VIRTUAL_KEYS.map((key) => (
+                <button
+                  key={key.label}
+                  type="button"
+                  aria-label={key.title}
+                  title={key.title}
+                  onPointerDown={(event) => event.preventDefault()}
+                  onClick={() => sendVirtualKey(key)}
+                  className={cn(
+                    'grid h-9 cursor-pointer place-items-center rounded-md border border-[#2d3b46] bg-[#101820] px-2 font-mono text-[11px] font-semibold text-[#c4d0d9] shadow-[inset_0_-1px_0_#0006] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary active:translate-y-px max-md:h-8 max-md:text-[10px]',
+                    key.className,
+                  )}
+                >
+                  {key.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <button
+            type="button"
+            aria-label={virtualKeyboardOpen ? '收起虚拟键盘' : '打开虚拟键盘'}
+            aria-pressed={virtualKeyboardOpen}
+            title={virtualKeyboardOpen ? '收起虚拟键盘' : '打开虚拟键盘'}
+            onClick={() => {
+              setVirtualKeyboardOpen((value) => !value)
+              terminalRef.current?.focus()
+            }}
+            className={cn(
+              'grid size-9 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_10px_30px_#000a] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:size-8',
+              virtualKeyboardOpen && 'border-[#315a48] bg-[#15251e] text-primary',
+            )}
+          >
+            <Keyboard className="size-4 max-md:size-3.5" />
+          </button>
+        </div>
       )}
       {visible && onlineServices.length > 0 && servicesCollapsed && (
         <button

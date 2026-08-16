@@ -444,6 +444,7 @@ class TerminalManager:
         self._owned_pids: set[int] = set()
         self.loop = asyncio.get_running_loop()
         self.service_discovery_event = asyncio.Event()
+        self._tmux_states_cache: tuple[float, dict[str, tuple[bool, str, bool]]] | None = None
         if self.backend == "tmux":
             if not shutil.which(self.tmux_binary):
                 raise RuntimeError(f"tmux executable not found: {self.tmux_binary}")
@@ -465,9 +466,12 @@ class TerminalManager:
 
     def list(self, owner: str | None = None) -> list[dict[str, object]]:
         if self.backend == "tmux":
+            # One tmux exec describes every pane on the socket, so refreshing N
+            # sessions no longer costs 2N blocking subprocess calls on the loop.
+            states = self._tmux_pane_states(max_age=1.0)
             for session in tuple(self.sessions.values()):
                 if session.active:
-                    self._refresh_tmux_state(session)
+                    self._refresh_tmux_state(session, states)
         sessions = sorted(
             (
                 session
@@ -481,12 +485,11 @@ class TerminalManager:
     def get(self, session_id: str) -> TerminalSession | None:
         session = self.sessions.get(session_id)
         if session and self.backend == "tmux":
+            states = self._tmux_pane_states(max_age=1.0)
             if session.active:
-                self._refresh_tmux_state(session)
-            if (
-                session.active
-                and session.fd < 0
-                and self._tmux_session_exists(session.tmux_name or "")
+                self._refresh_tmux_state(session, states)
+            if session.active and session.fd < 0 and self._tmux_session_alive(
+                session.tmux_name or "", states
             ):
                 self._spawn_tmux_client(session)
         return session
@@ -653,6 +656,10 @@ class TerminalManager:
     def _tmux_run(
         self, *arguments: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
+        if arguments and arguments[0] in {"new-session", "kill-session", "kill-server"}:
+            # The batched pane snapshot is only valid while the set of sessions
+            # is unchanged. Invalidating here means no caller can forget to.
+            self._tmux_states_cache = None
         result = subprocess.run(
             self._tmux_command(*arguments), capture_output=True, text=True
         )
@@ -666,6 +673,46 @@ class TerminalManager:
             return False
         result = self._tmux_run("has-session", "-t", tmux_name, check=False)
         return result.returncode == 0
+
+    def _tmux_pane_states(
+        self, *, max_age: float = 0.0
+    ) -> dict[str, tuple[bool, str, bool]] | None:
+        """Describe every pane on the socket with a single tmux exec.
+
+        Maps each tmux session name to (pane_dead, pane_dead_status, pane_pipe).
+        Returns None when the query itself failed; callers must then fall back to
+        the per-session path, because an unreachable tmux server would otherwise
+        be indistinguishable from "every session has died".
+        """
+        cached = self._tmux_states_cache
+        if max_age > 0 and cached and time.monotonic() - cached[0] <= max_age:
+            return cached[1]
+        result = self._tmux_run(
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pipe}",
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        states: dict[str, tuple[bool, str, bool]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 4 or not fields[0]:
+                continue
+            # Every agentserver session owns exactly one pane; if that ever
+            # changes, the first pane still decides the session's liveness.
+            states.setdefault(fields[0], (fields[1] == "1", fields[2], fields[3] == "1"))
+        self._tmux_states_cache = (time.monotonic(), states)
+        return states
+
+    def _tmux_session_alive(
+        self, tmux_name: str, states: dict[str, tuple[bool, str, bool]] | None
+    ) -> bool:
+        if states is None:
+            return self._tmux_session_exists(tmux_name)
+        return bool(tmux_name) and tmux_name in states
 
     def _configure_tmux_server(self) -> None:
         if self.tmux_socket is None:
@@ -1001,35 +1048,46 @@ class TerminalManager:
         session.fd = fd
         self.loop.add_reader(fd, self._read_ready, session.id)
 
-    def _refresh_tmux_state(self, session: TerminalSession) -> None:
-        if not session.tmux_name or not self._tmux_session_exists(session.tmux_name):
+    def _refresh_tmux_state(
+        self,
+        session: TerminalSession,
+        states: dict[str, tuple[bool, str, bool]] | None = None,
+    ) -> None:
+        tmux_name = session.tmux_name or ""
+        if not self._tmux_session_alive(tmux_name, states):
             session.exited_at = session.exited_at or time.time()
             session.return_code = session.return_code if session.return_code is not None else -1
             self._stop_tmux_artifact_capture(session, stop_pipe=False)
             return
-        result = self._tmux_run(
-            "display-message",
-            "-p",
-            "-t",
-            session.tmux_name,
-            "#{pane_dead}:#{pane_dead_status}:#{pane_pipe}",
-            check=False,
-        )
-        fields = result.stdout.strip().split(":", 2)
-        if result.returncode == 0 and fields[0] == "1":
+        if states is not None:
+            queried = True
+            dead, dead_status, piped = states[tmux_name]
+        else:
+            result = self._tmux_run(
+                "display-message",
+                "-p",
+                "-t",
+                tmux_name,
+                "#{pane_dead}:#{pane_dead_status}:#{pane_pipe}",
+                check=False,
+            )
+            fields = result.stdout.strip().split(":", 2)
+            queried = result.returncode == 0
+            dead = fields[0] == "1"
+            dead_status = fields[1] if len(fields) > 1 else ""
+            piped = len(fields) > 2 and fields[2] == "1"
+        if queried and dead:
             session.exited_at = session.exited_at or time.time()
             try:
-                session.return_code = int(fields[1])
-            except (IndexError, ValueError):
+                session.return_code = int(dead_status)
+            except (TypeError, ValueError):
                 session.return_code = None
             self._stop_tmux_artifact_capture(session)
-        elif result.returncode == 0:
+        elif queried:
             session.exited_at = None
             session.return_code = None
             if self.artifact_callback is not None and (
-                session.artifact_fd < 0
-                or len(fields) < 3
-                or fields[2] != "1"
+                session.artifact_fd < 0 or not piped
             ):
                 self._stop_tmux_artifact_capture(session, stop_pipe=False)
             self._start_tmux_artifact_capture(session)
