@@ -1024,5 +1024,186 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                         )
 
 
+class TmuxPaneStateSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """The batched `list-panes -a` snapshot replaces 2N per-session tmux execs.
+
+    tmux is not required: `_tmux_run` is replaced by a recorder that returns real
+    CompletedProcess values, so the snapshot parsing and the fallback contract are
+    both exercised without a tmux server.
+    """
+
+    def _manager(self, directory: str) -> TerminalManager:
+        with patch("app.terminal.shutil.which", return_value="/usr/bin/tmux"), patch.object(
+            TerminalManager, "_restore_tmux_sessions"
+        ):
+            # No artifact_callback: _start_tmux_artifact_capture then early-returns,
+            # keeping these tests to the liveness logic under test.
+            return TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+            )
+
+    @staticmethod
+    def _recorder(
+        calls: list[tuple[str, ...]], stdout: str = "", returncode: int = 0
+    ):
+        def run(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            calls.append(arguments)
+            return subprocess.CompletedProcess(
+                list(arguments), returncode, stdout=stdout, stderr=""
+            )
+
+        return run
+
+    @staticmethod
+    def _session(session_id: str) -> TerminalSession:
+        return TerminalSession(
+            id=session_id,
+            name=session_id,
+            pid=-1,
+            fd=-1,
+            command="/bin/sh -l",
+            cwd="/tmp",
+            tmux_name=f"agentserver-{session_id}",
+        )
+
+    async def test_snapshot_parses_every_pane_and_caches_within_ttl(self) -> None:
+        stdout = (
+            "agentserver-alive\t0\t\t1\n"
+            "agentserver-dead\t1\t137\t0\n"
+            "malformed-line-without-fields\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                states = manager._tmux_pane_states()
+                self.assertEqual(
+                    {
+                        "agentserver-alive": (False, "", True),
+                        "agentserver-dead": (True, "137", False),
+                    },
+                    states,
+                )
+                self.assertEqual(1, len(calls))
+                self.assertEqual("list-panes", calls[0][0])
+                self.assertEqual("-a", calls[0][1])
+
+                # Inside the TTL the snapshot is reused without a second exec.
+                self.assertEqual(states, manager._tmux_pane_states(max_age=60.0))
+                self.assertEqual(1, len(calls))
+                # max_age=0 always re-queries.
+                manager._tmux_pane_states()
+                self.assertEqual(2, len(calls))
+            await manager.close()
+
+    async def test_failed_snapshot_falls_back_instead_of_killing_every_session(self) -> None:
+        """A transient tmux failure must not look like "all sessions died"."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            session = self._session("alive")
+            manager.sessions[session.id] = session
+            calls: list[tuple[str, ...]] = []
+
+            def run(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(arguments)
+                if arguments[0] == "list-panes":
+                    return subprocess.CompletedProcess(
+                        list(arguments), 1, stdout="", stderr="tmux unavailable"
+                    )
+                if arguments[0] == "display-message":
+                    return subprocess.CompletedProcess(
+                        list(arguments), 0, stdout="0::0\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(
+                    list(arguments), 0, stdout="", stderr=""
+                )
+
+            with patch.object(manager, "_tmux_run", run):
+                self.assertIsNone(manager._tmux_pane_states())
+                manager.list()
+            self.assertTrue(session.active, "a failed snapshot must not mark sessions dead")
+            # Fallback path: has-session + display-message per session.
+            self.assertIn("has-session", [call[0] for call in calls])
+            await manager.close()
+
+    async def test_list_refreshes_many_sessions_with_one_tmux_exec(self) -> None:
+        names = [f"session-{index}" for index in range(5)]
+        stdout = "".join(f"agentserver-{name}\t0\t\t0\n" for name in names)
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            for name in names:
+                manager.sessions[name] = self._session(name)
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                listed = manager.list()
+            self.assertEqual(5, len(listed))
+            self.assertTrue(all(item["active"] for item in listed))
+            self.assertEqual(
+                ["list-panes"],
+                [call[0] for call in calls],
+                "refreshing 5 sessions must cost exactly one tmux exec",
+            )
+            await manager.close()
+
+    async def test_snapshot_marks_dead_and_missing_sessions_exited(self) -> None:
+        stdout = "agentserver-dead\t1\t137\t0\n"
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            dead = self._session("dead")
+            vanished = self._session("vanished")
+            manager.sessions[dead.id] = dead
+            manager.sessions[vanished.id] = vanished
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                manager.list()
+            self.assertFalse(dead.active)
+            self.assertEqual(137, dead.return_code)
+            self.assertFalse(vanished.active, "a pane absent from the snapshot has died")
+            self.assertEqual(-1, vanished.return_code)
+            self.assertEqual(["list-panes"], [call[0] for call in calls])
+            await manager.close()
+
+    async def test_session_mutating_commands_invalidate_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            calls: list[tuple[str, ...]] = []
+
+            def run(
+                command: list[str], *, capture_output: bool, text: bool
+            ) -> subprocess.CompletedProcess[str]:
+                arguments = tuple(command[3:])
+                calls.append(arguments)
+                stdout = (
+                    "agentserver-a\t0\t\t0\n"
+                    if arguments and arguments[0] == "list-panes"
+                    else ""
+                )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=stdout, stderr=""
+                )
+
+            with patch("app.terminal.subprocess.run", side_effect=run):
+                manager._tmux_pane_states()
+                self.assertIsNotNone(manager._tmux_states_cache)
+                manager._tmux_run("kill-session", "-t", "agentserver-a", check=False)
+                self.assertIsNone(
+                    manager._tmux_states_cache,
+                    "kill-session changes which sessions exist",
+                )
+                manager._tmux_pane_states()
+                manager._tmux_run("new-session", "-d", "-s", "agentserver-b")
+                self.assertIsNone(manager._tmux_states_cache)
+                # Read-only commands keep the snapshot.
+                manager._tmux_pane_states()
+                manager._tmux_run("display-message", "-p", "x", check=False)
+                self.assertIsNotNone(manager._tmux_states_cache)
+            await manager.close()
+
+
 if __name__ == "__main__":
     unittest.main()
