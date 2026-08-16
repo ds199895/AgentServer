@@ -97,6 +97,12 @@ SSH 终端的远端路径。远端自定义 `workspace_root` 只约束文件面�
 `Range`。服务端依据实际内容嗅探类型，响应始终带 `nosniff`；HTML、SVG 和未知内容不会
 内联到主站上下文。
 
+浏览器文件区使用懒加载树：每个已展开目录独立缓存并通过版本绑定的游标分页，超过单页条目
+上限时可以继续加载，而不会替换整棵树。`/ws/workspace/{terminal_id}` 只轮询客户端声明的
+已展开目录和选中文件，发送根相对路径失效事件，不发送文件内容；客户端收到事件后仍通过
+上述只读网关重新列目录或生成新授权。文本文件使用动态加载的只读 CodeMirror 查看器，
+HTML、SVG 和未知格式仍不会作为可执行内容打开。
+
 本地提供器用设备号、inode、纳秒级 mtime/ctime 和大小复核版本。SFTP v3 通常只暴露秒级
 mtime 和大小，因此远端授权还会保存并在每次读取时复核一个有界内容探针；它是短时、
 version-checked 的授权，不是完整文件快照。若远端文件在同一秒被等长改写、且探针覆盖部分
@@ -335,7 +341,8 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 | `FILE_GRANT_TTL` | 文件解析授权的有效秒数，默认 120 |
 | `MAX_WORKSPACE_FILE_BYTES` | 可生成预览授权的最大文件字节数，默认 32 MiB |
 | `MAX_WORKSPACE_READ_BYTES` | 单次完整或 Range 响应的最大字节数，默认 32 MiB |
-| `MAX_WORKSPACE_LIST_ENTRIES` | 单次目录列表最大条目数，默认 1000 |
+| `MAX_WORKSPACE_LIST_ENTRIES` | 目录分页允许的单页最大条目数，默认 1000；浏览器默认请求 200 |
+| `WORKSPACE_WATCH_INTERVAL` | 文件树监听已展开目录和选中文件的轮询间隔秒数，默认 2，范围 0.5-30 |
 | `MAX_IMAGE_ATTACHMENT_BYTES` | `read-image` 可持久化的最大图片字节数，默认 5 MiB |
 | `MAX_IMAGE_ATTACHMENT_PIXELS` | 图片允许的最大像素总数，默认 4000 万 |
 | `ARTIFACT_INGEST_QUEUE_SIZE` | 终端输出 Artifact 待持久化队列上限，默认 1024 |
@@ -364,12 +371,13 @@ PREVIEW_PUBLIC_ORIGIN=https://preview.metakroma.com
 - `POST /api/devices/{id}/previews`
 - `GET/POST /api/terminals`（创建本地终端时可选 `workspace_root`，且必须位于 `TERMINAL_CWD` 内）
 - `DELETE /api/terminals/{id}`
-- `GET /api/terminals/{id}/workspace?path={relative_path}`
+- `GET /api/terminals/{id}/workspace?path={relative_path}&limit=200&cursor=...&revision=...`
 - `POST /api/terminals/{id}/files/resolve`，请求体为 `{"path":"relative/file.png"}`
 - `GET /api/files/{grant_id}/content?terminal_id={id}`（支持 `Range` 与 `If-None-Match`）
 - `GET/POST /api/terminals/{id}/artifacts`（GET 可选 `after_sequence`）
 - `POST /api/terminals/{id}/read-image`，请求体为 `{"path":"relative/image.png"}`
 - `GET /api/terminals/{id}/attachments/{sha256_id}`
+- `WS /ws/workspace/{id}`（客户端发送 `{"type":"watch","paths":[...]}`，服务端发送失效路径）
 - `GET /api/previews`
 - `POST /api/previews/{id}/ticket`
 - `DELETE /api/previews/{id}`

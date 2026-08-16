@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -405,7 +406,11 @@ def workspace_http_error(error: WorkspaceError) -> HTTPException:
         status_code = 503
     else:
         status_code = 500
-    return HTTPException(status_code=status_code, detail=str(error), headers=headers)
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": str(error)},
+        headers=headers,
+    )
 
 
 def file_grant_payload(grant: FileGrant) -> dict[str, object]:
@@ -1041,6 +1046,9 @@ async def list_workspace(
     session_id: str,
     request: Request,
     path: str = "",
+    cursor: str | None = None,
+    revision: str | None = None,
+    limit: int = 200,
     manager: TerminalManager = Depends(terminal_manager),
     service: WorkspaceService = Depends(workspace_service),
     username: str = Depends(current_user),
@@ -1051,16 +1059,17 @@ async def list_workspace(
     try:
         binding = await bind_terminal_workspace(request.app, session)
         requested_path = path or "."
-        directory = await asyncio.to_thread(
-            service.stat, username, session_id, requested_path
+        page = await asyncio.to_thread(
+            service.list_page,
+            username,
+            session_id,
+            requested_path,
+            cursor=cursor,
+            limit=limit,
+            expected_revision=revision,
         )
-        if directory.kind != "directory":
-            raise WorkspaceNotDirectory(
-                f'workspace path "{directory.path}" is not a directory'
-            )
-        entries = await asyncio.to_thread(
-            service.list, username, session_id, directory.path
-        )
+        directory = page.directory
+        entries = page.entries
         # SFTP canonicalizes a configured root lazily on first I/O.
         binding = await asyncio.to_thread(service.binding, username, session_id)
     except WorkspaceError as error:
@@ -1076,12 +1085,23 @@ async def list_workspace(
     parent_path = "/".join(parts[:-1]) if parts else None
     return {
         "path": relative_path,
+        "workspace_id": binding.id,
         "root": binding.root,
         "provider": binding.provider_kind,
+        "platform": session.workspace_platform,
+        "current_path": session.workspace_current_path,
         "parent": parent_path,
         "parent_path": parent_path,
         "breadcrumbs": breadcrumbs,
-        "truncated": False,
+        "revision": page.revision,
+        "next_cursor": page.next_cursor,
+        "truncated": page.next_cursor is not None,
+        "capabilities": {
+            "read": True,
+            "write": False,
+            "watch": True,
+            "pagination": True,
+        },
         "entries": [
             {
                 "name": entry.name,
@@ -1090,6 +1110,8 @@ async def list_workspace(
                 "size": entry.size,
                 "modified_at": entry.modified_at,
                 "version": entry.etag,
+                "hidden": entry.name.startswith("."),
+                "readonly": True,
             }
             for entry in entries
         ],
@@ -1685,6 +1707,104 @@ async def artifact_socket(websocket: WebSocket, session_id: str) -> None:
         await asyncio.gather(*done, *pending, return_exceptions=True)
     finally:
         await subscription.aclose()
+
+
+@app.websocket("/ws/workspace/{session_id}")
+async def workspace_socket(websocket: WebSocket, session_id: str) -> None:
+    """Poll watched root-relative paths and emit bounded invalidations.
+
+    Local and SFTP workspaces share this conservative transport. Directory
+    metadata catches child additions/removals while explicitly watched files
+    catch in-place content updates. Clients re-list affected nodes through the
+    normal owner-scoped workspace API; websocket events never carry contents.
+    """
+
+    username = signer.verify(websocket.cookies.get(COOKIE_NAME))
+    if not username:
+        await websocket.close(code=4401)
+        return
+    manager: TerminalManager = websocket.app.state.terminals
+    session = manager.get_for_owner(session_id, username)
+    if not session:
+        await websocket.close(code=4404)
+        return
+    service: WorkspaceService = websocket.app.state.workspaces
+    try:
+        await bind_terminal_workspace(websocket.app, session)
+    except WorkspaceError:
+        await websocket.close(code=4410)
+        return
+
+    watched_paths: set[str] = {""}
+    signatures: dict[str, tuple[str, int, float, str] | tuple[str, str]] = {}
+    interval = min(
+        30.0,
+        max(0.5, float(os.getenv("WORKSPACE_WATCH_INTERVAL", "2"))),
+    )
+
+    async def receive_watches() -> None:
+        nonlocal watched_paths
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            raw = message.get("text")
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if payload.get("type") != "watch" or not isinstance(payload.get("paths"), list):
+                continue
+            values = [
+                value
+                for value in payload["paths"]
+                if isinstance(value, str) and len(value) <= 4_096
+            ][:64]
+            watched_paths = set(values) | {""}
+            for stale in tuple(signatures):
+                if stale not in watched_paths:
+                    signatures.pop(stale, None)
+
+    async def poll_watches() -> None:
+        while True:
+            changed: list[str] = []
+            current_paths = tuple(sorted(watched_paths))
+            for path in current_paths:
+                try:
+                    entry = await asyncio.to_thread(
+                        service.stat,
+                        username,
+                        session_id,
+                        path or ".",
+                    )
+                    signature: tuple[str, int, float, str] | tuple[str, str] = (
+                        entry.kind,
+                        entry.size,
+                        entry.modified_at,
+                        entry.etag,
+                    )
+                except WorkspaceError as error:
+                    signature = ("error", error.code)
+                previous = signatures.get(path)
+                signatures[path] = signature
+                if previous is not None and previous != signature:
+                    changed.append(path)
+            if changed:
+                await websocket.send_json({"type": "changed", "paths": changed})
+            await asyncio.sleep(interval)
+
+    await websocket.accept()
+    await websocket.send_json({"type": "ready", "paths": [""]})
+    receiver = asyncio.create_task(receive_watches())
+    poller = asyncio.create_task(poll_watches())
+    done, pending = await asyncio.wait(
+        {receiver, poller}, return_when=asyncio.FIRST_COMPLETED
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*done, *pending, return_exceptions=True)
 
 
 @app.websocket("/ws/terminal/{session_id}")

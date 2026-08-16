@@ -197,6 +197,43 @@ class WorkspaceServiceTests(unittest.TestCase):
             grant, self.service.resolve_grant(grant.id, "alice", "terminal-1")
         )
 
+    def test_directory_pages_are_bounded_directory_first_and_revision_checked(self) -> None:
+        (self.root / "z-folder").mkdir()
+        (self.root / "a-folder").mkdir()
+        (self.root / "another.txt").write_text("another", encoding="utf-8")
+
+        first = self.service.list_page(
+            "alice", "terminal-1", ".", limit=2
+        )
+        self.assertEqual(["a-folder", "z-folder"], [entry.name for entry in first.entries])
+        self.assertIsNotNone(first.next_cursor)
+
+        second = self.service.list_page(
+            "alice",
+            "terminal-1",
+            ".",
+            cursor=first.next_cursor,
+            limit=2,
+            expected_revision=first.revision,
+        )
+        self.assertEqual(["another.txt", "document.bin"], [entry.name for entry in second.entries])
+        self.assertEqual(
+            len({entry.path for entry in (*first.entries, *second.entries)}),
+            len(first.entries) + len(second.entries),
+        )
+
+        time.sleep(0.01)
+        (self.root / "new.txt").write_text("new", encoding="utf-8")
+        with self.assertRaises(WorkspaceFileChanged):
+            self.service.list_page(
+                "alice",
+                "terminal-1",
+                ".",
+                cursor=first.next_cursor,
+                limit=2,
+                expected_revision=first.revision,
+            )
+
     def test_magic_beats_extension_and_only_bounded_raster_is_inline(self) -> None:
         html = self.service.grant("alice", "terminal-1", "spoof.png")
         self.assertEqual("text/html", html.media_type)

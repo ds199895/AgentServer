@@ -15,6 +15,10 @@ export type TerminalSession = {
     kind: 'local' | 'sftp' | string
     root: string
     platform: 'posix' | 'windows' | string
+    current_path?: string | null
+    binding_id?: string
+    available?: boolean
+    error?: string
   }
 }
 
@@ -79,6 +83,8 @@ export type WorkspaceEntry = {
   size: number
   modified_at: number
   version: string
+  hidden?: boolean
+  readonly?: boolean
 }
 
 export type WorkspaceBreadcrumb = {
@@ -87,14 +93,37 @@ export type WorkspaceBreadcrumb = {
 }
 
 export type WorkspaceListing = {
+  workspace_id: string
   path: string
   root: string
   provider: string
+  platform: 'posix' | 'windows' | string
+  current_path: string | null
   parent: string | null
   parent_path: string | null
   entries: WorkspaceEntry[]
   breadcrumbs: WorkspaceBreadcrumb[]
+  revision: string
+  next_cursor: string | null
   truncated: boolean
+  capabilities: {
+    read: boolean
+    write: boolean
+    watch: boolean
+    pagination: boolean
+  }
+}
+
+export type WorkspaceRequestOptions = {
+  cursor?: string | null
+  revision?: string | null
+  limit?: number
+  signal?: AbortSignal
+}
+
+export class ApiError extends Error {
+  status?: number
+  code?: string
 }
 
 export type FileGrant = {
@@ -169,14 +198,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     let message = `请求失败 (${response.status})`
+    let code: string | undefined
     try {
-      const body = (await response.json()) as { detail?: string }
-      if (body.detail) message = body.detail
+      const body = (await response.json()) as {
+        detail?: string | { code?: string; message?: string }
+      }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.detail?.message) message = body.detail.message
+      if (typeof body.detail === 'object') code = body.detail?.code
     } catch {
       // Keep the status-based fallback message.
     }
-    const error = new Error(message) as Error & { status?: number }
+    const error = new ApiError(message)
     error.status = response.status
+    error.code = code
     throw error
   }
   return response.json() as Promise<T>
@@ -229,10 +264,16 @@ export const api = {
   },
   deleteTerminal: (id: string) =>
     request<{ ok: boolean }>(`/api/terminals/${id}`, { method: 'DELETE' }),
-  workspace: (id: string, path = '') => {
+  workspace: (id: string, path = '', options: WorkspaceRequestOptions = {}) => {
     const query = new URLSearchParams()
     query.set('path', path)
-    return request<WorkspaceListing>(`/api/terminals/${encodeURIComponent(id)}/workspace?${query}`)
+    if (options.cursor) query.set('cursor', options.cursor)
+    if (options.revision) query.set('revision', options.revision)
+    if (options.limit) query.set('limit', String(options.limit))
+    return request<WorkspaceListing>(
+      `/api/terminals/${encodeURIComponent(id)}/workspace?${query}`,
+      { signal: options.signal },
+    )
   },
   resolveFile: (id: string, path: string) =>
     request<FileGrant>(`/api/terminals/${encodeURIComponent(id)}/files/resolve`, {

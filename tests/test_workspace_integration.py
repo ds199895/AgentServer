@@ -28,6 +28,7 @@ from app.main import (
     read_workspace_file,
     resolve_workspace_file,
     signer,
+    workspace_socket,
 )
 from app.terminal import TerminalSession
 from app.workspace import WorkspaceService
@@ -232,6 +233,37 @@ class WorkspaceApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(websocket.accepted)
         self.assertEqual({}, self.artifacts._subscribers)
+
+    async def test_workspace_websocket_accepts_and_sends_ready_before_disconnect(self) -> None:
+        class FakeWebSocket:
+            def __init__(self, outer: "WorkspaceApiIntegrationTests") -> None:
+                self.cookies = {"agentserver_session": signer.issue("alice")}
+                self.app = SimpleNamespace(
+                    state=SimpleNamespace(
+                        terminals=outer.manager,
+                        workspaces=outer.workspaces,
+                    )
+                )
+                self.accepted = False
+                self.sent: list[object] = []
+
+            async def accept(self) -> None:
+                self.accepted = True
+
+            async def send_json(self, value: object) -> None:
+                self.sent.append(value)
+
+            async def receive(self) -> dict[str, object]:
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def close(self, code: int) -> None:
+                raise AssertionError(f"unexpected close: {code}")
+
+        websocket = FakeWebSocket(self)
+        await workspace_socket(websocket, self.session.id)  # type: ignore[arg-type]
+
+        self.assertTrue(websocket.accepted)
+        self.assertEqual({"type": "ready", "paths": [""]}, websocket.sent[0])
 
 
 if __name__ == "__main__":

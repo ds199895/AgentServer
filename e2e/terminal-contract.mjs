@@ -426,10 +426,17 @@ try {
       await route.continue()
       return
     }
-    const response = await route.fetch()
+    // Keep the compatibility response independent from the page request. The
+    // page can navigate while this handler is running, which aborts Playwright
+    // forwarding on newer Chromium builds even after the server returned
+    // successfully. Node's fetch is not tied to that navigation lifecycle.
+    const cookie = await route.request().headerValue('cookie')
+    const response = await fetch(route.request().url(), {
+      headers: cookie ? { cookie } : {},
+    })
     const sessions = await response.json()
     for (const session of sessions) delete session.services
-    await route.fulfill({ response, json: sessions })
+    await route.fulfill({ status: response.status, json: sessions })
   })
 
   // Backend sessions must not populate a fresh workspace. Explicitly clear
@@ -731,11 +738,12 @@ try {
   await primaryPane.getByRole('button', { name: '打开工作区文件' }).click()
   const workspacePane = page.getByRole('complementary', { name: /工作区/ })
   await workspacePane.waitFor()
-  await workspacePane.getByRole('button', { name: /README\.md/ }).click()
-  await workspacePane.locator('pre').filter({ hasText: '# AgentServer' }).waitFor()
+  await workspacePane.getByRole('tree').waitFor()
+  await workspacePane.getByRole('treeitem', { name: /README\.md/ }).click()
+  await workspacePane.locator('.cm-content').filter({ hasText: '# AgentServer' }).waitFor()
   await workspacePane.getByRole('button', { name: '关闭文件预览' }).click()
-  await workspacePane.getByRole('button', { name: /web_dist/ }).click()
-  await workspacePane.getByRole('button', { name: /favicon\.png/ }).click()
+  await workspacePane.getByRole('treeitem', { name: /web_dist/ }).click()
+  await workspacePane.getByRole('treeitem', { name: /favicon\.png/ }).click()
   await workspacePane.getByRole('img', { name: 'favicon.png' }).waitFor()
   await workspacePane.getByRole('button', { name: /Artifacts/ }).click()
   await workspacePane.getByText('不可变').first().waitFor()

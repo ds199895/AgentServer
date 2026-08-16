@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import codecs
 import contextlib
 import errno
 import hashlib
+import heapq
+import json
 import mimetypes
 import os
 import posixpath
@@ -107,6 +111,16 @@ class WorkspaceRead:
     @property
     def total(self) -> int:
         return self.entry.size
+
+
+@dataclass(frozen=True)
+class WorkspaceDirectoryPage:
+    """One stable, bounded page of a directory listing."""
+
+    directory: WorkspaceEntry
+    entries: tuple[WorkspaceEntry, ...]
+    revision: str
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -241,6 +255,25 @@ class WorkspaceProvider(ABC):
 
         raise NotImplementedError
 
+    def list_page(
+        self,
+        path: str = ".",
+        *,
+        after: tuple[int, str, str] | None = None,
+        limit: int = 200,
+    ) -> tuple[tuple[WorkspaceEntry, ...], bool]:
+        """Return a directory-first page.
+
+        Providers with streaming directory APIs override this method so the
+        page remains memory bounded. The compatibility implementation keeps
+        third-party/test providers working.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        entries = self.list(path, max_entries=max(1_000, limit + 1))
+        return _select_entry_page(entries, after=after, limit=limit)
+
     def close(self) -> None:
         """Release provider resources; local/stateless providers may do nothing."""
 
@@ -282,6 +315,72 @@ def _entry_kind(mode: int) -> WorkspaceEntryKind:
     if stat_module.S_ISLNK(mode):
         return "symlink"
     return "other"
+
+
+def _entry_sort_key(entry: WorkspaceEntry) -> tuple[int, str, str]:
+    rank = {"directory": 0, "file": 1, "symlink": 2, "other": 3}[entry.kind]
+    return rank, entry.name.casefold(), entry.name
+
+
+def _select_entry_page(
+    entries: Any,
+    *,
+    after: tuple[int, str, str] | None,
+    limit: int,
+) -> tuple[tuple[WorkspaceEntry, ...], bool]:
+    candidates = (entry for entry in entries if after is None or _entry_sort_key(entry) > after)
+    selected = heapq.nsmallest(limit + 1, candidates, key=_entry_sort_key)
+    has_more = len(selected) > limit
+    return tuple(selected[:limit]), has_more
+
+
+def _encode_directory_cursor(
+    path: str,
+    revision: str,
+    entry: WorkspaceEntry,
+) -> str:
+    payload = json.dumps(
+        {"v": 1, "p": path, "r": revision, "k": list(_entry_sort_key(entry))},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_directory_cursor(
+    value: str,
+    *,
+    path: str,
+    revision: str,
+) -> tuple[int, str, str]:
+    if not value or len(value) > 8_192:
+        raise WorkspaceAccessDenied("workspace cursor is invalid")
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(value + padding))
+        key = payload["k"]
+        decoded = (int(key[0]), str(key[1]), str(key[2]))
+        if (
+            payload.get("v") != 1
+            or payload.get("p") != path
+            or payload.get("r") != revision
+            or decoded[0] not in {0, 1, 2, 3}
+            or len(decoded[1]) > 4_096
+            or len(decoded[2]) > 4_096
+        ):
+            raise ValueError
+        return decoded
+    except (
+        binascii.Error,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        UnicodeError,
+    ) as exc:
+        raise WorkspaceFileChanged(
+            "directory changed while its paginated listing was open"
+        ) from exc
 
 
 def _weak_etag(*values: object) -> str:
@@ -462,6 +561,38 @@ class LocalWorkspaceProvider(WorkspaceProvider):
                 os.close(descriptor)
         entries.sort(key=lambda entry: (entry.name.casefold(), entry.name))
         return tuple(entries)
+
+    def list_page(
+        self,
+        path: str = ".",
+        *,
+        after: tuple[int, str, str] | None = None,
+        limit: int = 200,
+    ) -> tuple[tuple[WorkspaceEntry, ...], bool]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        parts = _path_parts(path)
+        with self._lock:
+            descriptor = self._open_directory(parts)
+            try:
+                with os.scandir(descriptor) as scanner:
+                    return _select_entry_page(
+                        (
+                            self._entry((*parts, item.name), item.stat(follow_symlinks=False))
+                            for item in scanner
+                        ),
+                        after=after,
+                        limit=limit,
+                    )
+            except FileNotFoundError as exc:
+                raise WorkspaceFileChanged(
+                    "directory changed while it was being listed"
+                ) from exc
+            except OSError as exc:
+                _raise_local_error(exc, _display_path(parts))
+                raise AssertionError("unreachable")
+            finally:
+                os.close(descriptor)
 
     def read_range(
         self,
@@ -841,6 +972,46 @@ class SftpWorkspaceProvider(WorkspaceProvider):
         entries.sort(key=lambda entry: (entry.name.casefold(), entry.name))
         return tuple(entries)
 
+    def list_page(
+        self,
+        path: str = ".",
+        *,
+        after: tuple[int, str, str] | None = None,
+        limit: int = 200,
+    ) -> tuple[tuple[WorkspaceEntry, ...], bool]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        parts = _path_parts(path)
+        with self._lock:
+            sftp, canonical = self._resolve(parts)
+            iterator: Any | None = None
+            try:
+                listdir_iter = getattr(sftp, "listdir_iter", None)
+                if callable(listdir_iter):
+                    iterator = iter(listdir_iter(canonical, read_aheads=1))
+                else:
+                    iterator = iter(sftp.listdir_attr(canonical))
+                return _select_entry_page(
+                    (
+                        self._entry((*parts, str(value.filename)), value)
+                        for value in iterator
+                    ),
+                    after=after,
+                    limit=limit,
+                )
+            except WorkspaceError:
+                raise
+            except Exception as exc:
+                self._raise_remote(exc, _display_path(parts))
+                raise AssertionError("unreachable")
+            finally:
+                close_iterator = getattr(iterator, "close", None)
+                if callable(close_iterator):
+                    try:
+                        close_iterator()
+                    except Exception:
+                        self._disconnect()
+
     def read_range(
         self,
         path: str,
@@ -1059,6 +1230,66 @@ class WorkspaceService:
             entries = state.provider.list(path, max_entries=self.max_list_entries)
             self._refresh_binding_root(state)
             return entries
+
+    def list_page(
+        self,
+        owner: str,
+        terminal_id: str,
+        path: str = ".",
+        *,
+        cursor: str | None = None,
+        limit: int = 200,
+        expected_revision: str | None = None,
+    ) -> WorkspaceDirectoryPage:
+        if limit < 1 or limit > self.max_list_entries:
+            raise WorkspaceTooLarge(
+                f"directory page size must be between 1 and {self.max_list_entries}"
+            )
+        state = self._binding_state(owner, terminal_id)
+        with state.lock:
+            if state.closed:
+                raise WorkspaceNotFound("terminal has no workspace binding")
+            directory = state.provider.stat(path)
+            if directory.kind != "directory":
+                raise WorkspaceNotDirectory(
+                    f'workspace path "{directory.path}" is not a directory'
+                )
+            revision = directory.etag
+            if expected_revision is not None and expected_revision != revision:
+                raise WorkspaceFileChanged(
+                    "directory changed while its paginated listing was open"
+                )
+            after = (
+                _decode_directory_cursor(
+                    cursor,
+                    path=directory.path,
+                    revision=revision,
+                )
+                if cursor
+                else None
+            )
+            entries, has_more = state.provider.list_page(
+                directory.path,
+                after=after,
+                limit=limit,
+            )
+            refreshed = state.provider.stat(directory.path)
+            if refreshed.kind != "directory" or refreshed.etag != revision:
+                raise WorkspaceFileChanged(
+                    "directory changed while it was being listed"
+                )
+            self._refresh_binding_root(state)
+        next_cursor = (
+            _encode_directory_cursor(directory.path, revision, entries[-1])
+            if has_more and entries
+            else None
+        )
+        return WorkspaceDirectoryPage(
+            directory=refreshed,
+            entries=entries,
+            revision=revision,
+            next_cursor=next_cursor,
+        )
 
     def stat(self, owner: str, terminal_id: str, path: str) -> WorkspaceEntry:
         state = self._binding_state(owner, terminal_id)
@@ -1461,6 +1692,7 @@ __all__ = [
     "WorkspaceAccessDenied",
     "WorkspaceBinding",
     "WorkspaceConfigurationError",
+    "WorkspaceDirectoryPage",
     "WorkspaceEntry",
     "WorkspaceError",
     "WorkspaceFileChanged",

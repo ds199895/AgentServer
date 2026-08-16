@@ -9,10 +9,13 @@ import {
   Maximize2,
   Minimize2,
   RefreshCw,
+  WrapText,
   XIcon,
 } from 'lucide-react'
 
 import { api, type FileGrant } from '@/api'
+import { ReadonlyCodeViewer } from '@/components/ReadonlyCodeViewer'
+import { cn } from '@/lib/utils'
 
 const MAX_TEXT_BYTES = 256 * 1024
 const MAX_INLINE_BYTES = 64 * 1024 * 1024
@@ -26,6 +29,8 @@ type Props = {
   onClose: () => void
   onRetry?: () => void
   onResolveDownload?: (grant: FileGrant) => Promise<FileGrant>
+  stale?: boolean
+  onReload?: () => void
 }
 
 function formatBytes(value: number): string {
@@ -61,8 +66,9 @@ function previewKind(grant: FileGrant): PreviewKind {
 async function responseError(response: Response): Promise<Error> {
   let message = `读取文件失败 (${response.status})`
   try {
-    const body = await response.json() as { detail?: string }
-    if (body.detail) message = body.detail
+    const body = await response.json() as { detail?: string | { message?: string } }
+    if (typeof body.detail === 'string') message = body.detail
+    else if (body.detail?.message) message = body.detail.message
   } catch {
     // A binary endpoint may return an empty or non-JSON error body.
   }
@@ -135,7 +141,7 @@ function EmptyPreview() {
   )
 }
 
-export function ArtifactPreview({ grant, resolving = false, resolveError = '', onClose, onRetry, onResolveDownload }: Props) {
+export function ArtifactPreview({ grant, resolving = false, resolveError = '', onClose, onRetry, onResolveDownload, stale = false, onReload }: Props) {
   const [objectUrl, setObjectUrl] = useState('')
   const [textContent, setTextContent] = useState('')
   const [truncated, setTruncated] = useState(false)
@@ -144,6 +150,7 @@ export function ArtifactPreview({ grant, resolving = false, resolveError = '', o
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState('')
   const [actualSize, setActualSize] = useState(false)
+  const [lineWrapping, setLineWrapping] = useState(false)
   const [contentAttempt, setContentAttempt] = useState(0)
   const kind = useMemo(() => grant ? previewKind(grant) : 'download', [grant])
   const contentUrl = grant ? api.fileContentUrl(grant) : ''
@@ -274,10 +281,22 @@ export function ArtifactPreview({ grant, resolving = false, resolveError = '', o
             {actualSize ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </button>
         )}
+        {kind === 'text' && (
+          <button type="button" onClick={() => setLineWrapping((value) => !value)} aria-pressed={lineWrapping} aria-label={lineWrapping ? '关闭自动换行' : '开启自动换行'} title={lineWrapping ? '关闭自动换行' : '自动换行'} className={cn('grid size-8 cursor-pointer place-items-center rounded-md border border-[#34404b] bg-[#121a21] text-[#9cabb6] hover:text-primary', lineWrapping && 'border-[#47705e] text-primary')}>
+            <WrapText className="size-3.5" />
+          </button>
+        )}
         <button type="button" onClick={() => void downloadFile()} disabled={downloading} className="grid size-8 cursor-pointer place-items-center rounded-md border border-[#34404b] bg-[#121a21] text-[#9cabb6] hover:text-primary disabled:cursor-wait disabled:opacity-60" aria-label={downloading ? `正在下载 ${grant.name}` : `下载 ${grant.name}`} title={downloading ? '正在刷新下载授权…' : '下载原文件'}>{downloading ? <LoaderCircle className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}</button>
         <button type="button" onClick={onClose} className="grid size-8 cursor-pointer place-items-center rounded-md border border-[#34404b] bg-[#121a21] text-[#9cabb6] hover:text-white max-md:flex" aria-label="关闭文件预览" title="返回文件列表"><XIcon className="size-3.5" /></button>
       </header>
       <div className="relative min-h-0 overflow-auto">
+        {stale && (
+          <div role="status" className="absolute inset-x-2 top-2 z-30 flex items-center gap-2 rounded-md border border-[#735e2d] bg-[#2b2415f2] px-3 py-2 text-[10px] text-[#f1c974] shadow-lg">
+            <AlertTriangle className="size-3.5 flex-none" />
+            <span className="min-w-0 flex-1">文件已在工作区中发生变化。</span>
+            {onReload && <button type="button" onClick={onReload} className="cursor-pointer rounded border border-[#806d3d] px-2 py-1 font-semibold hover:bg-[#45391e]">重新加载</button>}
+          </div>
+        )}
         {downloadError && (
           <div role="alert" className="absolute top-2 right-2 z-30 flex max-w-[min(360px,calc(100%-16px))] items-center gap-2 rounded-lg border border-[#713640] bg-[#28171bf2] px-3 py-2 text-[10px] text-[#ffadb5] shadow-xl">
             <AlertTriangle className="size-3.5 flex-none" />
@@ -308,9 +327,9 @@ export function ArtifactPreview({ grant, resolving = false, resolveError = '', o
           </div>
         )}
         {!error && kind === 'text' && !loading && (
-          <div className="min-h-full bg-[#090e13]">
-            {truncated && <div className="sticky top-0 z-10 border-b border-[#5f4d29] bg-[#2a2315ee] px-3 py-2 text-[10px] text-[#f1c974]">仅显示前 {formatBytes(MAX_TEXT_BYTES)}；下载可查看完整文件。</div>}
-            <pre className="m-0 min-w-full whitespace-pre-wrap break-words p-4 font-mono text-[11px] leading-5 text-[#d3dde5] selection:bg-[#315a48]">{textContent || '（空文件）'}</pre>
+          <div className={cn('grid h-full min-h-[240px] bg-[#090e13]', truncated ? 'grid-rows-[auto_minmax(0,1fr)]' : 'grid-rows-[minmax(0,1fr)]')}>
+            {truncated && <div className="z-10 border-b border-[#5f4d29] bg-[#2a2315ee] px-3 py-2 text-[10px] text-[#f1c974]">仅显示前 {formatBytes(MAX_TEXT_BYTES)}；下载可查看完整文件。</div>}
+            <ReadonlyCodeViewer value={textContent} filename={grant.name} lineWrapping={lineWrapping} />
           </div>
         )}
         {!error && kind === 'pdf' && objectUrl && (

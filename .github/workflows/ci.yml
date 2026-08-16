@@ -78,7 +78,7 @@ jobs:
 
   build-release:
     name: build release
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -116,7 +116,7 @@ jobs:
 
   deploy-production:
     name: deploy production
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs:
       - verify
       - build-release

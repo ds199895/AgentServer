@@ -723,35 +723,39 @@ export default function App() {
               'absolute inset-3 overflow-hidden rounded-[10px] border border-[#222d37] bg-[#0b0f14] shadow-[0_20px_55px_#0006] max-md:inset-1.5',
               !(page === 'terminals' && !missingTerminalId) && 'invisible pointer-events-none',
             )}>
-              <TerminalGrid
-                layout={layout}
-                devices={devices}
-                sessions={sessions}
-                pageVisible={page === 'terminals' && !missingTerminalId}
-                activeId={activeId}
-                focusedLeafId={focusedLeafId}
-                forceSingle={forceSingle || focusMode}
-                previewBusy={previewBusy}
-                creatingTab={cloningId !== null}
-                onFocusLeaf={focusLeaf}
-                onActivateTab={(sessionId, leafId, options) => {
-                  activatePaneTab(sessionId, leafId, { focusInput: options.focusTerminal })
-                }}
-                onPinTab={pinPaneTab}
-                onDetachTab={detachPaneTab}
-                onMoveTab={movePaneTab}
-                onNewTab={(source, leafId) => void cloneTerminal(source, leafId)}
-                onRatio={(splitId, ratio) => {
-                  if (layoutRef.current) setLayoutState(setRatio(layoutRef.current, splitId, ratio))
-                }}
-                onSplit={splitTerminal}
-                onClosePane={closeTerminalPane}
-                onPreviewService={(session, service) => void openDetectedService(session, service)}
-                onOpenWorkspace={(session) => setWorkspaceSessionId(session.id)}
-              />
-              {page === 'terminals' && activeSession && workspaceSession?.id === activeSession.id && (
-                <WorkspacePane key={workspaceSession.id} session={workspaceSession} onClose={() => setWorkspaceSessionId(null)} />
-              )}
+              <div className="flex h-full min-h-0 w-full min-w-0">
+                <div className={cn('min-h-0 min-w-0 flex-1', page === 'terminals' && activeSession && workspaceSession?.id === activeSession.id && 'max-md:hidden')}>
+                  <TerminalGrid
+                    layout={layout}
+                    devices={devices}
+                    sessions={sessions}
+                    pageVisible={page === 'terminals' && !missingTerminalId}
+                    activeId={activeId}
+                    focusedLeafId={focusedLeafId}
+                    forceSingle={forceSingle || focusMode}
+                    previewBusy={previewBusy}
+                    creatingTab={cloningId !== null}
+                    onFocusLeaf={focusLeaf}
+                    onActivateTab={(sessionId, leafId, options) => {
+                      activatePaneTab(sessionId, leafId, { focusInput: options.focusTerminal })
+                    }}
+                    onPinTab={pinPaneTab}
+                    onDetachTab={detachPaneTab}
+                    onMoveTab={movePaneTab}
+                    onNewTab={(source, leafId) => void cloneTerminal(source, leafId)}
+                    onRatio={(splitId, ratio) => {
+                      if (layoutRef.current) setLayoutState(setRatio(layoutRef.current, splitId, ratio))
+                    }}
+                    onSplit={splitTerminal}
+                    onClosePane={closeTerminalPane}
+                    onPreviewService={(session, service) => void openDetectedService(session, service)}
+                    onOpenWorkspace={(session) => setWorkspaceSessionId(session.id)}
+                  />
+                </div>
+                {page === 'terminals' && activeSession && workspaceSession?.id === activeSession.id && (
+                  <WorkspacePane key={workspaceSession.id} session={workspaceSession} onClose={() => setWorkspaceSessionId(null)} />
+                )}
+              </div>
             </div>
           )}
           {page === 'terminals' && activeSession && (
