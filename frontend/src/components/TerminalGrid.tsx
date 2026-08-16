@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Columns2, LoaderCircle, Plus, Rows2, Search, XIcon } from 'lucide-react'
+import { Columns2, LoaderCircle, Pin, Plus, Rows2, XIcon } from 'lucide-react'
 
 import type { DetectedService, Device, TerminalSession } from '@/api'
 import TerminalPane from '@/TerminalPane'
@@ -27,7 +27,6 @@ type Props = {
   /** 移动端忽略分屏几何，但不改动已保存的桌面布局 */
   forceSingle: boolean
   previewBusy: { terminalId: string; port: number } | null
-  splitting: boolean
   creatingTab: boolean
   onFocusLeaf: (leafId: string) => void
   /** 激活指定 leaf 内的标签，并把全局焦点同步到该 leaf。 */
@@ -36,14 +35,22 @@ type Props = {
     leafId: string,
     options: { focusTerminal: boolean },
   ) => void
+  /** 把指定窗格中的临时预览标签固定为普通标签。 */
+  onPinTab: (sessionId: string, leafId: string) => void
+  /** 仅解除指定窗格中的标签归属；后台终端继续运行。 */
+  onDetachTab: (sessionId: string, leafId: string) => void
+  /** 拖动标签到另一个窗格或在当前窗格内排序；不触碰后台终端。 */
+  onMoveTab: (
+    sessionId: string,
+    sourceLeafId: string,
+    targetLeafId: string,
+    targetIndex: number,
+  ) => void
   /** 在指定 leaf 内按当前标签的设备/工作区 profile 新建标签。 */
   onNewTab: (source: TerminalSession, leafId: string) => void
-  /** 为指定 leaf 打开终端查找器；空 leaf 可借此选择已有会话。 */
-  onFindTab: (leafId: string) => void
-  /** 关闭终端后台会话；调用侧负责确认和布局收缩。 */
-  onCloseTerminal: (session: TerminalSession) => void
   onRatio: (splitId: string, ratio: number) => void
-  onSplit: (session: TerminalSession, leafId: string, direction: LayoutDirection) => void
+  /** 纯布局分屏；新窗格默认为空，不创建或复制后台终端。 */
+  onSplit: (leafId: string, direction: LayoutDirection) => void
   onClosePane: (leafId: string) => void
   onPreviewService: (session: TerminalSession, service: DetectedService) => void
   onOpenWorkspace: (session: TerminalSession) => void
@@ -56,10 +63,14 @@ type TerminalPaneTab = {
   session: TerminalSession
   terminalLabel: string
   workspaceLabel: string
+  preview: boolean
 }
+type DraggedPaneTab = { sessionId: string; sourceLeafId: string }
+type PaneDropTarget = { leafId: string; index: number }
 
 const FULL_RECT: Rect = { left: 0, top: 0, width: 1, height: 1 }
 const MAX_CACHED_TERMINALS = 8
+const TERMINAL_TAB_DRAG_TYPE = 'application/x-agentserver-terminal-tab'
 
 function collectPlacements(
   node: LayoutNode,
@@ -226,35 +237,52 @@ function SplitSash({
 }
 
 function PaneTabStrip({
+  leafId,
   paneNumber,
   tabs,
   activeTabId,
   focused,
+  draggedTab,
+  dropTarget,
   canSplit,
   canClosePane,
   creatingTab,
   onActivateTab,
-  onCloseTerminal,
+  onPinTab,
+  onDetachTab,
+  onTabDragStart,
+  onTabDragOver,
+  onTabDrop,
+  onTabDragEnd,
   onNewTab,
-  onFindTab,
   onSplit,
   onClosePane,
 }: {
+  leafId: string
   paneNumber: number
   tabs: TerminalPaneTab[]
   activeTabId: string | null
   focused: boolean
+  draggedTab: DraggedPaneTab | null
+  dropTarget: PaneDropTarget | null
   canSplit: boolean
   canClosePane: boolean
   creatingTab: boolean
   onActivateTab: (sessionId: string, options: { focusTerminal: boolean }) => void
-  onCloseTerminal: (session: TerminalSession) => void
+  onPinTab: (sessionId: string) => void
+  onDetachTab: (sessionId: string) => void
+  onTabDragStart: (event: React.DragEvent<HTMLButtonElement>, sessionId: string) => void
+  onTabDragOver: (event: React.DragEvent<HTMLElement>, targetIndex: number) => void
+  onTabDrop: (event: React.DragEvent<HTMLElement>, targetIndex: number) => void
+  onTabDragEnd: () => void
   onNewTab: () => void
-  onFindTab: () => void
   onSplit: (direction: LayoutDirection) => void
   onClosePane: () => void
 }) {
   const tabRefs = useRef(new Map<string, HTMLButtonElement>())
+  const activePreviewTab = tabs.find((tab) => (
+    tab.preview && tab.session.id === activeTabId
+  ))
 
   useEffect(() => {
     if (!activeTabId) return
@@ -283,6 +311,19 @@ function PaneTabStrip({
     })
   }
 
+  const dropIndexForTab = (event: React.DragEvent<HTMLElement>, index: number) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    return event.clientX < rect.left + rect.width / 2 ? index : index + 1
+  }
+
+  const scrollTabListNearEdge = (event: React.DragEvent<HTMLElement>) => {
+    const tabList = event.currentTarget.closest<HTMLElement>('[role="tablist"]')
+    if (!tabList) return
+    const rect = tabList.getBoundingClientRect()
+    if (event.clientX < rect.left + 32) tabList.scrollLeft -= 14
+    else if (event.clientX > rect.right - 32) tabList.scrollLeft += 14
+  }
+
   return (
     <header
       aria-label={`窗格 ${paneNumber} 终端栏`}
@@ -302,21 +343,57 @@ function PaneTabStrip({
         aria-orientation="horizontal"
         aria-label={`窗格 ${paneNumber} 终端标签`}
         data-terminal-pane-tabs={paneNumber}
+        data-terminal-drop-leaf-id={leafId}
         className="flex min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden [scrollbar-color:#34404c_transparent] [scrollbar-width:thin]"
       >
         {tabs.map((tab, index) => {
           const active = tab.session.id === activeTabId
           const tabDeviceLabel = tab.session.device_name || '本机'
           const runtimeLabel = tab.session.active ? '运行中' : '已退出'
+          const tabModeLabel = tab.preview ? '临时预览，双击固定' : '已固定'
+          const dropBefore = dropTarget?.leafId === leafId && dropTarget.index === index
+          const dropAfter = (
+            index === tabs.length - 1 &&
+            dropTarget?.leafId === leafId &&
+            dropTarget.index === tabs.length
+          )
           return (
             <span
               key={tab.session.id}
               role="presentation"
+              data-terminal-tab-mode={tab.preview ? 'preview' : 'pinned'}
+              data-terminal-drag-wrapper={tab.session.id}
+              data-terminal-drop-leaf-id={leafId}
+              data-terminal-drop-index={dropBefore ? index : dropAfter ? index + 1 : undefined}
+              data-terminal-drop-active={dropBefore || dropAfter ? 'true' : 'false'}
+              onDragOver={(event) => {
+                if (!draggedTab) return
+                event.preventDefault()
+                event.stopPropagation()
+                event.dataTransfer.dropEffect = 'move'
+                scrollTabListNearEdge(event)
+                onTabDragOver(event, dropIndexForTab(event, index))
+              }}
+              onDrop={(event) => {
+                if (!draggedTab) return
+                event.preventDefault()
+                event.stopPropagation()
+                onTabDrop(event, dropIndexForTab(event, index))
+              }}
               className={cn(
-                'flex min-w-[148px] max-w-[260px] flex-none items-stretch border-r border-[#25303a] bg-[#0c1218] text-[#71808b]',
+                'relative flex min-w-[148px] max-w-[260px] flex-none items-stretch border-r border-[#25303a] bg-[#0c1218] text-[#71808b]',
                 active && 'bg-[#15231d] text-[#dce8e1] shadow-[inset_0_-2px_var(--color-primary)]',
+                tab.preview && 'bg-[#101820] text-[#94a2ad]',
+                active && tab.preview && 'bg-[#15231d] text-[#dce8e1]',
+                draggedTab?.sessionId === tab.session.id && 'opacity-45',
               )}
             >
+              {dropBefore && (
+                <i aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary shadow-[0_0_8px_#77f2b4]" />
+              )}
+              {dropAfter && (
+                <i aria-hidden="true" className="pointer-events-none absolute inset-y-0 right-0 z-10 w-0.5 bg-primary shadow-[0_0_8px_#77f2b4]" />
+              )}
               <button
                 ref={(node) => {
                   if (node) tabRefs.current.set(tab.session.id, node)
@@ -326,17 +403,23 @@ function PaneTabStrip({
                 role="tab"
                 id={`terminal-tab-${tab.session.id}`}
                 data-terminal-tab-id={tab.session.id}
+                data-terminal-drag-id={tab.session.id}
+                data-terminal-tab-mode={tab.preview ? 'preview' : 'pinned'}
+                draggable
                 aria-selected={active}
                 aria-controls={`terminal-panel-${tab.session.id}`}
                 tabIndex={active || (!activeTabId && index === 0) ? 0 : -1}
-                aria-label={`窗格 ${paneNumber} 激活 ${tabDeviceLabel} ${tab.terminalLabel} ${tab.session.id.slice(0, 8)} ${runtimeLabel}`}
-                title={`${tabDeviceLabel} · ${tab.terminalLabel} · ${tab.workspaceLabel} · ${tab.session.id} · ${runtimeLabel}`}
+                aria-label={`窗格 ${paneNumber} 激活 ${tabDeviceLabel} ${tab.terminalLabel} ${tab.session.id.slice(0, 8)} ${runtimeLabel} ${tabModeLabel}`}
+                title={`${tabDeviceLabel} · ${tab.terminalLabel} · ${tab.workspaceLabel} · ${tab.session.id} · ${runtimeLabel} · ${tabModeLabel}`}
+                onDragStart={(event) => onTabDragStart(event, tab.session.id)}
+                onDragEnd={onTabDragEnd}
                 onClick={() => onActivateTab(tab.session.id, { focusTerminal: true })}
+                onDoubleClick={() => { if (tab.preview) onPinTab(tab.session.id) }}
                 onKeyDown={(event) => {
                   if (event.key === 'Delete') {
                     event.preventDefault()
                     event.stopPropagation()
-                    onCloseTerminal(tab.session)
+                    onDetachTab(tab.session.id)
                     return
                   }
                   if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
@@ -344,7 +427,7 @@ function PaneTabStrip({
                   event.stopPropagation()
                   activateByKeyboard(index, event.key)
                 }}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 bg-transparent px-2 text-left hover:bg-[#17212a] hover:text-[#d2dde4] focus-visible:outline-1 focus-visible:outline-primary"
+                className="flex min-w-0 flex-1 cursor-grab select-none items-center gap-1.5 bg-transparent px-2 text-left hover:bg-[#17212a] hover:text-[#d2dde4] active:cursor-grabbing focus-visible:outline-1 focus-visible:outline-primary"
               >
                 <i
                   aria-hidden="true"
@@ -353,51 +436,85 @@ function PaneTabStrip({
                     tab.session.active && 'bg-primary shadow-[0_0_7px_#77f2b477]',
                   )}
                 />
-                <span className="min-w-0 truncate text-[9px] font-semibold">
+                <span className={cn(
+                  'min-w-0 truncate text-[9px] font-semibold',
+                  tab.preview && 'italic',
+                )}>
                   {tabDeviceLabel} / {tab.terminalLabel}
                 </span>
+                {tab.preview && (
+                  <span className="flex-none rounded border border-[#395247] bg-[#14241d] px-1 font-mono text-[7px] not-italic text-[#8fc8aa]">
+                    预览
+                  </span>
+                )}
                 <code className="flex-none font-mono text-[7px] text-[#60717d]">
                   {tab.session.id.slice(0, 6)}
                 </code>
               </button>
               <button
                 type="button"
-                aria-label={`关闭窗格 ${paneNumber} 的终端 ${tabDeviceLabel} ${tab.terminalLabel}`}
-                title={`关闭终端并结束后台会话 · ${tab.session.id.slice(0, 8)}`}
-                onClick={() => onCloseTerminal(tab.session)}
-                className="grid w-6 flex-none cursor-pointer place-items-center bg-transparent text-[#52616c] hover:bg-[#352027] hover:text-[#ff929d] focus-visible:outline-1 focus-visible:outline-[#ff929d]"
+                draggable={false}
+                aria-label={`从窗格 ${paneNumber} 移除终端 ${tabDeviceLabel} ${tab.terminalLabel}，后台继续运行`}
+                title={`从当前窗格移除，后台终端继续运行 · ${tab.session.id.slice(0, 8)}`}
+                onClick={() => onDetachTab(tab.session.id)}
+                onDragStart={(event) => event.preventDefault()}
+                className="grid w-6 flex-none cursor-pointer place-items-center bg-transparent text-[#52616c] hover:bg-[#352027] hover:text-[#ff929d] focus-visible:outline-1 focus-visible:outline-[#ff929d] max-md:w-8"
               >
                 <XIcon className="size-2.5" />
               </button>
             </span>
           )
         })}
-        {!tabs.length && (
-          <span aria-hidden="true" className="flex min-w-24 flex-1 items-center px-3 font-mono text-[8px] text-[#5e6d78]">
-            空窗格
-          </span>
-        )}
+        <span
+          aria-hidden="true"
+          data-terminal-drop-leaf-id={leafId}
+          data-terminal-drop-index={tabs.length}
+          data-terminal-drop-active={dropTarget?.leafId === leafId && dropTarget.index === tabs.length ? 'true' : 'false'}
+          onDragOver={(event) => {
+            if (!draggedTab) return
+            event.preventDefault()
+            event.stopPropagation()
+            event.dataTransfer.dropEffect = 'move'
+            onTabDragOver(event, tabs.length)
+          }}
+          onDrop={(event) => {
+            if (!draggedTab) return
+            event.preventDefault()
+            event.stopPropagation()
+            onTabDrop(event, tabs.length)
+          }}
+          className={cn(
+            'relative flex min-w-8 flex-1 items-center px-3 font-mono text-[8px] text-[#5e6d78]',
+            !tabs.length && 'min-w-24',
+            dropTarget?.leafId === leafId && dropTarget.index === tabs.length && 'bg-[#14241d]',
+          )}
+        >
+          {!tabs.length && '空窗格'}
+          {dropTarget?.leafId === leafId && dropTarget.index === tabs.length && (
+            <i aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 z-10 w-0.5 bg-primary shadow-[0_0_8px_#77f2b4]" />
+          )}
+        </span>
       </div>
       <div className="flex flex-none items-center gap-0.5 border-l border-[#26313a] bg-[#0f161c] px-1">
-        {!tabs.length ? (
+        {activePreviewTab && (
           <button
             type="button"
-            onClick={onFindTab}
-            aria-label={`向窗格 ${paneNumber} 添加终端`}
-            title="选择未归属终端；没有可选会话时前往设备页新建"
-            className="flex h-6 cursor-pointer items-center gap-1 rounded px-1.5 text-[8px] font-semibold text-[#82918c] hover:bg-[#193025] hover:text-primary"
+            onClick={() => onPinTab(activePreviewTab.session.id)}
+            aria-label={`固定窗格 ${paneNumber} 的预览终端 ${activePreviewTab.terminalLabel}`}
+            title="固定当前预览标签"
+            className="grid size-6 cursor-pointer place-items-center rounded text-[#8fc8aa] hover:bg-[#193025] hover:text-primary max-md:size-8"
           >
-            <Search className="size-3.5" />
-            <span className="max-lg:hidden">添加终端</span>
+            <Pin className="size-3" />
           </button>
-        ) : (
+        )}
+        {tabs.length > 0 && (
           <button
             type="button"
             onClick={onNewTab}
             disabled={creatingTab}
             aria-label={`在窗格 ${paneNumber} 新建终端标签`}
             title="在当前窗格新建同设备、同工作区终端"
-            className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
+            className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent max-md:size-8"
           >
             {creatingTab ? <LoaderCircle className="size-3 animate-spin" /> : <Plus className="size-3.5" />}
           </button>
@@ -407,18 +524,18 @@ function PaneTabStrip({
             <button
               type="button"
               onClick={() => onSplit('row')}
-              aria-label={`从窗格 ${paneNumber} 新建同设备终端并向右分屏`}
-              title="新建同设备终端并向右分屏"
-              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary"
+              aria-label={`将窗格 ${paneNumber} 向右分屏，新窗格为空`}
+              title="向右分屏（新窗格为空）"
+              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary max-md:size-8"
             >
               <Columns2 className="size-3.5" />
             </button>
             <button
               type="button"
               onClick={() => onSplit('column')}
-              aria-label={`从窗格 ${paneNumber} 新建同设备终端并向下分屏`}
-              title="新建同设备终端并向下分屏"
-              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary"
+              aria-label={`将窗格 ${paneNumber} 向下分屏，新窗格为空`}
+              title="向下分屏（新窗格为空）"
+              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary max-md:size-8"
             >
               <Rows2 className="size-3.5" />
             </button>
@@ -430,7 +547,7 @@ function PaneTabStrip({
             onClick={onClosePane}
             aria-label={`关闭窗格 ${paneNumber}（保留终端）`}
             title="关闭窗格（保留终端）"
-            className="grid size-6 cursor-pointer place-items-center rounded text-[#75838e] hover:bg-[#2b1b20] hover:text-[#ff9aa4]"
+            className="grid size-6 cursor-pointer place-items-center rounded text-[#75838e] hover:bg-[#2b1b20] hover:text-[#ff9aa4] max-md:size-8"
           >
             <XIcon className="size-3" />
           </button>
@@ -455,13 +572,13 @@ export function TerminalGrid(props: Props) {
     focusedLeafId,
     forceSingle,
     previewBusy,
-    splitting,
     creatingTab,
     onFocusLeaf,
     onActivateTab,
+    onPinTab,
+    onDetachTab,
+    onMoveTab,
     onNewTab,
-    onFindTab,
-    onCloseTerminal,
     onRatio,
     onSplit,
     onClosePane,
@@ -469,6 +586,10 @@ export function TerminalGrid(props: Props) {
     onOpenWorkspace,
   } = props
   const rootRef = useRef<HTMLDivElement>(null)
+  const draggedTabRef = useRef<DraggedPaneTab | null>(null)
+  const suppressTabClickRef = useRef<string | null>(null)
+  const [draggedTab, setDraggedTab] = useState<DraggedPaneTab | null>(null)
+  const [dropTarget, setDropTarget] = useState<PaneDropTarget | null>(null)
   const { leafPlacements, sessionPlacements, sashes, leafNumbers } = useMemo(() => {
     const placements = new Map<string, LeafPlacement>()
     const numbers = new Map<string, number>()
@@ -515,6 +636,7 @@ export function TerminalGrid(props: Props) {
           session: tabSession,
           terminalLabel: display?.label || tabSession.name || '终端',
           workspaceLabel: tabSession.workspace?.root || tabSession.cwd || display?.workspaceLabel || '默认目录',
+          preview: leaf.previewTab === sessionId,
         }]
       })
       result.set(leaf.id, tabs)
@@ -582,10 +704,67 @@ export function TerminalGrid(props: Props) {
   ])
   const mountedSessions = sessions.filter((session) => mountedIds.has(session.id))
 
+  const clearTabDrag = () => {
+    const draggedSessionId = draggedTabRef.current?.sessionId ?? null
+    draggedTabRef.current = null
+    setDraggedTab(null)
+    setDropTarget(null)
+    if (draggedSessionId) {
+      // Chromium may synthesize one click immediately after dragend. Limit the
+      // guard to that event-loop turn so the next intentional click still works.
+      window.setTimeout(() => {
+        if (suppressTabClickRef.current === draggedSessionId) {
+          suppressTabClickRef.current = null
+        }
+      }, 0)
+    }
+  }
+  const startTabDrag = (
+    event: React.DragEvent<HTMLButtonElement>,
+    sessionId: string,
+    sourceLeafId: string,
+  ) => {
+    const sourceLeaf = leafPlacements.find((placement) => placement.leaf.id === sourceLeafId)?.leaf
+    if (!sourceLeaf?.tabs.includes(sessionId)) {
+      event.preventDefault()
+      return
+    }
+    const drag = { sessionId, sourceLeafId }
+    draggedTabRef.current = drag
+    suppressTabClickRef.current = sessionId
+    setDraggedTab(drag)
+    setDropTarget(null)
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData(TERMINAL_TAB_DRAG_TYPE, JSON.stringify(drag))
+  }
+  const updateTabDropTarget = (leafId: string, index: number) => {
+    if (!draggedTabRef.current) return
+    setDropTarget((current) => (
+      current?.leafId === leafId && current.index === index ? current : { leafId, index }
+    ))
+  }
+  const dropTab = (leafId: string, index: number) => {
+    const drag = draggedTabRef.current
+    if (!drag) return
+    onMoveTab(drag.sessionId, drag.sourceLeafId, leafId, index)
+    clearTabDrag()
+  }
+
+  useEffect(() => {
+    if (!draggedTab) return
+    const cancelWithEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      clearTabDrag()
+    }
+    window.addEventListener('keydown', cancelWithEscape, true)
+    return () => window.removeEventListener('keydown', cancelWithEscape, true)
+  }, [draggedTab])
+
   return (
     <div
       ref={rootRef}
       data-mounted-terminal-count={mountedSessions.length}
+      data-terminal-tab-dragging={draggedTab ? 'true' : 'false'}
       className="relative h-full w-full min-h-0 min-w-0 overflow-hidden"
     >
       {mountedSessions.map((session) => {
@@ -648,6 +827,7 @@ export function TerminalGrid(props: Props) {
             data-terminal-leaf-id={leaf.id}
             data-terminal-pane-number={paneNumber}
             data-terminal-pane-empty={tabs.length === 0 ? 'true' : 'false'}
+            data-terminal-pane-focused={focused ? 'true' : 'false'}
             aria-label={`终端窗格 ${paneNumber}`}
             style={{
               left: percent(rect.left),
@@ -661,23 +841,70 @@ export function TerminalGrid(props: Props) {
             )}
           >
             <PaneTabStrip
+              leafId={leaf.id}
               paneNumber={paneNumber}
               tabs={tabs}
               activeTabId={activeTab?.session.id ?? null}
               focused={focused}
-              canSplit={!singleMode && !splitting && Boolean(activeTab)}
+              draggedTab={draggedTab}
+              dropTarget={dropTarget}
+              canSplit={!singleMode}
               canClosePane={!singleMode && sashes.length > 0}
               creatingTab={creatingTab}
-              onActivateTab={(sessionId, options) => onActivateTab(sessionId, leaf.id, options)}
-              onCloseTerminal={onCloseTerminal}
-              onNewTab={() => { if (activeTab) onNewTab(activeTab.session, leaf.id) }}
-              onFindTab={() => {
-                onFocusLeaf(leaf.id)
-                onFindTab(leaf.id)
+              onActivateTab={(sessionId, options) => {
+                const suppressed = suppressTabClickRef.current
+                if (suppressed === sessionId) {
+                  suppressTabClickRef.current = null
+                  return
+                }
+                onActivateTab(sessionId, leaf.id, options)
               }}
-              onSplit={(direction) => { if (activeTab) onSplit(activeTab.session, leaf.id, direction) }}
+              onPinTab={(sessionId) => {
+                const suppressed = suppressTabClickRef.current
+                if (suppressed === sessionId) {
+                  suppressTabClickRef.current = null
+                  return
+                }
+                onPinTab(sessionId, leaf.id)
+              }}
+              onDetachTab={(sessionId) => onDetachTab(sessionId, leaf.id)}
+              onTabDragStart={(event, sessionId) => startTabDrag(event, sessionId, leaf.id)}
+              onTabDragOver={(_event, targetIndex) => updateTabDropTarget(leaf.id, targetIndex)}
+              onTabDrop={(_event, targetIndex) => dropTab(leaf.id, targetIndex)}
+              onTabDragEnd={clearTabDrag}
+              onNewTab={() => { if (activeTab) onNewTab(activeTab.session, leaf.id) }}
+              onSplit={(direction) => onSplit(leaf.id, direction)}
               onClosePane={() => onClosePane(leaf.id)}
             />
+            {draggedTab && (
+              <div
+                data-terminal-pane-drop-zone={paneNumber}
+                data-terminal-drop-leaf-id={leaf.id}
+                data-terminal-drop-index={tabs.length}
+                data-terminal-drop-active={dropTarget?.leafId === leaf.id && dropTarget.index === tabs.length ? 'true' : 'false'}
+                onDragOver={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  event.dataTransfer.dropEffect = 'move'
+                  updateTabDropTarget(leaf.id, tabs.length)
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  dropTab(leaf.id, tabs.length)
+                }}
+                className={cn(
+                  'pointer-events-auto absolute inset-x-0 top-[34px] bottom-0 z-30 grid place-items-center border-2 border-dashed border-transparent bg-[#07100db8] text-center transition-colors max-md:top-8',
+                  dropTarget?.leafId === leaf.id && dropTarget.index === tabs.length
+                    ? 'border-primary bg-[#10231bdb]'
+                    : 'hover:border-[#426451]',
+                )}
+              >
+                <span className="rounded border border-[#2c4939] bg-[#0c1712e8] px-3 py-2 font-mono text-[9px] text-[#8fc8aa] shadow-lg">
+                  移动到窗格 P{paneNumber}
+                </span>
+              </div>
+            )}
             {!tabs.length && (
               <div
                 role="region"
@@ -690,7 +917,7 @@ export function TerminalGrid(props: Props) {
                 <div role="status">
                   <strong className="block text-[11px] font-semibold text-[#9ba8b1]">窗格 {paneNumber} 暂无终端</strong>
                   <span className="mt-1.5 block max-w-72 text-[9px] leading-4 text-[#5f6d77]">
-                    添加尚未归属的会话，或前往设备页新建终端。
+                    从上方设备组单击终端可临时预览，双击可固定为此窗格的标签。
                   </span>
                 </div>
               </div>
