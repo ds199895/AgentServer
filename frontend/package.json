@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test:layout": "node --test test/terminal-layout.test.mjs"
+    "test:layout": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

@@ -6,6 +6,13 @@ import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, Keyboard,
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
+import {
+  EMPTY_VIRTUAL_MODIFIERS,
+  encodeVirtualKey,
+  type VirtualKeyName,
+  type VirtualModifier,
+  type VirtualModifierState,
+} from '@/terminal-virtual-keyboard'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
@@ -20,21 +27,24 @@ type TerminalContextMenu = {
 type VirtualKey = {
   label: string
   title: string
-  data: string
+  key: VirtualKeyName
   className: string
 }
 
 const VIRTUAL_KEYS: VirtualKey[] = [
-  { label: 'Shift', title: 'Shift / 反向 Tab', data: '\x1b[Z', className: 'col-start-1 row-start-1' },
-  { label: 'Ctrl', title: 'Ctrl+C', data: '\x03', className: 'col-start-2 row-start-1' },
-  { label: 'Alt', title: 'Alt / Meta 前缀', data: '\x1b', className: 'col-start-3 row-start-1' },
-  { label: 'Esc', title: 'Escape', data: '\x1b', className: 'col-start-1 row-start-2' },
-  { label: '↑', title: '方向键上', data: '\x1b[A', className: 'col-start-2 row-start-2' },
-  { label: 'Enter', title: 'Enter', data: '\r', className: 'col-start-3 row-start-2' },
-  { label: '←', title: '方向键左', data: '\x1b[D', className: 'col-start-1 row-start-3' },
-  { label: '↓', title: '方向键下', data: '\x1b[B', className: 'col-start-2 row-start-3' },
-  { label: '→', title: '方向键右', data: '\x1b[C', className: 'col-start-3 row-start-3' },
-  { label: 'Tab', title: 'Tab', data: '\t', className: 'col-start-1 row-start-4 col-span-3' },
+  { label: 'Esc', title: 'Escape', key: 'escape', className: 'col-start-1 row-start-2' },
+  { label: '↑', title: '方向键上', key: 'arrowUp', className: 'col-start-2 row-start-2' },
+  { label: 'Enter', title: 'Enter', key: 'enter', className: 'col-start-3 row-start-2' },
+  { label: '←', title: '方向键左', key: 'arrowLeft', className: 'col-start-1 row-start-3' },
+  { label: '↓', title: '方向键下', key: 'arrowDown', className: 'col-start-2 row-start-3' },
+  { label: '→', title: '方向键右', key: 'arrowRight', className: 'col-start-3 row-start-3' },
+  { label: 'Tab', title: 'Tab', key: 'tab', className: 'col-start-1 row-start-4 col-span-3' },
+]
+
+const VIRTUAL_MODIFIERS: Array<{ modifier: VirtualModifier; label: string }> = [
+  { modifier: 'shift', label: 'Shift' },
+  { modifier: 'ctrl', label: 'Ctrl' },
+  { modifier: 'alt', label: 'Alt' },
 ]
 
 async function copyText(text: string): Promise<void> {
@@ -86,6 +96,7 @@ export default function TerminalPane({
   const hostRef = useRef<HTMLDivElement>(null)
   const visibleRef = useRef(visible)
   const focusedRef = useRef(focused)
+  const virtualKeyboardOpenRef = useRef(false)
   const restoreRef = useRef<(() => void) | null>(null)
   const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
@@ -96,6 +107,9 @@ export default function TerminalPane({
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null)
   const [pastePanelOpen, setPastePanelOpen] = useState(false)
   const [virtualKeyboardOpen, setVirtualKeyboardOpen] = useState(false)
+  const [virtualModifiers, setVirtualModifiers] = useState<VirtualModifierState>(
+    EMPTY_VIRTUAL_MODIFIERS,
+  )
   const [pasteDraft, setPasteDraft] = useState('')
   const [notice, setNotice] = useState('')
   const [showAllServices, setShowAllServices] = useState(false)
@@ -165,11 +179,30 @@ export default function TerminalPane({
     closePastePanel()
   }
 
+  const toggleVirtualKeyboard = () => {
+    const next = !virtualKeyboardOpenRef.current
+    virtualKeyboardOpenRef.current = next
+    // xterm focuses its hidden textarea. Blurring it before opening the
+    // accessory panel prevents mobile browsers from treating this click as a
+    // request to show their own IME. A later explicit tap on the terminal can
+    // still bring the native keyboard back when text input is wanted.
+    if (next) terminalRef.current?.blur()
+    setVirtualKeyboardOpen(next)
+    if (!next) setVirtualModifiers(EMPTY_VIRTUAL_MODIFIERS)
+  }
+
+  const toggleVirtualModifier = (modifier: VirtualModifier) => {
+    setVirtualModifiers((current) => ({ ...current, [modifier]: !current[modifier] }))
+  }
+
   const sendVirtualKey = (key: VirtualKey) => {
     const terminal = terminalRef.current
     if (!terminal) return
-    terminal.input(key.data, true)
-    terminal.focus()
+    terminal.input(
+      encodeVirtualKey(key.key, virtualModifiers, terminal.modes.applicationCursorKeysMode),
+      true,
+    )
+    setVirtualModifiers(EMPTY_VIRTUAL_MODIFIERS)
   }
 
   const selectAll = () => {
@@ -304,7 +337,9 @@ export default function TerminalPane({
             activeElement === document.body ||
             activeElement === document.documentElement ||
             hostRef.current?.contains(activeElement)
-          if (focusedRef.current && mayRestoreFocus) terminal.focus()
+          if (focusedRef.current && !virtualKeyboardOpenRef.current && mayRestoreFocus) {
+            terminal.focus()
+          }
         })
       })
     }
@@ -508,7 +543,9 @@ export default function TerminalPane({
     } else {
       setContextMenu(null)
       setPastePanelOpen(false)
+      virtualKeyboardOpenRef.current = false
       setVirtualKeyboardOpen(false)
+      setVirtualModifiers(EMPTY_VIRTUAL_MODIFIERS)
       setPasteDraft('')
     }
   }, [visible, focused])
@@ -622,7 +659,31 @@ export default function TerminalPane({
           )}
         >
           {virtualKeyboardOpen && (
-            <div className="grid w-[min(236px,calc(100vw-1rem))] grid-cols-3 grid-rows-4 gap-1.5 rounded-xl border border-[#30404b] bg-[#0c1319ef] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:w-[min(218px,calc(100vw-1rem))] max-md:gap-1 max-md:rounded-lg max-md:p-1.5">
+            <div
+              role="group"
+              aria-label="终端辅助键盘"
+              className="grid w-[min(236px,calc(100vw-1rem))] grid-cols-3 grid-rows-4 gap-1.5 rounded-xl border border-[#30404b] bg-[#0c1319ef] p-2 shadow-[0_16px_50px_#000b] backdrop-blur-md max-md:w-[min(218px,calc(100vw-1rem))] max-md:gap-1 max-md:rounded-lg max-md:p-1.5"
+            >
+              {VIRTUAL_MODIFIERS.map(({ modifier, label }) => {
+                const active = virtualModifiers[modifier]
+                return (
+                  <button
+                    key={modifier}
+                    type="button"
+                    aria-label={`${label}组合键`}
+                    aria-pressed={active}
+                    title={active ? `取消 ${label}` : `与下一个按键组合`}
+                    onPointerDown={(event) => event.preventDefault()}
+                    onClick={() => toggleVirtualModifier(modifier)}
+                    className={cn(
+                      'col-span-1 row-start-1 grid h-9 cursor-pointer place-items-center rounded-md border border-[#2d3b46] bg-[#101820] px-2 font-mono text-[11px] font-semibold text-[#c4d0d9] shadow-[inset_0_-1px_0_#0006] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary active:translate-y-px max-md:h-8 max-md:text-[10px]',
+                      active && 'border-[#58a982] bg-[#193025] text-primary shadow-[inset_0_0_0_1px_#77f2b433]',
+                    )}
+                  >
+                    {label}
+                  </button>
+                )
+              })}
               {VIRTUAL_KEYS.map((key) => (
                 <button
                   key={key.label}
@@ -646,10 +707,8 @@ export default function TerminalPane({
             aria-label={virtualKeyboardOpen ? '收起虚拟键盘' : '打开虚拟键盘'}
             aria-pressed={virtualKeyboardOpen}
             title={virtualKeyboardOpen ? '收起虚拟键盘' : '打开虚拟键盘'}
-            onClick={() => {
-              setVirtualKeyboardOpen((value) => !value)
-              terminalRef.current?.focus()
-            }}
+            onPointerDown={(event) => event.preventDefault()}
+            onClick={toggleVirtualKeyboard}
             className={cn(
               'grid size-9 cursor-pointer place-items-center rounded-full border border-[#2d3b46] bg-[#101820cc] text-[#9aa9b4] shadow-[0_10px_30px_#000a] backdrop-blur-md transition-colors hover:border-[#315a48] hover:text-primary max-md:size-8',
               virtualKeyboardOpen && 'border-[#315a48] bg-[#15251e] text-primary',
