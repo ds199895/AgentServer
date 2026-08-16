@@ -119,6 +119,10 @@ export function TerminalTabsBar({
     .filter((group) => group.sessions.some((session) => placements.get(session.id)?.visible))
     .map((group) => group.key)
     .join('\u0000')
+  const activeGroupKey = activeId
+    ? terminalGroups.find((group) => group.sessions.some((session) => session.id === activeId))?.key ?? null
+    : null
+  const activeGroupExpanded = activeGroupKey ? expandedGroupKeys.has(activeGroupKey) : false
 
   useEffect(() => {
     if (!visibleGroupKey) return
@@ -190,7 +194,7 @@ export function TerminalTabsBar({
       tabRefs.current.get(activeId)?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [activeId, expandedGroupKeys])
+  }, [activeGroupExpanded, activeGroupKey, activeId])
 
   useEffect(() => {
     if (!searchOpen) return
@@ -226,7 +230,7 @@ export function TerminalTabsBar({
         <div
           role="list"
           aria-label="终端设备组"
-          className="flex min-w-0 flex-1 touch-pan-x items-center gap-1.5 overflow-x-auto overscroll-x-contain [scrollbar-color:#34404c_transparent] [scrollbar-width:thin]"
+          className="flex h-[33px] min-w-0 flex-1 touch-pan-x items-stretch gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
           {terminalGroups.map((group) => {
             const device = group.deviceId ? deviceMap.get(group.deviceId) : undefined

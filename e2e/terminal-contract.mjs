@@ -883,6 +883,64 @@ try {
     fail(`empty panes or scale sessions became visible: ${JSON.stringify(visibleIdsAtScale)}`)
   }
 
+  // A long device/terminal catalog must remain a 33px strip aligned with the
+  // search trigger. Its native scrollbar is visually hidden (so it consumes
+  // no row height), while trackpad/mouse horizontal scrolling remains usable.
+  await ensureLocalGroupExpanded(page)
+  const deviceStripMetrics = await page.evaluate(() => {
+    const search = document.querySelector('button[aria-label="搜索终端"]')
+    const strip = document.querySelector('[role="list"][aria-label="终端设备组"]')
+    if (!(search instanceof HTMLElement) || !(strip instanceof HTMLElement)) return null
+    const searchRect = search.getBoundingClientRect()
+    const stripRect = strip.getBoundingClientRect()
+    const groupRects = [...strip.children]
+      .filter((element) => element.getAttribute('role') === 'listitem')
+      .map((element) => element.getBoundingClientRect())
+    const style = getComputedStyle(strip)
+    return {
+      searchHeight: searchRect.height,
+      searchCenterY: searchRect.top + searchRect.height / 2,
+      stripHeight: stripRect.height,
+      stripCenterY: stripRect.top + stripRect.height / 2,
+      groupHeights: groupRects.map((rect) => rect.height),
+      groupCenterYs: groupRects.map((rect) => rect.top + rect.height / 2),
+      clientWidth: strip.clientWidth,
+      scrollWidth: strip.scrollWidth,
+      clientHeight: strip.clientHeight,
+      offsetHeight: strip.offsetHeight,
+      overflowX: style.overflowX,
+      scrollbarWidth: style.scrollbarWidth,
+    }
+  })
+  if (!deviceStripMetrics) fail('terminal device strip metrics are unavailable')
+  if (
+    Math.abs(deviceStripMetrics.searchHeight - deviceStripMetrics.stripHeight) > 1 ||
+    Math.abs(deviceStripMetrics.searchCenterY - deviceStripMetrics.stripCenterY) > 1 ||
+    deviceStripMetrics.groupHeights.some((height) => (
+      Math.abs(height - deviceStripMetrics.searchHeight) > 1
+    )) ||
+    deviceStripMetrics.groupCenterYs.some((centerY) => (
+      Math.abs(centerY - deviceStripMetrics.searchCenterY) > 1
+    ))
+  ) {
+    fail(`terminal device strip is not aligned with search: ${JSON.stringify(deviceStripMetrics)}`)
+  }
+  if (
+    deviceStripMetrics.scrollWidth <= deviceStripMetrics.clientWidth + 1 ||
+    !['auto', 'scroll'].includes(deviceStripMetrics.overflowX) ||
+    deviceStripMetrics.scrollbarWidth !== 'none' ||
+    deviceStripMetrics.offsetHeight - deviceStripMetrics.clientHeight > 1
+  ) {
+    fail(`terminal device strip scrollbar consumes layout or cannot overflow: ${JSON.stringify(deviceStripMetrics)}`)
+  }
+  const deviceStrip = page.getByRole('list', { name: '终端设备组', exact: true })
+  await deviceStrip.evaluate((element) => { element.scrollLeft = 0 })
+  await deviceStrip.hover()
+  await page.mouse.wheel(360, 0)
+  await page.waitForFunction(() => (
+    (document.querySelector('[role="list"][aria-label="终端设备组"]')?.scrollLeft || 0) > 0
+  ))
+
   await page.getByRole('button', { name: '搜索终端', exact: true }).click()
   let searchDialog = page.getByRole('dialog')
   await searchDialog.getByRole('combobox').fill(scalePrefix)
