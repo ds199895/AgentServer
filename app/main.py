@@ -53,6 +53,7 @@ from .terminal import (
     ListeningProcess,
     RESIZE_MESSAGE,
     SNAPSHOT_COMPLETE_MESSAGE,
+    STREAM_GAP,
     TerminalManager,
     parse_listener_scan,
     remote_shell_command,
@@ -97,6 +98,12 @@ devices = DeviceStore(DATA_DIR / "agent_server.db")
 
 
 DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
+# Terminal scrollback replays are sliced to this size so a single attach cannot
+# hand the event loop a multi-megabyte frame in one go.
+SNAPSHOT_CHUNK_BYTES = 64 * 1024
+# Session-state pushes are coalesced over this window so a burst of transitions
+# (a device reconnecting, several services going offline) sends one snapshot.
+SESSION_PUSH_DEBOUNCE_SECONDS = 0.25
 DOWNLOAD_FILES = {
     "install-frpc-ssh.sh": (ROOT / "scripts" / "install_frpc_ssh.sh", "text/x-shellscript"),
     "install-frpc-ssh.ps1": (ROOT / "scripts" / "install_frpc_ssh.ps1", "text/plain"),
@@ -1807,6 +1814,53 @@ async def workspace_socket(websocket: WebSocket, session_id: str) -> None:
     await asyncio.gather(*done, *pending, return_exceptions=True)
 
 
+@app.websocket("/ws/sessions")
+async def sessions_socket(websocket: WebSocket) -> None:
+    """Push this owner's session list whenever it actually changes.
+
+    Replaces the browser's periodic /api/terminals poll. That poll cost a tmux
+    query per request per open tab regardless of whether anything had changed;
+    here the server only speaks when a session or service really transitions.
+    """
+    username = signer.verify(websocket.cookies.get(COOKIE_NAME))
+    if not username:
+        await websocket.close(code=4401)
+        return
+
+    manager: TerminalManager = websocket.app.state.terminals
+    await websocket.accept()
+    waiter = manager.subscribe_state()
+
+    async def send_snapshots() -> None:
+        await websocket.send_json(manager.list(username))
+        while True:
+            await waiter.wait()
+            # Coalesce a burst of transitions into one push, then clear again so
+            # anything that landed during the pause is folded into this snapshot
+            # rather than triggering a second, identical one.
+            await asyncio.sleep(SESSION_PUSH_DEBOUNCE_SECONDS)
+            waiter.clear()
+            await websocket.send_json(manager.list(username))
+
+    async def receive_until_disconnect() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+    sender = asyncio.create_task(send_snapshots())
+    receiver = asyncio.create_task(receive_until_disconnect())
+    try:
+        done, pending = await asyncio.wait(
+            {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+    finally:
+        manager.unsubscribe_state(waiter)
+
+
 @app.websocket("/ws/terminal/{session_id}")
 async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
     username = signer.verify(websocket.cookies.get(COOKIE_NAME))
@@ -1821,8 +1875,12 @@ async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
 
     await websocket.accept()
     snapshot, queue = manager.attach(session_id)
-    if snapshot:
-        await websocket.send_bytes(snapshot)
+    # Scrollback can reach TERMINAL_SCROLLBACK_BYTES (2 MiB by default). Send it
+    # in slices and yield between them so one attach cannot stall the event loop
+    # — every other terminal's output is pumped from this same loop.
+    for start in range(0, len(snapshot), SNAPSHOT_CHUNK_BYTES):
+        await websocket.send_bytes(snapshot[start:start + SNAPSHOT_CHUNK_BYTES])
+        await asyncio.sleep(0)
     # xterm may answer control-sequence queries while parsing a scrollback replay.
     # Tell the browser exactly where the replay ends so those generated replies
     # are not mistaken for fresh keyboard input and written back to the PTY.
@@ -1830,7 +1888,14 @@ async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
 
     async def send_output() -> None:
         while True:
-            await websocket.send_bytes(await queue.get())
+            payload = await queue.get()
+            if payload is STREAM_GAP:
+                # This client fell too far behind to be resynced in place. Close
+                # so it reconnects and replays a coherent snapshot instead of
+                # rendering a stream with a hole in it.
+                await websocket.close(code=1011)
+                return
+            await websocket.send_bytes(payload)
 
     async def receive_input() -> None:
         while True:

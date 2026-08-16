@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.terminal import (
+    STREAM_GAP,
     DetectedService,
     ListeningProcess,
     TerminalManager,
@@ -180,6 +181,41 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("output/report.pdf", events[0]["path"])
         self.assertEqual("terminal-marker", events[0]["source"])
+
+    async def test_overloaded_subscriber_gets_a_gap_marker_not_a_hole(self) -> None:
+        """A backed-up client must not silently receive a spliced VT stream."""
+        session = self.manager.create("Backpressure")
+        _snapshot, queue = self.manager.attach(session.id)
+        healthy_snapshot, healthy = self.manager.attach(session.id)
+        del _snapshot, healthy_snapshot
+        try:
+            while not queue.full():
+                queue.put_nowait(b"queued")
+            queued_before = queue.qsize()
+
+            self.manager._broadcast(session, b"\x1b[31mlate\x1b[0m")
+
+            # Everything pending is discarded in favour of one explicit marker,
+            # so nothing can mistake a hole for continuous output.
+            self.assertEqual(1, queue.qsize())
+            self.assertIs(STREAM_GAP, queue.get_nowait())
+            self.assertGreater(queued_before, 1)
+
+            # The slow client's overflow must not cost a healthy subscriber
+            # either chunk. Live PTY output may be interleaved, so assert on
+            # order rather than on exact queue contents.
+            self.manager._broadcast(session, b"still fine")
+            delivered: list[bytes] = []
+            while not healthy.empty():
+                delivered.append(healthy.get_nowait())
+            self.assertNotIn(STREAM_GAP, delivered)
+            self.assertLess(
+                delivered.index(b"\x1b[31mlate\x1b[0m"),
+                delivered.index(b"still fine"),
+            )
+        finally:
+            self.manager.detach(session.id, queue)
+            self.manager.detach(session.id, healthy)
 
     async def test_session_cleanup_never_signals_special_pids(self) -> None:
         with patch("app.terminal.subprocess.run") as process_scan, patch(

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
-import { api, frontendBuildSha, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
+import { api, frontendBuildSha, normalizeTerminalSessions, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
@@ -97,8 +97,9 @@ function focusTerminalInput(id: string): void {
       activeElement === document.documentElement ||
       (previousActiveElement instanceof Element && !previousActiveElement.isConnected)
     if (!focusIsStillAvailable) return
-    const pane = [...document.querySelectorAll<HTMLElement>('[data-terminal-id]')]
-      .find((element) => element.dataset.terminalId === id)
+    const pane = document.querySelector<HTMLElement>(
+      `[data-terminal-id="${CSS.escape(id)}"]`,
+    )
     pane?.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus({ preventScroll: true })
   }))
 }
@@ -138,8 +139,11 @@ export default function App() {
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
   const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
   const [workspaceSessionId, setWorkspaceSessionId] = useState<string | null>(null)
-  const [layout, setLayout] = useState<LayoutNode | null>(() => initialLayout().layout)
-  const [focusedLeafId, setFocusedLeafId] = useState<string | null>(() => initialLayout().focusedLeafId)
+  // initialLayout() parses localStorage; hold it in one state slot so bootstrap
+  // validates the persisted layout once instead of once per derived field.
+  const [persistedBoot] = useState(initialLayout)
+  const [layout, setLayout] = useState<LayoutNode | null>(persistedBoot.layout)
+  const [focusedLeafId, setFocusedLeafId] = useState<string | null>(persistedBoot.focusedLeafId)
   const [forceSingle, setForceSingle] = useState(isCoarseLayout)
   const [focusMode, setFocusMode] = useState(false)
   const [error, setError] = useState('')
@@ -153,6 +157,13 @@ export default function App() {
   const loadRequestIdRef = useRef(0)
   const sessionMutationEpochRef = useRef(0)
   const sessionMutationDepthRef = useRef(0)
+  // 轮询每 5 秒都会返回全新的数组/对象。无条件 setState 会让下游所有
+  // useMemo 失效并重渲染每个已挂载的 pane,即使数据一个字节都没变。
+  // 一次 stringify 远比一轮全树重渲染便宜。
+  const devicesSignatureRef = useRef('')
+  const sessionsSignatureRef = useRef('')
+  const previewsSignatureRef = useRef('')
+  const sessionsPushHealthyRef = useRef(false)
 
   // 布局操作需要同步读取最新值(轮询 load 与事件处理器都会触发),
   // 因此通过 ref 镜像 + 成对 setter,避免在 setState updater 里产生副作用。
@@ -165,36 +176,34 @@ export default function App() {
     setFocusedLeafId(next)
   }
 
+  // 任何本地乐观更新都会让指纹与实际 state 脱钩。清空后下一轮轮询
+  // 一定重新落盘,不会因为指纹陈旧而把过期 state 留死。
+  const invalidateSnapshots = () => {
+    devicesSignatureRef.current = ''
+    sessionsSignatureRef.current = ''
+    previewsSignatureRef.current = ''
+  }
+
   const beginSessionMutation = () => {
     sessionMutationDepthRef.current += 1
     sessionMutationEpochRef.current += 1
+    invalidateSnapshots()
   }
   const finishSessionMutation = () => {
     sessionMutationDepthRef.current = Math.max(0, sessionMutationDepthRef.current - 1)
     sessionMutationEpochRef.current += 1
   }
 
-  const load = useCallback(async () => {
-    const requestId = ++loadRequestIdRef.current
-    const mutationEpoch = sessionMutationEpochRef.current
-    const [nextDevices, nextSessions, nextPreviews] = await Promise.all([api.devices(), api.terminals(), api.previews()])
-    // A slower, older poll must never overwrite a newer response. Device and
-    // preview snapshots are safe to apply while a terminal mutation is pending,
-    // but the session/layout snapshot is not.
-    if (requestId !== loadRequestIdRef.current) return
-    setDevices(nextDevices)
-    setPreviews(nextPreviews)
-    const currentPreview = activePreviewRef.current
-    if (currentPreview && !nextPreviews.some((item) => item.id === currentPreview.preview.id)) {
-      activePreviewRef.current = null
-      setActivePreview(null)
-      setError('开发服务已停止，关联预览隧道已自动关闭')
+  // 会话快照有两个来源:HTTP 轮询与 /ws/sessions 推送。两者共用同一套
+  // 对账逻辑,以免路由/布局同步出现两份实现。
+  const applySessions = useCallback((nextSessions: TerminalSession[]) => {
+    // 只跳过 setState;下面的路由/布局对账必须照常执行,它还负责 URL 同步,
+    // 而布局可能在两次快照之间被用户改动过。
+    const sessionsSignature = JSON.stringify(nextSessions)
+    if (sessionsSignature !== sessionsSignatureRef.current) {
+      sessionsSignatureRef.current = sessionsSignature
+      setSessions(nextSessions)
     }
-    if (
-      sessionMutationDepthRef.current > 0 ||
-      mutationEpoch !== sessionMutationEpochRef.current
-    ) return
-    setSessions(nextSessions)
     const route = routeFromLocation()
     const previousLayout = layoutRef.current
     const routedLeaf = route.terminalId && previousLayout
@@ -266,6 +275,37 @@ export default function App() {
     }
   }, [])
 
+  const load = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current
+    const mutationEpoch = sessionMutationEpochRef.current
+    const [nextDevices, nextSessions, nextPreviews] = await Promise.all([api.devices(), api.terminals(), api.previews()])
+    // A slower, older poll must never overwrite a newer response. Device and
+    // preview snapshots are safe to apply while a terminal mutation is pending,
+    // but the session/layout snapshot is not.
+    if (requestId !== loadRequestIdRef.current) return
+    const devicesSignature = JSON.stringify(nextDevices)
+    if (devicesSignature !== devicesSignatureRef.current) {
+      devicesSignatureRef.current = devicesSignature
+      setDevices(nextDevices)
+    }
+    const previewsSignature = JSON.stringify(nextPreviews)
+    if (previewsSignature !== previewsSignatureRef.current) {
+      previewsSignatureRef.current = previewsSignature
+      setPreviews(nextPreviews)
+    }
+    const currentPreview = activePreviewRef.current
+    if (currentPreview && !nextPreviews.some((item) => item.id === currentPreview.preview.id)) {
+      activePreviewRef.current = null
+      setActivePreview(null)
+      setError('开发服务已停止，关联预览隧道已自动关闭')
+    }
+    if (
+      sessionMutationDepthRef.current > 0 ||
+      mutationEpoch !== sessionMutationEpochRef.current
+    ) return
+    applySessions(nextSessions)
+  }, [applySessions])
+
   useEffect(() => {
     activePreviewRef.current = activePreview
   }, [activePreview])
@@ -315,10 +355,77 @@ export default function App() {
     void start()
     return () => { cancelled = true }
   }, [load])
+  // 会话生命周期与服务状态由服务端推送。在 tmux 后端下,原来每 5 秒一次的
+  // /api/terminals 轮询会让每个标签页都触发一轮 tmux 查询,而绝大多数时候
+  // 什么都没变。
   useEffect(() => {
     if (!username) return
-    const timer = window.setInterval(() => void load().catch(() => undefined), 5000)
-    return () => window.clearInterval(timer)
+    let socket: WebSocket | null = null
+    let reconnectTimer: number | undefined
+    let reconnectAttempt = 0
+    let disposed = false
+
+    const connect = () => {
+      if (disposed) return
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions`)
+      socket.onopen = () => {
+        reconnectAttempt = 0
+        sessionsPushHealthyRef.current = true
+      }
+      socket.onmessage = (event) => {
+        // 本地变更进行中时跳过:那次变更自己的 load() 会给出最终状态,
+        // 与轮询路径的 mutation guard 保持一致。
+        if (sessionMutationDepthRef.current > 0) return
+        try {
+          applySessions(normalizeTerminalSessions(JSON.parse(String(event.data))))
+        } catch {
+          // 畸形帧不该打断连接;下一次推送仍是完整快照。
+        }
+      }
+      socket.onclose = (event) => {
+        sessionsPushHealthyRef.current = false
+        if (disposed || event.code === 4401) return
+        const delay = Math.min(750 * 2 ** reconnectAttempt, 8000)
+        reconnectAttempt += 1
+        reconnectTimer = window.setTimeout(connect, delay)
+      }
+      socket.onerror = () => socket?.close()
+    }
+    connect()
+
+    return () => {
+      disposed = true
+      sessionsPushHealthyRef.current = false
+      window.clearTimeout(reconnectTimer)
+      socket?.close(1000)
+    }
+  }, [applySessions, username])
+
+  // 轮询退化为兜底:devices/previews 没有推送通道,而推送断开时它还要
+  // 顶上会话状态。隐藏的标签页不轮询,重新可见时立刻补一次。
+  useEffect(() => {
+    if (!username) return
+    let timer: number | undefined
+    let cancelled = false
+    const schedule = () => {
+      if (cancelled) return
+      const interval = sessionsPushHealthyRef.current ? 30_000 : 5_000
+      timer = window.setTimeout(async () => {
+        if (document.visibilityState === 'visible') await load().catch(() => undefined)
+        schedule()
+      }, interval)
+    }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void load().catch(() => undefined)
+    }
+    schedule()
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+    }
   }, [load, username])
   useEffect(() => {
     const media = window.matchMedia('(max-width: 767px), (pointer: coarse)')
@@ -635,10 +742,11 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
+  const logout = async () => { await api.logout(); invalidateSnapshots(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
   const stopPreview = async (preview: Preview) => {
     try {
       await api.deletePreview(preview.id)
+      invalidateSnapshots()
       setPreviews((current) => current.filter((item) => item.id !== preview.id))
       if (activePreview?.preview.id === preview.id) { activePreviewRef.current = null; setActivePreview(null) }
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法关闭预览') }
@@ -655,6 +763,7 @@ export default function App() {
         session.id,
       )
       const { url } = await api.previewTicket(preview.id)
+      invalidateSnapshots()
       setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
       activePreviewRef.current = { preview, url }
       setActivePreview({ preview, url })
@@ -837,12 +946,14 @@ export default function App() {
           initialTerminalId={previewTarget.terminalId}
           onClose={() => setPreviewTarget(null)}
           onCreated={(preview, url) => {
+            invalidateSnapshots()
             setPreviews((current) => [preview, ...current.filter((item) => item.id !== preview.id)])
             activePreviewRef.current = { preview, url }
             setActivePreview({ preview, url })
             setPreviewTarget(null)
           }}
           onDeleted={(id) => {
+            invalidateSnapshots()
             setPreviews((current) => current.filter((item) => item.id !== id))
             if (activePreview?.preview.id === id) { activePreviewRef.current = null; setActivePreview(null) }
           }}

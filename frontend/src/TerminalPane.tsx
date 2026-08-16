@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
+import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, Keyboard, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
@@ -246,6 +247,22 @@ export default function TerminalPane({
     })
     const fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
+    // xterm 6 ships only the DOM renderer, which builds a span per style run per
+    // row. The WebGL addon registers itself during open()'s onWillOpen, so it has
+    // to be loaded first; if construction or context creation fails, xterm falls
+    // back to the DOM renderer on its own.
+    let webglAddon: WebglAddon | null = null
+    try {
+      const addon = new WebglAddon()
+      addon.onContextLoss(() => {
+        addon.dispose()
+        if (webglAddon === addon) webglAddon = null
+      })
+      terminal.loadAddon(addon)
+      webglAddon = addon
+    } catch {
+      webglAddon = null
+    }
     terminal.open(hostRef.current)
     terminalRef.current = terminal
     terminal.attachCustomKeyEventHandler((event) => {
@@ -317,16 +334,19 @@ export default function TerminalPane({
       }
     }
 
-    const restore = () => {
+    const restore = ({ rebuildAtlas = false } = {}) => {
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
       restoreFrame = window.requestAnimationFrame(() => {
         fit()
         refreshFrame = window.requestAnimationFrame(() => {
           if (!visibleRef.current || disposed) return
-          // clearTextureAtlas() is a no-op unless a WebGL/canvas renderer is
-          // loaded; its only effect there is the full refresh below, so calling
-          // both repainted every row twice. WebGL recovers via onContextLoss.
+          // The WebGL texture atlas can come back corrupt after the OS resumes
+          // from sleep (Chromium/Nvidia), so rebuild it on the page-return path
+          // only. Doing it on every focus/visibility toggle would repaint every
+          // row twice for no benefit, and it is a plain no-op under the DOM
+          // renderer we fall back to.
+          if (rebuildAtlas) terminal.clearTextureAtlas()
           terminal.refresh(0, terminal.rows - 1)
           // ResizeObserver、WS onopen 和 visibilitychange 都可能在用户已经
           // 聚焦分隔条/按钮后触发。只允许当前 pane 在页面没有交互焦点，或
@@ -499,7 +519,9 @@ export default function TerminalPane({
     document.addEventListener('keydown', closeContextMenuOnEscape)
     const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fit))
     const restoreWhenPageReturns = () => {
-      if (document.visibilityState === 'visible' && visibleRef.current) restore()
+      if (document.visibilityState === 'visible' && visibleRef.current) {
+        restore({ rebuildAtlas: true })
+      }
     }
     resizeObserver.observe(hostRef.current)
     document.addEventListener('visibilitychange', restoreWhenPageReturns)
@@ -531,6 +553,10 @@ export default function TerminalPane({
       socket?.close(1000)
       restoreRef.current = null
       terminalRef.current = null
+      // Release the WebGL context before the terminal so the addon does not
+      // touch an already-disposed renderer.
+      webglAddon?.dispose()
+      webglAddon = null
       terminal.dispose()
     }
   }, [sessionId])

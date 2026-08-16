@@ -190,6 +190,12 @@ function normalizeTerminalSession(session: TerminalSessionPayload): TerminalSess
   }
 }
 
+/** Apply the same older-backend tolerance to pushed payloads as to HTTP ones. */
+export function normalizeTerminalSessions(payload: unknown): TerminalSession[] {
+  if (!Array.isArray(payload)) return []
+  return payload.map((session) => normalizeTerminalSession(session as TerminalSessionPayload))
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',

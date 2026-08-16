@@ -659,15 +659,40 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       drawCharacterTarget(selectedSessionIdRef.current, '#8affd2', true)
     }
 
+    // 这个循环会重画整个像素世界。终端页常驻挂载着 compact 缩略图，
+    // 所以它必须在不可见时彻底停下，可见时也不该跟终端抢满帧。
+    const minFrameInterval = compact ? 1000 / 12 : 0
     let frame = 0
+    let lastDrawAt = 0
+    let onScreen = true
     const animate = (now: number) => {
-      drawFrame(now)
       frame = window.requestAnimationFrame(animate)
+      if (minFrameInterval && now - lastDrawAt < minFrameInterval) return
+      lastDrawAt = now
+      drawFrame(now)
     }
-    frame = window.requestAnimationFrame(animate)
+    const startLoop = () => {
+      if (!frame) frame = window.requestAnimationFrame(animate)
+    }
+    const stopLoop = () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      frame = 0
+    }
+    // rAF 已经会在标签页隐藏时暂停；IntersectionObserver 负责的是
+    // 画布被滚出视口/被收起的情况，那时 rAF 仍在正常触发。
+    const visibilityObserver = new IntersectionObserver((entries) => {
+      const nextOnScreen = entries[entries.length - 1].isIntersecting
+      if (nextOnScreen === onScreen) return
+      onScreen = nextOnScreen
+      if (onScreen) startLoop()
+      else stopLoop()
+    })
+    visibilityObserver.observe(canvas)
+    startLoop()
 
     return () => {
-      window.cancelAnimationFrame(frame)
+      stopLoop()
+      visibilityObserver.disconnect()
       resizeObserver.disconnect()
       canvas.removeEventListener('pointerdown', onPointerDown)
       canvas.removeEventListener('pointermove', onPointerMove)

@@ -439,6 +439,24 @@ try {
     await route.fulfill({ status: response.status, json: sessions })
   })
 
+  // Session state also arrives over /ws/sessions, so the same compatibility
+  // guard has to cover pushed snapshots — otherwise the first push would hand
+  // the UI a `services` array the HTTP guard above just removed, and the
+  // older-agent path would silently stop being exercised.
+  await page.routeWebSocket('**/ws/sessions', (ws) => {
+    const server = ws.connectToServer()
+    server.onMessage((message) => {
+      try {
+        const sessions = JSON.parse(String(message))
+        for (const session of sessions) delete session.services
+        ws.send(JSON.stringify(sessions))
+      } catch {
+        ws.send(message)
+      }
+    })
+    ws.onMessage((message) => server.send(message))
+  })
+
   // Backend sessions must not populate a fresh workspace. Explicitly clear
   // storage and enter /terminals: P1 exists as an empty editor group.
   await page.evaluate(() => window.localStorage.clear())

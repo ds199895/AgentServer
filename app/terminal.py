@@ -27,6 +27,20 @@ from typing import Callable
 
 RESIZE_MESSAGE = re.compile(r"^\x01\[(\d+),(\d+)\]$")
 SNAPSHOT_COMPLETE_MESSAGE = "\x01[snapshot-complete]"
+
+
+class StreamGap:
+    """Queued when a subscriber falls so far behind that its stream is lost.
+
+    A terminal stream is raw VT bytes, so it cannot be repaired by discarding
+    part of it. The only correct recovery is for that client to reconnect and
+    replay a fresh snapshot.
+    """
+
+    __slots__ = ()
+
+
+STREAM_GAP = StreamGap()
 ANSI_ESCAPE = re.compile(
     r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[@-_][0-?]*[ -/]*[@-~])"
 )
@@ -283,7 +297,7 @@ class TerminalSession:
     return_code: int | None = None
     chunks: deque[bytes] = field(default_factory=deque)
     buffer_size: int = 0
-    subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
+    subscribers: set[asyncio.Queue[bytes | StreamGap]] = field(default_factory=set)
     pending_input: bytearray = field(default_factory=bytearray)
     services: dict[int, DetectedService] = field(default_factory=dict)
     discovery_tail: str = ""
@@ -445,6 +459,9 @@ class TerminalManager:
         self.loop = asyncio.get_running_loop()
         self.service_discovery_event = asyncio.Event()
         self._tmux_states_cache: tuple[float, dict[str, tuple[bool, str, bool]]] | None = None
+        # Each state subscriber owns its own Event. A single shared Event would
+        # let one client's clear() swallow a notification another had not read.
+        self._state_waiters: set[asyncio.Event] = set()
         if self.backend == "tmux":
             if not shutil.which(self.tmux_binary):
                 raise RuntimeError(f"tmux executable not found: {self.tmux_binary}")
@@ -463,6 +480,29 @@ class TerminalManager:
                         self._close_client(session)
                 self.sessions.clear()
                 raise
+
+    def subscribe_state(self) -> asyncio.Event:
+        """Register for session-lifecycle notifications.
+
+        Lets clients be pushed session/service changes instead of polling
+        /api/terminals, which in the tmux backend costs a tmux query per call.
+        """
+        waiter = asyncio.Event()
+        self._state_waiters.add(waiter)
+        return waiter
+
+    def unsubscribe_state(self, waiter: asyncio.Event) -> None:
+        self._state_waiters.discard(waiter)
+
+    def _notify_state_change(self) -> None:
+        """Signal a real transition only — never on an unchanged refresh.
+
+        `list()` is what subscribers call to build their payload, and it refreshes
+        tmux state on the way. Notifying unconditionally from there would make
+        every push cause the next one.
+        """
+        for waiter in tuple(self._state_waiters):
+            waiter.set()
 
     def list(self, owner: str | None = None) -> list[dict[str, object]]:
         if self.backend == "tmux":
@@ -571,6 +611,7 @@ class TerminalManager:
         if self.command.strip():
             initial_input = f"{self.command}\r".encode("utf-8")
             self.loop.call_later(0.05, self.write, session_id, initial_input)
+        self._notify_state_change()
         return session
 
     def create_process(
@@ -646,6 +687,7 @@ class TerminalManager:
         self.sessions[session_id] = session
         self.resize(session_id, cols, rows)
         self.loop.add_reader(fd, self._read_ready, session_id)
+        self._notify_state_change()
         return session
 
     def _tmux_command(self, *arguments: str) -> list[str]:
@@ -1023,6 +1065,7 @@ class TerminalManager:
             self.store.delete(session.id)
             self._tmux_run("kill-session", "-t", tmux_name, check=False)
             raise
+        self._notify_state_change()
         return session
 
     def _spawn_tmux_client(self, session: TerminalSession) -> None:
@@ -1054,10 +1097,13 @@ class TerminalManager:
         states: dict[str, tuple[bool, str, bool]] | None = None,
     ) -> None:
         tmux_name = session.tmux_name or ""
+        was_active = session.active
         if not self._tmux_session_alive(tmux_name, states):
             session.exited_at = session.exited_at or time.time()
             session.return_code = session.return_code if session.return_code is not None else -1
             self._stop_tmux_artifact_capture(session, stop_pipe=False)
+            if was_active:
+                self._notify_state_change()
             return
         if states is not None:
             queried = True
@@ -1083,9 +1129,13 @@ class TerminalManager:
             except (TypeError, ValueError):
                 session.return_code = None
             self._stop_tmux_artifact_capture(session)
+            if was_active:
+                self._notify_state_change()
         elif queried:
             session.exited_at = None
             session.return_code = None
+            if not was_active:
+                self._notify_state_change()
             if self.artifact_callback is not None and (
                 session.artifact_fd < 0 or not piped
             ):
@@ -1405,6 +1455,8 @@ class TerminalManager:
                 service.process_missing_count = 0
                 if was_visible:
                     removed.append((session.id, service.port))
+        if removed:
+            self._notify_state_change()
         return removed
 
     def update_service_status(
@@ -1436,6 +1488,8 @@ class TerminalManager:
         became_offline = previous != "offline" and service.status == "offline"
         if became_offline:
             service.retry_after = time.time() + SERVICE_REDISCOVERY_COOLDOWN
+        if previous != service.status:
+            self._notify_state_change()
         return service, became_offline
 
     def _broadcast(self, session: TerminalSession, chunk: bytes) -> None:
@@ -1443,11 +1497,19 @@ class TerminalManager:
             try:
                 queue.put_nowait(chunk)
             except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(chunk)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
+                # Dropping a queued chunk would punch a hole into the middle of a
+                # raw VT stream: truncated UTF-8 or CSI/OSC sequences, and lost
+                # mode changes (alt screen, SGR, DECSTBM) that leave the emulator
+                # wrong for the rest of the connection — with nothing able to
+                # detect it. Discard everything pending for this one subscriber
+                # and hand its sender an explicit gap marker to resync from.
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(STREAM_GAP)
 
     def _mark_exited(self, session: TerminalSession) -> None:
         if self.backend == "tmux":
@@ -1471,6 +1533,7 @@ class TerminalManager:
             session.return_code = None
             self._owned_pids.discard(session.pid)
         session.exited_at = time.time()
+        self._notify_state_change()
         marker = b"\r\n\x1b[90m[process exited]\x1b[0m\r\n"
         self._append(session, marker)
         self._broadcast(session, marker)
@@ -1491,15 +1554,15 @@ class TerminalManager:
         elif attempt < 20:
             self.loop.call_later(0.05, self._reap_child, session, attempt + 1)
 
-    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes]]:
+    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes | StreamGap]]:
         session = self.sessions[session_id]
         if self.backend == "tmux" and session.active and session.fd < 0:
             self._spawn_tmux_client(session)
-        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
+        queue: asyncio.Queue[bytes | StreamGap] = asyncio.Queue(maxsize=1024)
         session.subscribers.add(queue)
         return b"".join(session.chunks), queue
 
-    def detach(self, session_id: str, queue: asyncio.Queue[bytes]) -> None:
+    def detach(self, session_id: str, queue: asyncio.Queue[bytes | StreamGap]) -> None:
         session = self.sessions.get(session_id)
         if session:
             session.subscribers.discard(queue)
@@ -1613,6 +1676,7 @@ class TerminalManager:
             session.exited_at = time.time()
             session.subscribers.clear()
             self.sessions.pop(session_id, None)
+            self._notify_state_change()
             return True
         if session.active:
             if session.pid > 1:
@@ -1649,6 +1713,7 @@ class TerminalManager:
             session.exited_at = time.time()
         session.subscribers.clear()
         self.sessions.pop(session_id, None)
+        self._notify_state_change()
         return True
 
     async def close(self) -> None:
