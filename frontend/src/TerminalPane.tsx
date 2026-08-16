@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, Columns2, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower, Rows2, XIcon } from 'lucide-react'
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
 import { cn } from '@/lib/utils'
@@ -45,11 +45,6 @@ type Props = {
   /** 当前全局聚焦的 pane；仅它可以在恢复渲染时自动聚焦 xterm。 */
   focused?: boolean
   previewBusyPort?: number | null
-  /** 是否显示拆分按钮(移动端与单窗格回退时为 false) */
-  canSplit?: boolean
-  canClosePane: boolean
-  onSplit?: (direction: 'row' | 'column') => void
-  onClosePane?: () => void
   onPreviewService?: (service: DetectedService) => void
   onOpenWorkspace?: () => void
 }
@@ -62,10 +57,6 @@ export default function TerminalPane({
   visible,
   focused = false,
   previewBusyPort,
-  canSplit = false,
-  canClosePane,
-  onSplit,
-  onClosePane,
   onPreviewService,
   onOpenWorkspace,
 }: Props) {
@@ -491,13 +482,13 @@ export default function TerminalPane({
 
   return (
     <div className={cn(
-      'absolute inset-0 min-h-0 min-w-0 grid-rows-[36px_minmax(0,1fr)]',
+      'absolute inset-0 min-h-0 min-w-0 grid-rows-[30px_minmax(0,1fr)] max-md:grid-rows-[28px_minmax(0,1fr)]',
       visible ? 'grid' : 'hidden',
     )}>
       <header
-        aria-label={`${deviceLabel} ${terminalLabel} 终端窗格`}
+        aria-label={`${deviceLabel} ${terminalLabel} 终端信息`}
         className={cn(
-          'relative z-20 flex min-w-0 items-center gap-2 border-b border-[#202b35] bg-[#0d1319] px-2 text-[9px] text-[#84939e]',
+          'relative z-20 flex min-w-0 items-center gap-1.5 overflow-hidden border-b border-[#202b35] bg-[#0d1319] px-2 text-[9px] text-[#84939e]',
           focused && 'border-[#315a48] bg-[#102019]',
         )}
       >
@@ -518,7 +509,7 @@ export default function TerminalPane({
               )}
             />
             <span className={cn(
-              'font-medium text-[#8e9ba5]',
+              'font-medium text-[#8e9ba5] max-md:sr-only',
               connection === 'online' && session.active && 'text-[#8fd5b3]',
               connection === 'offline' && 'text-[#e58b94]',
               !session.active && 'text-[#a7848a]',
@@ -527,8 +518,8 @@ export default function TerminalPane({
             </span>
           </span>
           {paneNumber !== null && (
-            <span className="flex-none rounded border border-[#2b3741] bg-[#111920] px-1.5 py-0.5 font-mono text-[8px] text-[#9caab4]">
-              窗格 {paneNumber}
+            <span className="flex-none rounded border border-[#2b3741] bg-[#111920] px-1 py-0.5 font-mono text-[7px] text-[#9caab4]">
+              P{paneNumber}
             </span>
           )}
           <strong className="max-w-[24%] flex-none truncate text-[10px] font-semibold text-[#d7e1e8]" title={deviceLabel}>
@@ -545,51 +536,16 @@ export default function TerminalPane({
           <span className="min-w-0 truncate font-mono text-[8px] text-[#667782]" title={workspaceLabel}>
             {workspaceLabel}
           </span>
-        </div>
-        <div className="flex flex-none items-center gap-1">
           <button
             type="button"
             onClick={onOpenWorkspace}
             aria-label="打开工作区文件"
             title="打开文件与 Artifacts"
-            className="flex h-6 cursor-pointer items-center gap-1 rounded-md border border-[#2b3842] bg-[#111920] px-1.5 font-semibold text-[#8d9aa5] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
+            className="ml-auto flex h-5 flex-none cursor-pointer items-center gap-1 rounded border border-[#2b3842] bg-[#111920] px-1.5 font-semibold text-[#8d9aa5] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
           >
             <FolderOpen className="size-3" />
             <span className="max-lg:hidden">文件</span>
           </button>
-          {canSplit && (
-            <>
-              <button
-                type="button"
-                onClick={() => onSplit?.('row')}
-                aria-label="新建同设备终端并向右分屏"
-                title="新建同设备终端并向右分屏"
-                className="grid size-6 cursor-pointer place-items-center rounded-md border border-[#2b3842] bg-[#111920] text-[#8d9aa5] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
-              >
-                <Columns2 className="size-3" />
-              </button>
-              <button
-                type="button"
-                onClick={() => onSplit?.('column')}
-                aria-label="新建同设备终端并向下分屏"
-                title="新建同设备终端并向下分屏"
-                className="grid size-6 cursor-pointer place-items-center rounded-md border border-[#2b3842] bg-[#111920] text-[#8d9aa5] transition-colors hover:border-[#315a48] hover:bg-[#15251e] hover:text-primary"
-              >
-                <Rows2 className="size-3" />
-              </button>
-            </>
-          )}
-          {canClosePane && (
-            <button
-              type="button"
-              onClick={onClosePane}
-              aria-label="关闭窗格（保留终端）"
-              title="关闭窗格（保留终端）"
-              className="grid size-6 cursor-pointer place-items-center rounded-md border border-[#2b3842] bg-[#111920] text-[#7f8c97] transition-colors hover:border-[#684049] hover:bg-[#2b1b20] hover:text-[#ff9aa4]"
-            >
-              <XIcon className="size-3" />
-            </button>
-          )}
         </div>
       </header>
       <div className="relative min-h-0 min-w-0 overflow-hidden pt-2 pr-2 pb-2 pl-3.5 max-md:pt-1.5 max-md:pr-[5px] max-md:pb-[5px] max-md:pl-[9px]">

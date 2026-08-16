@@ -65,6 +65,10 @@ export function firstLeaf(root: LayoutNode): LeafNode {
   return root.type === 'leaf' ? root : firstLeaf(root.children[0])
 }
 
+function firstLeafWithActiveTab(root: LayoutNode): LeafNode {
+  return listLeaves(root).find((leaf) => leaf.activeTab) ?? firstLeaf(root)
+}
+
 export function listLeaves(root: LayoutNode): LeafNode[] {
   if (root.type === 'leaf') return [root]
   return [...listLeaves(root.children[0]), ...listLeaves(root.children[1])]
@@ -75,34 +79,9 @@ export function listSessionIds(root: LayoutNode): string[] {
   return [...listSessionIds(root.children[0]), ...listSessionIds(root.children[1])]
 }
 
-function appendTabsToFirstLeaf(
-  root: LayoutNode,
-  tabs: string[],
-): { root: LayoutNode; leafId: string } {
-  if (root.type === 'leaf') {
-    const existing = new Set(root.tabs)
-    const additions = tabs.filter((tab) => {
-      if (existing.has(tab)) return false
-      existing.add(tab)
-      return true
-    })
-    return {
-      root: additions.length > 0 ? { ...root, tabs: [...root.tabs, ...additions] } : root,
-      leafId: root.id,
-    }
-  }
-  const appended = appendTabsToFirstLeaf(root.children[0], tabs)
-  return {
-    root: appended.root === root.children[0]
-      ? root
-      : { ...root, children: [appended.root, root.children[1]] },
-    leafId: appended.leafId,
-  }
-}
-
 /**
- * 关闭一个窗格但保留其中的会话。目标 leaf 的最近父 split 会坍缩，
- * 其全部标签追加到兄弟子树的第一个 leaf，且不改变接收 leaf 的 activeTab。
+ * 关闭一个窗格但不终止其中的后台会话。目标 leaf 的最近父 split 会
+ * 坍缩；其中 Tabs 从布局解除归属，仍可通过设备导航/搜索重新打开。
  * 根节点本身是唯一 leaf 或 leafId 无效时返回 null。
  */
 export function closeLeaf(
@@ -118,12 +97,10 @@ export function closeLeaf(
     const [first, second] = node.children
 
     if (first.type === 'leaf' && first.id === leafId) {
-      const receiver = appendTabsToFirstLeaf(second, first.tabs)
-      return { root: receiver.root, focusedLeafId: receiver.leafId }
+      return { root: second, focusedLeafId: firstLeafWithActiveTab(second).id }
     }
     if (second.type === 'leaf' && second.id === leafId) {
-      const receiver = appendTabsToFirstLeaf(first, second.tabs)
-      return { root: receiver.root, focusedLeafId: receiver.leafId }
+      return { root: first, focusedLeafId: firstLeafWithActiveTab(first).id }
     }
 
     const closedFirst = closeInNode(first)
@@ -159,23 +136,20 @@ function setActiveTab(root: LayoutNode, leafId: string, sessionId: string): Layo
 }
 
 /**
- * 从树中移除一个会话。所在 leaf 变空时整树坍缩:
- * 兄弟子树顶替父 split;整棵树空了返回 null。
+ * 从树中移除一个会话，但保留它所在的窗格。最后一个 Tab 被关闭后
+ * leaf 变为空组；只有显式 closeLeaf 才会收缩分屏结构。
  */
-export function removeSession(root: LayoutNode, sessionId: string): LayoutNode | null {
+export function removeSession(root: LayoutNode, sessionId: string): LayoutNode {
   if (root.type === 'leaf') {
     const index = root.tabs.indexOf(sessionId)
     if (index < 0) return root
     const tabs = root.tabs.filter((tab) => tab !== sessionId)
-    if (tabs.length === 0) return null
     const activeTab =
-      root.activeTab === sessionId ? tabs[Math.min(index, tabs.length - 1)] : root.activeTab
+      root.activeTab === sessionId ? tabs[Math.min(index, tabs.length - 1)] ?? null : root.activeTab
     return { ...root, tabs, activeTab }
   }
   const first = removeSession(root.children[0], sessionId)
   const second = removeSession(root.children[1], sessionId)
-  if (!first) return second
-  if (!second) return first
   if (first === root.children[0] && second === root.children[1]) return root
   return { ...root, children: [first, second] }
 }
@@ -217,10 +191,6 @@ export function activateSession(
     return { root: setActiveTab(root, currentLeaf.id, sessionId), leafId: currentLeaf.id }
   }
   let next = root
-  if (!next) {
-    const leaf = createLeaf([sessionId], sessionId)
-    return { root: leaf, leafId: leaf.id }
-  }
   const leafId = targetId && findLeaf(next, targetId) ? targetId : firstLeaf(next).id
   next = appendToLeaf(next, leafId, sessionId, true)
   return { root: next, leafId }
@@ -235,7 +205,8 @@ export function splitLeaf(
   leafId: string,
   direction: LayoutDirection,
   newSessionId: string,
-): { root: LayoutNode; newLeafId: string } {
+): { root: LayoutNode; newLeafId: string } | null {
+  if (!findLeaf(root, leafId) || leafOfSession(root, newSessionId)) return null
   const newLeaf = createLeaf([newSessionId], newSessionId)
   const replace = (node: LayoutNode): LayoutNode => {
     if (node.type === 'leaf') {
@@ -270,25 +241,17 @@ export function setRatio(root: LayoutNode, splitId: string, ratio: number): Layo
 }
 
 /**
- * 与服务器会话列表对账:剔除已消失的 id(空 leaf 自动坍缩),
- * 把树里没有的新 id 追加到第一个 leaf(不抢占 activeTab)。
+ * 与服务器会话列表对账：只剔除已消失的 id，并保留空窗格。
+ *
+ * 布局只记录用户已经打开到各 Pane 的 Tabs。服务器新发现但尚未打开
+ * 的后台会话必须继续留在设备导航/搜索中，不能自动灌入 P1。
  */
 export function reconcile(root: LayoutNode | null, sessionIds: string[]): LayoutNode | null {
-  let next: LayoutNode | null = root
-  if (next) {
-    for (const id of listSessionIds(next)) {
-      if (!sessionIds.includes(id) && next) next = removeSession(next, id)
-    }
-  }
-  if (!next) {
-    if (sessionIds.length === 0) return null
-    next = createLeaf([...sessionIds], sessionIds[0])
-    return next
-  }
-  for (const id of sessionIds) {
-    if (!leafOfSession(next, id)) {
-      next = appendToLeaf(next, firstLeaf(next).id, id, false)
-    }
+  let next = root
+  if (!next) return null
+  const validIds = new Set(sessionIds)
+  for (const id of listSessionIds(next)) {
+    if (!validIds.has(id)) next = removeSession(next, id)
   }
   return next
 }
@@ -323,15 +286,15 @@ function isValidNode(
   state.nodeIds.add(candidate.id)
   state.nodeCount += 1
   if (candidate.type === 'leaf') {
-    if (!Array.isArray(candidate.tabs) || candidate.tabs.length === 0) return false
+    if (!Array.isArray(candidate.tabs)) return false
     if (state.sessionIds.size + candidate.tabs.length > MAX_LAYOUT_SESSIONS) return false
     for (const tab of candidate.tabs) {
       if (!isNonEmptyId(tab) || state.sessionIds.has(tab)) return false
       state.sessionIds.add(tab)
     }
-    if (!isNonEmptyId(candidate.activeTab) || !candidate.tabs.includes(candidate.activeTab)) {
-      return false
-    }
+    if (candidate.tabs.length === 0) {
+      if (candidate.activeTab !== null) return false
+    } else if (!isNonEmptyId(candidate.activeTab) || !candidate.tabs.includes(candidate.activeTab)) return false
     state.leafIds.add(candidate.id)
     return true
   }

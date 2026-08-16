@@ -41,6 +41,12 @@ const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
 
 type ShowTerminalOptions = {
   replace?: boolean
+  /** 键盘在 TabStrip 中导航时保留 Tab 焦点，不抢回 xterm。 */
+  focusInput?: boolean
+  /** 聚焦空 Pane 时保留“最近终端”仅供用户后续显式 reveal。 */
+  preserveLast?: boolean
+  /** 新会话应进入的明确窗格；已有会话仍按 reveal 规则留在原窗格。 */
+  targetLeafId?: string | null
 }
 
 function initialLayout(): { layout: LayoutNode | null; focusedLeafId: string | null } {
@@ -130,6 +136,10 @@ export default function App() {
   const [forceSingle, setForceSingle] = useState(isCoarseLayout)
   const [focusMode, setFocusMode] = useState(false)
   const [splitting, setSplitting] = useState(false)
+  const [findTabRequest, setFindTabRequest] = useState<{
+    requestId: number
+    targetLeafId: string
+  } | null>(null)
   const [error, setError] = useState('')
   const [startupError, setStartupError] = useState('')
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
@@ -138,9 +148,11 @@ export default function App() {
   const layoutRef = useRef<LayoutNode | null>(layout)
   const focusedLeafIdRef = useRef<string | null>(focusedLeafId)
   const splittingRef = useRef(false)
+  const cloningRef = useRef(false)
   const loadRequestIdRef = useRef(0)
   const sessionMutationEpochRef = useRef(0)
   const sessionMutationDepthRef = useRef(0)
+  const findTabRequestIdRef = useRef(0)
 
   // 布局操作需要同步读取最新值(轮询 load 与事件处理器都会触发),
   // 因此通过 ref 镜像 + 成对 setter,避免在 setState updater 里产生副作用。
@@ -184,44 +196,80 @@ export default function App() {
     ) return
     setSessions(nextSessions)
     const route = routeFromLocation()
-    const routedSession = route.terminalId ? nextSessions.find((item) => item.id === route.terminalId) : undefined
+    const previousLayout = layoutRef.current
+    const routedLeaf = route.terminalId && previousLayout
+      ? leafOfSession(previousLayout, route.terminalId)
+      : null
+    const routedSession = route.terminalId
+      ? nextSessions.find((item) => item.id === route.terminalId)
+      : undefined
     const rememberedSession = nextSessions.find((item) => item.id === lastTerminalIdRef.current)
     const preferredSession = routedSession || rememberedSession || nextSessions[0]
-    lastTerminalIdRef.current = preferredSession?.id ?? null
-    storeTerminalId(lastTerminalIdRef.current)
-    if (route.page === 'terminals' && route.terminalId) {
-      activeIdRef.current = routedSession?.id ?? null
-      setActiveId(routedSession?.id ?? null)
-      setMissingTerminalId(routedSession ? null : route.terminalId)
-    } else if (route.page === 'terminals') {
-      activeIdRef.current = preferredSession?.id ?? null
-      setActiveId(preferredSession?.id ?? null)
-      setMissingTerminalId(null)
-      if (preferredSession) {
-        window.history.replaceState({}, '', `/terminal/${encodeURIComponent(preferredSession.id)}`)
-      }
-    } else if (activeIdRef.current && !nextSessions.some((item) => item.id === activeIdRef.current)) {
-      activeIdRef.current = null
-      setActiveId(null)
-      setMissingTerminalId(null)
-    }
-    // 布局树与服务器会话对账:剔除失效 id(空窗格自动坍缩)、
-    // 补进新会话,并让当前 active 会话留在其所在窗格中激活。
+
+    // 布局只记录已打开到各 Pane 的 Tabs：轮询仅剔除已
+    // 消失的 id，绝不把新发现的后台会话自动灌入 P1。
     const sessionIds = nextSessions.map((item) => item.id)
-    let nextLayout = reconcile(layoutRef.current, sessionIds)
-    const currentActive = activeIdRef.current
-    if (nextLayout && currentActive && sessionIds.includes(currentActive)) {
-      const activated = activateSession(nextLayout, currentActive)
+    let nextLayout = reconcile(previousLayout, sessionIds)
+    let nextFocusedLeafId = nextLayout
+      ? ((focusedLeafIdRef.current && findLeaf(nextLayout, focusedLeafIdRef.current)) || firstLeaf(nextLayout)).id
+      : null
+    let nextActiveId: string | null = null
+    let nextMissingId: string | null = null
+
+    if (route.page === 'terminals' && route.terminalId && routedSession) {
+      // 深链、设备页、设备世界和全局搜索统一为 reveal：已归属
+      // 的 Tab 只在原 Pane 激活；未归属的会话才进入当前 Pane。
+      const activated = activateSession(nextLayout, routedSession.id, { leafId: nextFocusedLeafId })
       nextLayout = activated.root
-      setFocusedLeafState(activated.leafId)
-    } else if (nextLayout) {
-      if (!focusedLeafIdRef.current || !findLeaf(nextLayout, focusedLeafIdRef.current)) {
-        setFocusedLeafState(firstLeaf(nextLayout).id)
+      nextFocusedLeafId = activated.leafId
+      nextActiveId = routedSession.id
+    } else if (route.page === 'terminals' && route.terminalId) {
+      if (routedLeaf && nextLayout) {
+        // 当前已打开的后台会话被外部关闭：在原 Pane 选中对账后的
+        // 相邻 Tab，而不是把它误报为一个新的无效深链。
+        const fallbackLeaf = findLeaf(nextLayout, routedLeaf.id)
+          || (nextFocusedLeafId ? findLeaf(nextLayout, nextFocusedLeafId) : null)
+          || firstLeaf(nextLayout)
+        nextFocusedLeafId = fallbackLeaf.id
+        nextActiveId = fallbackLeaf.activeTab
+      } else {
+        nextMissingId = route.terminalId
       }
-    } else {
-      setFocusedLeafState(null)
+    } else if (route.page === 'terminals') {
+      if (nextLayout) {
+        const focusedLeaf = (nextFocusedLeafId && findLeaf(nextLayout, nextFocusedLeafId)) || firstLeaf(nextLayout)
+        nextFocusedLeafId = focusedLeaf.id
+        nextActiveId = focusedLeaf.activeTab
+      } else if (preferredSession) {
+        // 仅在完全没有 workspace 布局时创建 P1。已持久化的空 Pane
+        // 是用户显式关闭最后一个 Tab 的结果，不会被自动填充。
+        const activated = activateSession(null, preferredSession.id)
+        nextLayout = activated.root
+        nextFocusedLeafId = activated.leafId
+        nextActiveId = preferredSession.id
+      }
     }
+
     setLayoutState(nextLayout)
+    setFocusedLeafState(nextFocusedLeafId)
+    activeIdRef.current = nextActiveId
+    setActiveId(nextActiveId)
+    setMissingTerminalId(nextMissingId)
+    setWorkspaceSessionId((current) => current === null ? null : nextActiveId)
+
+    if (nextActiveId) {
+      lastTerminalIdRef.current = nextActiveId
+      storeTerminalId(nextActiveId)
+    } else if (!nextSessions.some((item) => item.id === lastTerminalIdRef.current)) {
+      // 空 Pane 不清除最近记录，但已不存在的记录要换成一个有效 fallback。
+      lastTerminalIdRef.current = preferredSession?.id ?? null
+      storeTerminalId(lastTerminalIdRef.current)
+    }
+
+    if (route.page === 'terminals' && !nextMissingId) {
+      const path = nextActiveId ? `/terminal/${encodeURIComponent(nextActiveId)}` : '/terminals'
+      if (window.location.pathname !== path) window.history.replaceState({}, '', path)
+    }
   }, [])
 
   useEffect(() => {
@@ -298,57 +346,121 @@ export default function App() {
   useEffect(() => {
     const onPopState = () => {
       const route = routeFromLocation()
-      activeIdRef.current = route.terminalId
-      if (route.terminalId) {
-        lastTerminalIdRef.current = route.terminalId
-        storeTerminalId(route.terminalId)
+      let nextId: string | null = null
+      let nextMissingId: string | null = null
+
+      if (route.page === 'terminals' && route.terminalId) {
+        const session = sessions.find((item) => item.id === route.terminalId)
+        if (session) {
+          const root = layoutRef.current
+          const currentLeaf = root ? leafOfSession(root, session.id) : null
+          const activated = currentLeaf
+            ? activateSession(root, session.id)
+            : activateSession(root, session.id, { leafId: focusedLeafIdRef.current })
+          setLayoutState(activated.root)
+          setFocusedLeafState(activated.leafId)
+          nextId = session.id
+        } else {
+          nextMissingId = route.terminalId
+        }
+      } else if (route.page === 'terminals') {
+        const root = layoutRef.current
+        if (root) {
+          const leaf = (focusedLeafIdRef.current && findLeaf(root, focusedLeafIdRef.current))
+            || firstLeaf(root)
+          setFocusedLeafState(leaf.id)
+          nextId = leaf.activeTab
+        } else {
+          const preferredSession = sessions.find((item) => item.id === lastTerminalIdRef.current)
+            || sessions[0]
+          if (preferredSession) {
+            const activated = activateSession(null, preferredSession.id)
+            setLayoutState(activated.root)
+            setFocusedLeafState(activated.leafId)
+            nextId = preferredSession.id
+          }
+        }
       }
-      setActiveId(route.terminalId)
-      setWorkspaceSessionId((current) => current === null ? null : route.terminalId)
-      setMissingTerminalId(null)
+
+      // History navigation is an in-memory transition first. A failed refresh
+      // must not leave URL/active/focused leaf split across three states.
+      activeIdRef.current = nextId
+      setActiveId(nextId)
+      setWorkspaceSessionId((current) => current === null ? null : nextId)
+      setMissingTerminalId(nextMissingId)
       setPage(route.page)
+      if (nextId) {
+        lastTerminalIdRef.current = nextId
+        storeTerminalId(nextId)
+        focusTerminalInput(nextId)
+      }
       void load().catch(() => undefined)
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [load])
+  }, [load, sessions])
 
   const showTerminal = (id: string | null, options: ShowTerminalOptions = {}) => {
-    const { replace = false } = options
+    const { replace = false, focusInput = true, preserveLast = false, targetLeafId } = options
     activeIdRef.current = id; setActiveId(id); setMissingTerminalId(null); setPage('terminals')
     setWorkspaceSessionId((current) => current === null ? null : id)
-    lastTerminalIdRef.current = id
-    storeTerminalId(id)
+    if (id || !preserveLast) {
+      lastTerminalIdRef.current = id
+      storeTerminalId(id)
+    }
     if (id) {
       // 所有入口都遵循同一条 reveal 语义：已归属某个窗格的会话
       // 只在原窗格激活并聚焦，不再因“从哪里点击”而暗中跨窗格搬移。
       // 只有尚未进入布局的新会话才放入当前聚焦窗格。
       const root = layoutRef.current
       const currentLeaf = root ? leafOfSession(root, id) : null
+      const requestedTarget = root && targetLeafId && findLeaf(root, targetLeafId)
+        ? targetLeafId
+        : focusedLeafIdRef.current
       const activated = currentLeaf
         ? activateSession(root, id)
-        : activateSession(root, id, { leafId: focusedLeafIdRef.current })
+        : activateSession(root, id, { leafId: requestedTarget })
       setLayoutState(activated.root)
       setFocusedLeafState(activated.leafId)
     }
     const path = id ? `/terminal/${encodeURIComponent(id)}` : '/terminals'
     if (window.location.pathname !== path) window.history[replace ? 'replaceState' : 'pushState']({}, '', path)
-    if (id) focusTerminalInput(id)
+    if (id && focusInput) focusTerminalInput(id)
   }
   const focusLeaf = (leafId: string) => {
-    if (focusedLeafIdRef.current === leafId) return
-    setFocusedLeafState(leafId)
     const leaf = layoutRef.current ? findLeaf(layoutRef.current, leafId) : null
+    if (!leaf) return
+    if (focusedLeafIdRef.current !== leafId) setFocusedLeafState(leafId)
     const id = leaf?.activeTab ?? null
-    if (id && id !== activeIdRef.current) {
-      activeIdRef.current = id
-      setActiveId(id)
+    if (id === activeIdRef.current) return
+    activeIdRef.current = id
+    setActiveId(id)
+    setMissingTerminalId(null)
+    setWorkspaceSessionId((current) => current === null ? null : id)
+    if (id) {
       lastTerminalIdRef.current = id
       storeTerminalId(id)
-      setWorkspaceSessionId((current) => current === null ? null : id)
       const path = `/terminal/${encodeURIComponent(id)}`
       if (window.location.pathname !== path) window.history.replaceState({}, '', path)
+    } else if (window.location.pathname !== '/terminals') {
+      // 空 Pane 也是一个可聚焦的 editor group。它没有选中 Tab，
+      // 因此全局 active 与 URL 都必须同步清空。
+      window.history.replaceState({}, '', '/terminals')
     }
+  }
+  const activatePaneTab = (
+    sessionId: string,
+    leafId: string,
+    options: { focusInput?: boolean } = {},
+  ) => {
+    const root = layoutRef.current
+    const leaf = root ? findLeaf(root, leafId) : null
+    // Pane-local 切换是严格 select，不具有 attach/move 副作用。
+    if (!leaf?.tabs.includes(sessionId)) return
+    showTerminal(sessionId, {
+      focusInput: options.focusInput,
+      replace: options.focusInput === false,
+    })
   }
   const splitTerminal = async (source: TerminalSession, leafId: string, direction: LayoutDirection) => {
     if (splittingRef.current) return
@@ -363,18 +475,21 @@ export default function App() {
       setSessions((current) => current.some((item) => item.id === session.id)
         ? current.map((item) => item.id === session.id ? session : item)
         : [...current, session])
-      // A slow SFTP bind can make the new server session visible to a poll
-      // before this POST returns. Remove any optimistic/reconciled occurrence
-      // before inserting the new leaf so one session always has one xterm/WS.
-      const cleanLayout = layoutRef.current
-        ? removeSession(layoutRef.current, session.id)
-        : null
-      if (cleanLayout && findLeaf(cleanLayout, leafId)) {
-        const result = splitLeaf(cleanLayout, leafId, direction, session.id)
-        setLayoutState(result.root)
-        setFocusedLeafState(result.newLeafId)
+      // mutation epoch 会阻止 POST 期间的轮询改写 layout，因此可直接
+      // 对用户点击时的 leaf 分屏，不做 remove + reinsert 的非原子组合。
+      const currentLayout = layoutRef.current
+      if (currentLayout && findLeaf(currentLayout, leafId)) {
+        const result = splitLeaf(currentLayout, leafId, direction, session.id)
+        if (result) {
+          setLayoutState(result.root)
+          setFocusedLeafState(result.newLeafId)
+        } else {
+          const activated = activateSession(currentLayout, session.id, { leafId })
+          setLayoutState(activated.root)
+          setFocusedLeafState(activated.leafId)
+        }
       } else {
-        const activated = activateSession(cleanLayout, session.id, { leafId: focusedLeafIdRef.current })
+        const activated = activateSession(currentLayout, session.id, { leafId: focusedLeafIdRef.current })
         setLayoutState(activated.root)
         setFocusedLeafState(activated.leafId)
       }
@@ -413,12 +528,23 @@ export default function App() {
       const path = `/terminal/${encodeURIComponent(nextId)}`
       if (window.location.pathname !== path) window.history.replaceState({}, '', path)
       focusTerminalInput(nextId)
+    } else if (window.location.pathname !== '/terminals') {
+      window.history.replaceState({}, '', '/terminals')
     }
   }
   const navigate = (nextPage: MainPage, replace = false) => {
     if (nextPage === 'terminals') {
-      const preferredSession = sessions.find((item) => item.id === lastTerminalIdRef.current) || sessions[0]
-      showTerminal(preferredSession?.id ?? null, { replace })
+      const root = layoutRef.current
+      if (root) {
+        const leaf = (focusedLeafIdRef.current && findLeaf(root, focusedLeafIdRef.current)) || firstLeaf(root)
+        setFocusedLeafState(leaf.id)
+        // 恢复持久化 workspace：聚焦 Pane 若为空，保持为空，不用
+        // LAST_TERMINAL_KEY 把一个后台会话暗中填回。
+        showTerminal(leaf.activeTab, { replace, preserveLast: true })
+      } else {
+        const preferredSession = sessions.find((item) => item.id === lastTerminalIdRef.current) || sessions[0]
+        showTerminal(preferredSession?.id ?? null, { replace })
+      }
       return
     }
     activeIdRef.current = null; setActiveId(null); setMissingTerminalId(null); setPage(nextPage)
@@ -426,12 +552,14 @@ export default function App() {
     const path = nextPage === 'setup' ? '/setup' : '/'
     if (window.location.pathname !== path) window.history[replace ? 'replaceState' : 'pushState']({}, '', path)
   }
-  const openTerminal = async (device: Device) => {
+  const openTerminal = async (device: Device, targetLeafId?: string | null) => {
+    const capturedTargetLeafId = targetLeafId ?? focusedLeafIdRef.current
     beginSessionMutation()
     setBusyId(device.id); setError('')
     try {
       const session = await api.createDeviceTerminal(device.id, device.name)
-      setSessions((current) => current.some((item) => item.id === session.id) ? current : [...current, session]); showTerminal(session.id)
+      setSessions((current) => current.some((item) => item.id === session.id) ? current : [...current, session])
+      showTerminal(session.id, { targetLeafId: capturedTargetLeafId })
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法打开终端') }
     finally {
       finishSessionMutation()
@@ -439,7 +567,10 @@ export default function App() {
       void load().catch(() => undefined)
     }
   }
-  const cloneTerminal = async (source: TerminalSession) => {
+  const cloneTerminal = async (source: TerminalSession, targetLeafId?: string | null) => {
+    if (cloningRef.current) return
+    const capturedTargetLeafId = targetLeafId ?? focusedLeafIdRef.current
+    cloningRef.current = true
     beginSessionMutation()
     setCloningId(source.id); setError('')
     try {
@@ -450,9 +581,11 @@ export default function App() {
             source.workspace?.root,
           )
         : await api.createTerminal(source.name, source.workspace?.root)
-      setSessions((current) => current.some((item) => item.id === session.id) ? current : [...current, session]); showTerminal(session.id)
+      setSessions((current) => current.some((item) => item.id === session.id) ? current : [...current, session])
+      showTerminal(session.id, { targetLeafId: capturedTargetLeafId })
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法克隆终端') }
     finally {
+      cloningRef.current = false
       finishSessionMutation()
       setCloningId(null)
       void load().catch(() => undefined)
@@ -467,7 +600,8 @@ export default function App() {
       await api.deleteTerminal(session.id)
       setSessions((current) => current.filter((item) => item.id !== session.id))
       if (workspaceSessionId === session.id) setWorkspaceSessionId(null)
-      // 从布局树移除:同 leaf 的相邻标签自动递补为 activeTab,空窗格坍缩
+      // 从布局树移除：同 leaf 的相邻标签自动递补；最后一个
+      // Tab 关闭后保留空 Pane，只有显式“关闭窗格”才收缩分屏。
       const nextLayout = layoutRef.current ? removeSession(layoutRef.current, session.id) : null
       setLayoutState(nextLayout)
       if (activeIdRef.current === session.id) {
@@ -559,33 +693,51 @@ export default function App() {
             focusedLeafId={focusedLeafId}
             focusMode={focusMode}
             coarseMode={forceSingle}
+            findTabRequest={findTabRequest}
+            onFindTabRequestHandled={(requestId) => {
+              setFindTabRequest((current) => current?.requestId === requestId ? null : current)
+            }}
             onToggleFocusMode={() => {
               setFocusMode((current) => !current)
               if (activeId) focusTerminalInput(activeId)
             }}
-            onSelect={(id) => showTerminal(id)}
-            onClose={setCloseTarget}
+            onSelect={(id, targetLeafId) => showTerminal(id, { targetLeafId })}
             onClone={(source) => void cloneTerminal(source)}
             onPreview={(source) => setPreviewTarget({ deviceId: source.device_id || undefined, terminalId: source.id })}
           />
         )}
         <div className="relative min-h-0 min-w-0 overflow-auto">
-          {sessions.length > 0 && (
+          {layout && (
             <div className={cn(
               'absolute inset-3 overflow-hidden rounded-[10px] border border-[#222d37] bg-[#0b0f14] shadow-[0_20px_55px_#0006] max-md:inset-1.5',
-              !(page === 'terminals' && activeSession) && 'invisible pointer-events-none',
+              !(page === 'terminals' && !missingTerminalId) && 'invisible pointer-events-none',
             )}>
               <TerminalGrid
                 layout={layout}
                 devices={devices}
                 sessions={sessions}
-                pageVisible={page === 'terminals'}
+                pageVisible={page === 'terminals' && !missingTerminalId}
                 activeId={activeId}
                 focusedLeafId={focusedLeafId}
                 forceSingle={forceSingle || focusMode}
                 previewBusy={previewBusy}
                 splitting={splitting}
+                creatingTab={cloningId !== null}
                 onFocusLeaf={focusLeaf}
+                onActivateTab={(sessionId, leafId, options) => {
+                  activatePaneTab(sessionId, leafId, { focusInput: options.focusTerminal })
+                }}
+                onNewTab={(source, leafId) => void cloneTerminal(source, leafId)}
+                onFindTab={(leafId) => {
+                  if (sessions.length === 0) {
+                    setError('当前没有可添加的后台终端，请先在设备页新建。')
+                    navigate('devices')
+                    return
+                  }
+                  findTabRequestIdRef.current += 1
+                  setFindTabRequest({ requestId: findTabRequestIdRef.current, targetLeafId: leafId })
+                }}
+                onCloseTerminal={setCloseTarget}
                 onRatio={(splitId, ratio) => {
                   if (layoutRef.current) setLayoutState(setRatio(layoutRef.current, splitId, ratio))
                 }}
@@ -612,7 +764,7 @@ export default function App() {
             />
           )}
           {page === 'terminals' ? (
-            !activeSession && (
+            (!layout || Boolean(missingTerminalId)) && (
               <TerminalEmpty
                 missingTerminalId={missingTerminalId}
                 hasSessions={sessions.length > 0}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Columns2, LoaderCircle, Plus, Rows2, Search, XIcon } from 'lucide-react'
 
 import type { DetectedService, Device, TerminalSession } from '@/api'
 import TerminalPane from '@/TerminalPane'
@@ -27,7 +28,20 @@ type Props = {
   forceSingle: boolean
   previewBusy: { terminalId: string; port: number } | null
   splitting: boolean
+  creatingTab: boolean
   onFocusLeaf: (leafId: string) => void
+  /** 激活指定 leaf 内的标签，并把全局焦点同步到该 leaf。 */
+  onActivateTab: (
+    sessionId: string,
+    leafId: string,
+    options: { focusTerminal: boolean },
+  ) => void
+  /** 在指定 leaf 内按当前标签的设备/工作区 profile 新建标签。 */
+  onNewTab: (source: TerminalSession, leafId: string) => void
+  /** 为指定 leaf 打开终端查找器；空 leaf 可借此选择已有会话。 */
+  onFindTab: (leafId: string) => void
+  /** 关闭终端后台会话；调用侧负责确认和布局收缩。 */
+  onCloseTerminal: (session: TerminalSession) => void
   onRatio: (splitId: string, ratio: number) => void
   onSplit: (session: TerminalSession, leafId: string, direction: LayoutDirection) => void
   onClosePane: (leafId: string) => void
@@ -38,6 +52,11 @@ type Props = {
 type Rect = { left: number; top: number; width: number; height: number }
 type LeafPlacement = { leaf: LeafNode; rect: Rect }
 type SashPlacement = { split: SplitNode; rect: Rect }
+type TerminalPaneTab = {
+  session: TerminalSession
+  terminalLabel: string
+  workspaceLabel: string
+}
 
 const FULL_RECT: Rect = { left: 0, top: 0, width: 1, height: 1 }
 const MAX_CACHED_TERMINALS = 8
@@ -206,6 +225,221 @@ function SplitSash({
   )
 }
 
+function PaneTabStrip({
+  paneNumber,
+  tabs,
+  activeTabId,
+  focused,
+  canSplit,
+  canClosePane,
+  creatingTab,
+  onActivateTab,
+  onCloseTerminal,
+  onNewTab,
+  onFindTab,
+  onSplit,
+  onClosePane,
+}: {
+  paneNumber: number
+  tabs: TerminalPaneTab[]
+  activeTabId: string | null
+  focused: boolean
+  canSplit: boolean
+  canClosePane: boolean
+  creatingTab: boolean
+  onActivateTab: (sessionId: string, options: { focusTerminal: boolean }) => void
+  onCloseTerminal: (session: TerminalSession) => void
+  onNewTab: () => void
+  onFindTab: () => void
+  onSplit: (direction: LayoutDirection) => void
+  onClosePane: () => void
+}) {
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>())
+
+  useEffect(() => {
+    if (!activeTabId) return
+    const frame = window.requestAnimationFrame(() => {
+      tabRefs.current.get(activeTabId)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+        inline: 'nearest',
+      })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeTabId])
+
+  const activateByKeyboard = (currentIndex: number, key: string) => {
+    if (!tabs.length) return
+    let nextIndex: number | null = null
+    if (key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length
+    if (key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length
+    if (key === 'Home') nextIndex = 0
+    if (key === 'End') nextIndex = tabs.length - 1
+    if (nextIndex === null) return
+    const targetId = tabs[nextIndex].session.id
+    onActivateTab(targetId, { focusTerminal: false })
+    window.requestAnimationFrame(() => {
+      tabRefs.current.get(targetId)?.focus({ preventScroll: true })
+    })
+  }
+
+  return (
+    <header
+      aria-label={`窗格 ${paneNumber} 终端栏`}
+      className={cn(
+        'pointer-events-auto flex h-[34px] min-w-0 items-stretch border-b border-[#26313a] bg-[#0a1015] max-md:h-8',
+        focused && 'border-[#315a48] bg-[#0d1713]',
+      )}
+    >
+      <span
+        aria-label={`窗格 ${paneNumber}`}
+        className="grid min-w-9 flex-none place-items-center border-r border-[#26313a] bg-[#10171d] font-mono text-[8px] font-semibold text-[#8d9ba5]"
+      >
+        P{paneNumber}
+      </span>
+      <div
+        role="tablist"
+        aria-orientation="horizontal"
+        aria-label={`窗格 ${paneNumber} 终端标签`}
+        data-terminal-pane-tabs={paneNumber}
+        className="flex min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden [scrollbar-color:#34404c_transparent] [scrollbar-width:thin]"
+      >
+        {tabs.map((tab, index) => {
+          const active = tab.session.id === activeTabId
+          const tabDeviceLabel = tab.session.device_name || '本机'
+          const runtimeLabel = tab.session.active ? '运行中' : '已退出'
+          return (
+            <span
+              key={tab.session.id}
+              role="presentation"
+              className={cn(
+                'flex min-w-[148px] max-w-[260px] flex-none items-stretch border-r border-[#25303a] bg-[#0c1218] text-[#71808b]',
+                active && 'bg-[#15231d] text-[#dce8e1] shadow-[inset_0_-2px_var(--color-primary)]',
+              )}
+            >
+              <button
+                ref={(node) => {
+                  if (node) tabRefs.current.set(tab.session.id, node)
+                  else tabRefs.current.delete(tab.session.id)
+                }}
+                type="button"
+                role="tab"
+                id={`terminal-tab-${tab.session.id}`}
+                data-terminal-tab-id={tab.session.id}
+                aria-selected={active}
+                aria-controls={`terminal-panel-${tab.session.id}`}
+                tabIndex={active || (!activeTabId && index === 0) ? 0 : -1}
+                aria-label={`窗格 ${paneNumber} 激活 ${tabDeviceLabel} ${tab.terminalLabel} ${tab.session.id.slice(0, 8)} ${runtimeLabel}`}
+                title={`${tabDeviceLabel} · ${tab.terminalLabel} · ${tab.workspaceLabel} · ${tab.session.id} · ${runtimeLabel}`}
+                onClick={() => onActivateTab(tab.session.id, { focusTerminal: true })}
+                onKeyDown={(event) => {
+                  if (event.key === 'Delete') {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onCloseTerminal(tab.session)
+                    return
+                  }
+                  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  activateByKeyboard(index, event.key)
+                }}
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 bg-transparent px-2 text-left hover:bg-[#17212a] hover:text-[#d2dde4] focus-visible:outline-1 focus-visible:outline-primary"
+              >
+                <i
+                  aria-hidden="true"
+                  className={cn(
+                    'size-1.5 flex-none rounded-full bg-[#7b555d]',
+                    tab.session.active && 'bg-primary shadow-[0_0_7px_#77f2b477]',
+                  )}
+                />
+                <span className="min-w-0 truncate text-[9px] font-semibold">
+                  {tabDeviceLabel} / {tab.terminalLabel}
+                </span>
+                <code className="flex-none font-mono text-[7px] text-[#60717d]">
+                  {tab.session.id.slice(0, 6)}
+                </code>
+              </button>
+              <button
+                type="button"
+                aria-label={`关闭窗格 ${paneNumber} 的终端 ${tabDeviceLabel} ${tab.terminalLabel}`}
+                title={`关闭终端并结束后台会话 · ${tab.session.id.slice(0, 8)}`}
+                onClick={() => onCloseTerminal(tab.session)}
+                className="grid w-6 flex-none cursor-pointer place-items-center bg-transparent text-[#52616c] hover:bg-[#352027] hover:text-[#ff929d] focus-visible:outline-1 focus-visible:outline-[#ff929d]"
+              >
+                <XIcon className="size-2.5" />
+              </button>
+            </span>
+          )
+        })}
+        {!tabs.length && (
+          <span aria-hidden="true" className="flex min-w-24 flex-1 items-center px-3 font-mono text-[8px] text-[#5e6d78]">
+            空窗格
+          </span>
+        )}
+      </div>
+      <div className="flex flex-none items-center gap-0.5 border-l border-[#26313a] bg-[#0f161c] px-1">
+        {!tabs.length ? (
+          <button
+            type="button"
+            onClick={onFindTab}
+            aria-label={`向窗格 ${paneNumber} 添加终端`}
+            title="选择未归属终端；没有可选会话时前往设备页新建"
+            className="flex h-6 cursor-pointer items-center gap-1 rounded px-1.5 text-[8px] font-semibold text-[#82918c] hover:bg-[#193025] hover:text-primary"
+          >
+            <Search className="size-3.5" />
+            <span className="max-lg:hidden">添加终端</span>
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onNewTab}
+            disabled={creatingTab}
+            aria-label={`在窗格 ${paneNumber} 新建终端标签`}
+            title="在当前窗格新建同设备、同工作区终端"
+            className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
+          >
+            {creatingTab ? <LoaderCircle className="size-3 animate-spin" /> : <Plus className="size-3.5" />}
+          </button>
+        )}
+        {canSplit && (
+          <>
+            <button
+              type="button"
+              onClick={() => onSplit('row')}
+              aria-label={`从窗格 ${paneNumber} 新建同设备终端并向右分屏`}
+              title="新建同设备终端并向右分屏"
+              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary"
+            >
+              <Columns2 className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => onSplit('column')}
+              aria-label={`从窗格 ${paneNumber} 新建同设备终端并向下分屏`}
+              title="新建同设备终端并向下分屏"
+              className="grid size-6 cursor-pointer place-items-center rounded text-[#82918c] hover:bg-[#193025] hover:text-primary"
+            >
+              <Rows2 className="size-3.5" />
+            </button>
+          </>
+        )}
+        {canClosePane && (
+          <button
+            type="button"
+            onClick={onClosePane}
+            aria-label={`关闭窗格 ${paneNumber}（保留终端）`}
+            title="关闭窗格（保留终端）"
+            className="grid size-6 cursor-pointer place-items-center rounded text-[#75838e] hover:bg-[#2b1b20] hover:text-[#ff9aa4]"
+          >
+            <XIcon className="size-3" />
+          </button>
+        )}
+      </div>
+    </header>
+  )
+}
+
 /**
  * 可见终端和最近使用的少量终端保持稳定挂载，因此日常切换仍保留
  * xterm、选区和滚动位置。超出热缓存的隐藏会话会卸载 xterm/WS，
@@ -222,7 +456,12 @@ export function TerminalGrid(props: Props) {
     forceSingle,
     previewBusy,
     splitting,
+    creatingTab,
     onFocusLeaf,
+    onActivateTab,
+    onNewTab,
+    onFindTab,
+    onCloseTerminal,
     onRatio,
     onSplit,
     onClosePane,
@@ -230,27 +469,75 @@ export function TerminalGrid(props: Props) {
     onOpenWorkspace,
   } = props
   const rootRef = useRef<HTMLDivElement>(null)
-  const { sessionPlacements, sashes, leafNumbers } = useMemo(() => {
+  const { leafPlacements, sessionPlacements, sashes, leafNumbers } = useMemo(() => {
     const placements = new Map<string, LeafPlacement>()
     const numbers = new Map<string, number>()
+    const leaves: LeafPlacement[] = []
     const nextSashes: SashPlacement[] = []
     if (layout) {
-      const leaves: LeafPlacement[] = []
       collectPlacements(layout, FULL_RECT, leaves, nextSashes)
       for (const [index, placement] of leaves.entries()) {
         numbers.set(placement.leaf.id, index + 1)
         for (const sessionId of placement.leaf.tabs) placements.set(sessionId, placement)
       }
     }
-    return { sessionPlacements: placements, sashes: nextSashes, leafNumbers: numbers }
+    return {
+      leafPlacements: leaves,
+      sessionPlacements: placements,
+      sashes: nextSashes,
+      leafNumbers: numbers,
+    }
   }, [layout])
   const singleMode = forceSingle || !layout
   const terminalDisplays = useMemo(() => buildTerminalDisplayMap(sessions), [sessions])
+  const deviceMap = useMemo(
+    () => new Map(devices.map((device) => [device.id, device])),
+    [devices],
+  )
+  const displaySessions = useMemo(() => new Map(sessions.map((session) => {
+    const currentDevice = session.device_id ? deviceMap.get(session.device_id) : null
+    return [
+      session.id,
+      currentDevice && currentDevice.name !== session.device_name
+        ? { ...session, device_name: currentDevice.name }
+        : session,
+    ] as const
+  })), [deviceMap, sessions])
+  const paneTabsByLeafId = useMemo(() => {
+    const result = new Map<string, TerminalPaneTab[]>()
+    if (!layout) return result
+    for (const leaf of listLeaves(layout)) {
+      const tabs = leaf.tabs.flatMap((sessionId) => {
+        const tabSession = displaySessions.get(sessionId)
+        if (!tabSession) return []
+        const display = terminalDisplays.get(sessionId)
+        return [{
+          session: tabSession,
+          terminalLabel: display?.label || tabSession.name || '终端',
+          workspaceLabel: tabSession.workspace?.root || tabSession.cwd || display?.workspaceLabel || '默认目录',
+        }]
+      })
+      result.set(leaf.id, tabs)
+    }
+    return result
+  }, [displaySessions, layout, terminalDisplays])
+  const singleLeafPlacement = useMemo(() => {
+    if (!singleMode || !leafPlacements.length) return null
+    return leafPlacements.find((placement) => placement.leaf.id === focusedLeafId)
+      || (activeId ? sessionPlacements.get(activeId) : null)
+      || leafPlacements[0]
+  }, [activeId, focusedLeafId, leafPlacements, sessionPlacements, singleMode])
+  const paneFramePlacements = singleMode
+    ? (singleLeafPlacement ? [{ leaf: singleLeafPlacement.leaf, rect: FULL_RECT }] : [])
+    : leafPlacements
+  const singleVisibleSessionId = singleMode
+    ? singleLeafPlacement?.leaf.activeTab ?? (!layout ? activeId : null)
+    : null
   const visibleSessionIds = useMemo(() => {
     const ids = new Set<string>()
     if (!pageVisible) return ids
     if (singleMode) {
-      if (activeId) ids.add(activeId)
+      if (singleVisibleSessionId) ids.add(singleVisibleSessionId)
       return ids
     }
     if (layout) {
@@ -259,7 +546,7 @@ export function TerminalGrid(props: Props) {
       }
     }
     return ids
-  }, [activeId, layout, pageVisible, singleMode])
+  }, [layout, pageVisible, singleMode, singleVisibleSessionId])
   const visibleKey = [...visibleSessionIds].join('\u0000')
   const [cachedSessionIds, setCachedSessionIds] = useState<string[]>([])
 
@@ -302,21 +589,21 @@ export function TerminalGrid(props: Props) {
       className="relative h-full w-full min-h-0 min-w-0 overflow-hidden"
     >
       {mountedSessions.map((session) => {
-        const currentDevice = session.device_id
-          ? devices.find((device) => device.id === session.device_id)
-          : null
-        const displaySession = currentDevice && currentDevice.name !== session.device_name
-          ? { ...session, device_name: currentDevice.name }
-          : session
+        const displaySession = displaySessions.get(session.id) || session
+        const terminalDisplay = terminalDisplays.get(session.id)
         const placement = sessionPlacements.get(session.id)
         const rect = singleMode ? FULL_RECT : placement?.rect ?? FULL_RECT
         const visible = pageVisible && (singleMode
-          ? session.id === activeId
+          ? session.id === singleVisibleSessionId
           : placement?.leaf.activeTab === session.id)
         const leafId = placement?.leaf.id ?? null
         return (
           <div
             key={session.id}
+            id={leafId ? `terminal-panel-${session.id}` : undefined}
+            role={leafId ? 'tabpanel' : undefined}
+            aria-labelledby={leafId ? `terminal-tab-${session.id}` : undefined}
+            aria-hidden={!visible}
             data-terminal-id={session.id}
             data-terminal-leaf-id={leafId ?? undefined}
             data-terminal-visible={visible ? 'true' : 'false'}
@@ -330,27 +617,85 @@ export function TerminalGrid(props: Props) {
               height: percent(rect.height),
               pointerEvents: visible ? 'auto' : 'none',
             }}
+            className="absolute min-h-0 min-w-0 overflow-hidden"
+          >
+            <div className="absolute inset-x-0 top-[34px] bottom-0 min-h-0 min-w-0 max-md:top-8">
+              <TerminalPane
+                session={displaySession}
+                terminalLabel={terminalDisplay?.label || session.name || '终端'}
+                workspaceLabel={session.workspace?.root || session.cwd || terminalDisplay?.workspaceLabel || '默认目录'}
+                paneNumber={leafId ? (leafNumbers.get(leafId) ?? null) : null}
+                visible={visible}
+                focused={visible && session.id === activeId}
+                previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
+                onPreviewService={(service) => onPreviewService(displaySession, service)}
+                onOpenWorkspace={() => onOpenWorkspace(displaySession)}
+              />
+            </div>
+          </div>
+        )
+      })}
+      {pageVisible && paneFramePlacements.map((placement, index) => {
+        const { leaf, rect } = placement
+        const paneNumber = leafNumbers.get(leaf.id) ?? index + 1
+        const tabs = paneTabsByLeafId.get(leaf.id) || []
+        const activeTab = tabs.find((tab) => tab.session.id === leaf.activeTab) || tabs[0] || null
+        const focused = leaf.id === focusedLeafId || (singleMode && singleLeafPlacement?.leaf.id === leaf.id)
+        return (
+          <section
+            key={leaf.id}
+            data-terminal-pane-root="true"
+            data-terminal-leaf-id={leaf.id}
+            data-terminal-pane-number={paneNumber}
+            data-terminal-pane-empty={tabs.length === 0 ? 'true' : 'false'}
+            aria-label={`终端窗格 ${paneNumber}`}
+            style={{
+              left: percent(rect.left),
+              top: percent(rect.top),
+              width: percent(rect.width),
+              height: percent(rect.height),
+            }}
             className={cn(
-              'absolute min-h-0 min-w-0 overflow-hidden',
-              !singleMode && visible && leafId === focusedLeafId && 'ring-2 ring-inset ring-[#4d9b74]',
+              'pointer-events-none absolute z-20 min-h-0 min-w-0 overflow-hidden',
+              focused && 'ring-2 ring-inset ring-[#4d9b74]',
             )}
           >
-            <TerminalPane
-              session={displaySession}
-              terminalLabel={terminalDisplays.get(session.id)?.label || session.name || '终端'}
-              workspaceLabel={session.workspace?.root || session.cwd || terminalDisplays.get(session.id)?.workspaceLabel || '默认目录'}
-              paneNumber={!singleMode && leafId ? (leafNumbers.get(leafId) ?? null) : null}
-              visible={visible}
-              focused={visible && session.id === activeId}
-              previewBusyPort={previewBusy?.terminalId === session.id ? previewBusy.port : null}
-              canSplit={!singleMode && !splitting && Boolean(leafId)}
-              canClosePane={!singleMode && sashes.length > 0 && Boolean(leafId)}
-              onSplit={(direction) => { if (leafId) onSplit(session, leafId, direction) }}
-              onClosePane={() => { if (leafId) onClosePane(leafId) }}
-              onPreviewService={(service) => onPreviewService(session, service)}
-              onOpenWorkspace={() => onOpenWorkspace(session)}
+            <PaneTabStrip
+              paneNumber={paneNumber}
+              tabs={tabs}
+              activeTabId={activeTab?.session.id ?? null}
+              focused={focused}
+              canSplit={!singleMode && !splitting && Boolean(activeTab)}
+              canClosePane={!singleMode && sashes.length > 0}
+              creatingTab={creatingTab}
+              onActivateTab={(sessionId, options) => onActivateTab(sessionId, leaf.id, options)}
+              onCloseTerminal={onCloseTerminal}
+              onNewTab={() => { if (activeTab) onNewTab(activeTab.session, leaf.id) }}
+              onFindTab={() => {
+                onFocusLeaf(leaf.id)
+                onFindTab(leaf.id)
+              }}
+              onSplit={(direction) => { if (activeTab) onSplit(activeTab.session, leaf.id, direction) }}
+              onClosePane={() => onClosePane(leaf.id)}
             />
-          </div>
+            {!tabs.length && (
+              <div
+                role="region"
+                aria-label={`空终端窗格 ${paneNumber}`}
+                tabIndex={0}
+                onPointerDown={() => onFocusLeaf(leaf.id)}
+                onFocus={() => onFocusLeaf(leaf.id)}
+                className="pointer-events-auto absolute inset-x-0 top-[34px] bottom-0 grid place-items-center bg-[#0b0f14] px-5 text-center focus-visible:outline-1 focus-visible:outline-primary max-md:top-8"
+              >
+                <div role="status">
+                  <strong className="block text-[11px] font-semibold text-[#9ba8b1]">窗格 {paneNumber} 暂无终端</strong>
+                  <span className="mt-1.5 block max-w-72 text-[9px] leading-4 text-[#5f6d77]">
+                    添加尚未归属的会话，或前往设备页新建终端。
+                  </span>
+                </div>
+              </div>
+            )}
+          </section>
         )
       })}
       {!singleMode && pageVisible && sashes.map((placement) => (

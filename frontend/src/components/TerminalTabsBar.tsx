@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, Columns2, CornerDownLeft, LoaderCircle, Maximize2, MonitorPlay, Plus, Search, XIcon } from 'lucide-react'
+import { Columns2, CornerDownLeft, LoaderCircle, Maximize2, MonitorPlay, Plus, Search } from 'lucide-react'
 
 import type { Device, TerminalSession } from '@/api'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
-import { getCharacter, hashString, type CharPose } from '@/pixel/sprites'
 import {
   buildTerminalDisplayMap,
   groupTerminalSessions,
@@ -15,23 +14,6 @@ import { listLeaves, type LayoutNode } from '@/terminal-layout'
 
 export { groupTerminalSessions } from '@/terminal-display'
 export type { TerminalGroup } from '@/terminal-display'
-
-function SessionSprite({ session, pose }: { session: TerminalSession; pose: CharPose }) {
-  const ref = useRef<HTMLCanvasElement>(null)
-  useEffect(() => {
-    const canvas = ref.current
-    const context = canvas?.getContext('2d')
-    if (!canvas || !context) return
-    const sprite = getCharacter(pose, hashString(session.id), 0, false, session.active)
-    const scale = Math.min(canvas.width / sprite.width, canvas.height / sprite.height)
-    const width = Math.floor(sprite.width * scale)
-    const height = Math.floor(sprite.height * scale)
-    context.imageSmoothingEnabled = false
-    context.clearRect(0, 0, canvas.width, canvas.height)
-    context.drawImage(sprite, Math.floor((canvas.width - width) / 2), canvas.height - height, width, height)
-  }, [session.id, session.active, pose])
-  return <canvas ref={ref} width={18} height={24} aria-hidden="true" className="my-auto flex-none" />
-}
 
 type Placement = {
   pane: number | null
@@ -48,9 +30,10 @@ type Props = {
   focusedLeafId: string | null
   focusMode: boolean
   coarseMode: boolean
+  findTabRequest?: { requestId: number; targetLeafId: string } | null
+  onFindTabRequestHandled?: (requestId: number) => void
   onToggleFocusMode: () => void
-  onSelect: (id: string) => void
-  onClose: (session: TerminalSession) => void
+  onSelect: (id: string, targetLeafId?: string) => void
   onClone: (source: TerminalSession) => void
   onPreview: (source: TerminalSession) => void
 }
@@ -68,18 +51,21 @@ export function TerminalTabsBar({
   focusedLeafId,
   focusMode,
   coarseMode,
+  findTabRequest,
+  onFindTabRequestHandled,
   onToggleFocusMode,
   onSelect,
-  onClose,
   onClone,
   onPreview,
 }: Props) {
   const [searchOpen, setSearchOpen] = useState(false)
+  const [searchIntent, setSearchIntent] = useState<
+    { mode: 'reveal' } | { mode: 'attach-unassigned'; targetLeafId: string }
+  >({ mode: 'reveal' })
   const [query, setQuery] = useState('')
   const [highlightedSessionId, setHighlightedSessionId] = useState<string | null>(null)
-  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(() => new Set())
   const pendingFocusSessionRef = useRef<string | null>(null)
-  const tabRefs = useRef(new Map<string, HTMLButtonElement>())
+  const groupRefs = useRef(new Map<string, HTMLElement>())
   const resultRefs = useRef(new Map<string, HTMLButtonElement>())
   const deviceMap = useMemo(() => new Map(devices.map((device) => [device.id, device])), [devices])
   const terminalGroups = useMemo(() => groupTerminalSessions(sessions).sort((first, second) => {
@@ -92,6 +78,10 @@ export function TerminalTabsBar({
   }), [deviceMap, sessions])
   const baseDisplayMap = useMemo(() => buildTerminalDisplayMap(sessions), [sessions])
   const leaves = useMemo(() => layout ? listLeaves(layout) : [], [layout])
+  const assignedSessionIds = useMemo(
+    () => new Set(leaves.flatMap((leaf) => leaf.tabs)),
+    [leaves],
+  )
   const singleVisibleSession = coarseMode || focusMode
 
   const placements = useMemo(() => {
@@ -113,22 +103,9 @@ export function TerminalTabsBar({
     }
     return result
   }, [activeId, focusedLeafId, leaves, singleVisibleSession])
-  const visibleGroupKey = terminalGroups
-    .filter((group) => group.sessions.some((session) => placements.get(session.id)?.visible))
-    .map((group) => group.key)
-    .join('\u0000')
-
-  useEffect(() => {
-    if (!visibleGroupKey) return
-    const visibleKeys = visibleGroupKey.split('\u0000')
-    setExpandedGroupKeys((current) => {
-      if (visibleKeys.every((key) => current.has(key))) return current
-      const next = new Set(current)
-      for (const key of visibleKeys) next.add(key)
-      return next
-    })
-  }, [visibleGroupKey])
-
+  const focusedGroupKey = terminalGroups.find((group) => (
+    group.sessions.some((session) => placements.get(session.id)?.focused)
+  ))?.key || null
   const displayMap = useMemo(() => {
     const result = new Map<string, TerminalDisplay>()
     sessions.forEach((session) => {
@@ -150,12 +127,15 @@ export function TerminalTabsBar({
 
   const searchResults = useMemo(() => {
     const tokens = normalizedTokens(query)
+    const availableSessions = searchIntent.mode === 'attach-unassigned'
+      ? sessions.filter((session) => !assignedSessionIds.has(session.id))
+      : sessions
     const filtered = tokens.length
-      ? sessions.filter((session) => {
+      ? availableSessions.filter((session) => {
           const text = displayMap.get(session.id)?.searchText || ''
           return tokens.every((token) => text.includes(token))
         })
-      : [...sessions]
+      : [...availableSessions]
     return filtered.sort((first, second) => {
       if (first.id === activeId) return -1
       if (second.id === activeId) return 1
@@ -165,11 +145,15 @@ export function TerminalTabsBar({
       if (first.active !== second.active) return Number(second.active) - Number(first.active)
       return second.created_at - first.created_at
     })
-  }, [activeId, displayMap, placements, query, sessions])
+  }, [activeId, assignedSessionIds, displayMap, placements, query, searchIntent, sessions])
   const highlightedIndex = Math.max(0, searchResults.findIndex((session) => session.id === highlightedSessionId))
   const searchResultKey = searchResults.map((session) => session.id).join('\u0000')
 
-  const openSearch = (initialQuery = '') => {
+  const openSearch = (
+    initialQuery = '',
+    intent: { mode: 'reveal' } | { mode: 'attach-unassigned'; targetLeafId: string } = { mode: 'reveal' },
+  ) => {
+    setSearchIntent(intent)
     setQuery(initialQuery)
     setHighlightedSessionId(activeId)
     setSearchOpen(true)
@@ -179,16 +163,27 @@ export function TerminalTabsBar({
     setSearchOpen(false)
     setQuery('')
     setHighlightedSessionId(null)
-    onSelect(session.id)
+    onSelect(
+      session.id,
+      searchIntent.mode === 'attach-unassigned' ? searchIntent.targetLeafId : undefined,
+    )
   }
 
   useEffect(() => {
-    if (!activeId) return
+    if (!findTabRequest) return
+    openSearch('', { mode: 'attach-unassigned', targetLeafId: findTabRequest.targetLeafId })
+    onFindTabRequestHandled?.(findTabRequest.requestId)
+    // requestId is an event token: repeated clicks for the same leaf must reopen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findTabRequest?.requestId])
+
+  useEffect(() => {
+    if (!focusedGroupKey) return
     const frame = window.requestAnimationFrame(() => {
-      tabRefs.current.get(activeId)?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+      groupRefs.current.get(focusedGroupKey)?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [activeId, expandedGroupKeys])
+  }, [focusedGroupKey])
 
   useEffect(() => {
     if (!searchOpen) return
@@ -206,13 +201,16 @@ export function TerminalTabsBar({
   }, [highlightedSessionId, searchOpen, searchResultKey])
 
   const canToggleFocusMode = !coarseMode && leaves.length > 1
+  const targetPaneNumber = searchIntent.mode === 'attach-unassigned'
+    ? leaves.findIndex((leaf) => leaf.id === searchIntent.targetLeafId) + 1
+    : 0
 
   return (
     <>
       <nav aria-label="终端导航" className="flex min-w-0 items-center border-b border-border bg-[#0b1016] px-2 py-[5px] max-md:px-1.5">
         <button
           type="button"
-          onClick={() => openSearch()}
+          onClick={() => openSearch('', { mode: 'reveal' })}
           aria-label="搜索终端"
           title="搜索设备和终端"
           className="mr-1.5 flex h-[33px] flex-none cursor-pointer items-center gap-1.5 rounded-[7px] border border-[#2a3741] bg-[#10171e] px-2.5 text-[9px] font-semibold text-[#91a0ab] hover:border-[#3c5d4d] hover:bg-[#15231d] hover:text-primary max-md:mr-1 max-md:w-8 max-md:justify-center max-md:px-0"
@@ -221,30 +219,35 @@ export function TerminalTabsBar({
           <span className="max-md:hidden">搜索</span>
         </button>
 
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [scrollbar-color:#34404c_transparent] [scrollbar-width:thin]">
+        <div
+          role="list"
+          aria-label="终端设备组"
+          className="flex min-w-0 flex-1 touch-pan-x items-center gap-1.5 overflow-x-auto overscroll-x-contain [scrollbar-color:#34404c_transparent] [scrollbar-width:thin]"
+        >
           {terminalGroups.map((group) => {
             const device = group.deviceId ? deviceMap.get(group.deviceId) : undefined
             const groupName = group.deviceId ? device?.name || group.name : '本机'
             const cloneSource = group.sessions.find((session) => session.id === activeId) ||
               [...group.sessions].reverse().find((session) => session.active) ||
               group.sessions[group.sessions.length - 1]
-            const groupFocused = group.sessions.some((session) => placements.get(session.id)?.focused)
-            const groupVisible = group.sessions.some((session) => placements.get(session.id)?.visible)
-            const groupExpanded = expandedGroupKeys.has(group.key)
-            const importantSessions = group.sessions.filter((session) => (
-              session.id === activeId || placements.get(session.id)?.visible
-            ))
-            const displayedSessions = [...importantSessions]
-            for (const session of [...group.sessions].reverse()) {
-              if (displayedSessions.length >= Math.max(8, importantSessions.length)) break
-              if (!displayedSessions.some((item) => item.id === session.id)) displayedSessions.push(session)
-            }
-            displayedSessions.sort((first, second) => group.sessions.indexOf(first) - group.sessions.indexOf(second))
-            const hiddenSessionCount = group.sessions.length - displayedSessions.length
+            const runningCount = group.sessions.filter((session) => session.active).length
+            const visibleCount = group.sessions.filter((session) => placements.get(session.id)?.visible).length
+            const focusedSession = group.sessions.find((session) => placements.get(session.id)?.focused)
+            const focusedPlacement = focusedSession ? placements.get(focusedSession.id) : undefined
+            const groupFocused = Boolean(focusedSession)
+            const groupVisible = visibleCount > 0
+            const focusSummary = groupFocused
+              ? `，当前焦点${focusedPlacement?.pane ? `在窗格 ${focusedPlacement.pane}` : ''}`
+              : ''
+            const groupSummary = `${group.sessions.length} 个终端，${runningCount} 个运行中，${visibleCount} 个可见${focusSummary}`
             return (
               <section
                 key={group.key}
-                aria-label={`${groupName}，${group.sessions.length} 个终端`}
+                ref={(node) => {
+                  if (node) groupRefs.current.set(group.key, node)
+                  else groupRefs.current.delete(group.key)
+                }}
+                role="listitem"
                 className={cn(
                   'flex h-[33px] flex-none items-stretch overflow-hidden rounded-[7px] border border-[#26323c] bg-[#0f161d] hover:border-[#354451]',
                   groupVisible && 'border-[#344d42]',
@@ -253,120 +256,56 @@ export function TerminalTabsBar({
               >
                 <button
                   type="button"
-                  aria-expanded={groupExpanded}
-                  aria-label={`${groupExpanded ? '收起' : '展开'} ${groupName} 终端组，${group.sessions.length} 个终端`}
-                  onClick={() => setExpandedGroupKeys((current) => {
-                    const next = new Set(current)
-                    if (next.has(group.key)) next.delete(group.key)
-                    else next.add(group.key)
-                    return next
-                  })}
-                  title={device ? `${device.name} · ${device.hostname || device.id}` : '本机终端'}
-                  className="flex max-w-[150px] min-w-[72px] cursor-pointer items-center gap-1.5 border-r border-[#26323c] px-2.5 hover:bg-[#17212a] max-md:max-w-[110px] max-md:min-w-[58px] max-md:px-2"
+                  aria-label={`查找 ${groupName} 的终端，${groupSummary}`}
+                  onClick={() => openSearch(groupName, { mode: 'reveal' })}
+                  title={`${device ? `${device.name} · ${device.hostname || device.id}` : '本机终端'} · ${groupSummary}`}
+                  className="flex min-w-[185px] max-w-[280px] cursor-pointer items-center gap-2 border-r border-[#26323c] px-2.5 text-left hover:bg-[#17212a] focus-visible:bg-[#17212a] max-md:min-w-[158px] max-md:max-w-[210px] max-md:px-2"
                 >
-                  {groupExpanded ? <ChevronDown className="size-2.5 flex-none text-[#71808b]" /> : <ChevronRight className="size-2.5 flex-none text-[#71808b]" />}
                   <i
-                    data-running={group.sessions.some((session) => session.active)}
+                    aria-hidden="true"
+                    data-running={runningCount > 0}
                     className="size-1.5 flex-none rounded-full bg-[#59636d] data-[running=true]:bg-primary data-[running=true]:shadow-[0_0_8px_#77f2b488]"
                   />
-                  <strong className={cn('truncate text-[10px] font-semibold text-[#b9c5ce] max-md:text-[9px]', groupFocused && 'text-[#edf4f9]')}>
-                    {groupName}
-                  </strong>
-                  <span className="flex-none font-mono text-[7px] text-[#61707b]">{group.sessions.length}</span>
+                  <span className="min-w-0 flex-1">
+                    <strong className={cn('block truncate text-[10px] leading-[12px] font-semibold text-[#b9c5ce] max-md:text-[9px]', groupFocused && 'text-[#edf4f9]')}>
+                      {groupName}
+                    </strong>
+                    <span aria-hidden="true" className="mt-px flex items-center gap-1.5 whitespace-nowrap font-mono text-[7px] leading-[10px] text-[#687782]">
+                      <span>{group.sessions.length} 终端</span>
+                      <span className={cn(runningCount > 0 && 'text-[#8fc9ac]')}>{runningCount} 运行</span>
+                      <span className={cn(groupVisible && 'text-[#91c3aa]')}>{visibleCount} 可见</span>
+                      {groupFocused && (
+                        <span className="rounded bg-primary px-1 font-bold text-[#07120d]">
+                          焦点{focusedPlacement?.pane ? ` P${focusedPlacement.pane}` : ''}
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                  <Search aria-hidden="true" className="size-3 flex-none text-[#5f6e79]" />
                 </button>
-
-                {groupExpanded && <div className="flex flex-none items-stretch">
-                  {displayedSessions.map((session) => {
-                    const display = displayMap.get(session.id)
-                    const placement = placements.get(session.id)
-                    const focused = placement?.focused || false
-                    const visible = placement?.visible || false
-                    const onlineCount = session.services.filter((service) => service.status === 'online').length
-                    return (
-                      <span
-                        key={session.id}
-                        className={cn(
-                          'flex flex-none items-stretch border-r border-[#222d36] bg-[#0d1319]',
-                          visible && 'bg-[#13231c]',
-                          focused && 'bg-[#193025] shadow-[inset_0_-2px_var(--color-primary)]',
-                        )}
-                      >
-                        <button
-                          ref={(node) => {
-                            if (node) tabRefs.current.set(session.id, node)
-                            else tabRefs.current.delete(session.id)
-                          }}
-                          type="button"
-                          onClick={() => onSelect(session.id)}
-                          aria-current={focused ? 'page' : undefined}
-                          aria-label={`切换到 ${groupName} ${display?.label || session.name} ${display?.shortId || session.id.slice(0, 8)}`}
-                          title={`${groupName} · ${display?.label || session.name} · ${session.id}${placement?.pane ? ` · 窗格 ${placement.pane}` : ''}`}
-                          className={cn(
-                            'flex max-w-[190px] min-w-0 cursor-pointer items-center gap-1 bg-transparent pr-2 pl-[3px] text-[#72808b] hover:bg-[#17212a] hover:text-[#c2ced6] max-md:max-w-[155px] max-md:pr-1.5',
-                            visible && 'text-[#9acbb3]',
-                            focused && 'text-primary hover:text-primary',
-                          )}
-                        >
-                          <span className="relative my-auto flex-none">
-                            <SessionSprite session={session} pose={(display?.ordinal || 1) === 1 ? 'sit' : 'stand'} />
-                            {onlineCount > 0 && (
-                              <i aria-label={`${onlineCount} 个开发服务运行中`} className="absolute -top-1 -right-1.5 grid min-w-3 place-items-center rounded-full bg-primary px-[3px] font-mono text-[7px] leading-[11px] font-bold not-italic text-[#07120d] shadow-[0_1px_4px_#000c]">
-                                {onlineCount}
-                              </i>
-                            )}
-                          </span>
-                          <span className="min-w-0 truncate text-[9px] font-medium">{display?.label || session.name}</span>
-                          <code className="flex-none font-mono text-[7px] text-[#63717c] max-md:hidden">{display?.shortId || session.id.slice(0, 8)}</code>
-                          {placement?.pane && leaves.length > 1 && (
-                            <span className={cn(
-                              'flex-none rounded bg-[#1b252d] px-1 font-mono text-[7px] text-[#75838e]',
-                              visible && 'bg-[#20382d] text-[#9ed1b7]',
-                              focused && 'bg-primary text-[#07120d]',
-                            )}>
-                              {focused ? '当前' : visible ? '显示' : ''} P{placement.pane}
-                            </span>
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`关闭 ${groupName} ${display?.label || session.name}`}
-                          onClick={() => onClose(session)}
-                          className="grid w-5 flex-none cursor-pointer place-items-center bg-transparent text-[#586570] hover:bg-[#362027] hover:text-[#ff8d98] max-md:w-6"
-                        >
-                          <XIcon className="size-2.5" />
-                        </button>
-                      </span>
-                    )
-                  })}
-                  {hiddenSessionCount > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => openSearch(groupName)}
-                      aria-label={`查看 ${groupName} 其余 ${hiddenSessionCount} 个终端`}
-                      className="flex w-9 flex-none cursor-pointer items-center justify-center border-r border-[#26323c] bg-[#10171e] font-mono text-[8px] text-[#82909b] hover:bg-[#17251f] hover:text-primary"
-                    >
-                      +{hiddenSessionCount}
-                    </button>
-                  )}
-                  {group.deviceId && (
-                      <button type="button" aria-label={`预览 ${groupName} 的开发服务`} title="预览设备本地开发服务" onClick={() => onPreview(cloneSource)} className="grid w-7 flex-none cursor-pointer place-items-center border-r border-[#26323c] bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary">
-                        <MonitorPlay className="size-3.5" />
-                      </button>
-                  )}
+                {group.deviceId && (
                   <button
                     type="button"
-                    disabled={cloningId !== null}
-                    aria-label={`在 ${groupName} 新建终端`}
-                    title={group.deviceId ? '在同一设备新建终端' : '新建本地终端'}
-                    onClick={() => onClone(cloneSource)}
-                    className="grid w-7 flex-none cursor-pointer place-items-center bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
+                    aria-label={`预览 ${groupName} 的开发服务`}
+                    title="预览设备本地开发服务"
+                    onClick={() => onPreview(cloneSource)}
+                    className="grid w-8 flex-none cursor-pointer place-items-center border-r border-[#26323c] bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary focus-visible:bg-[#193025]"
                   >
-                    {cloningId && group.sessions.some((session) => session.id === cloningId)
-                      ? <LoaderCircle className="size-3 animate-spin" />
-                      : <Plus className="size-3.5" />}
+                    <MonitorPlay className="size-3.5" />
                   </button>
-                </div>
-                }
+                )}
+                <button
+                  type="button"
+                  disabled={cloningId !== null}
+                  aria-label={`在 ${groupName} 新建终端`}
+                  title={group.deviceId ? '在同一设备新建终端' : '新建本地终端'}
+                  onClick={() => onClone(cloneSource)}
+                  className="grid w-8 flex-none cursor-pointer place-items-center bg-transparent text-[#709b88] hover:bg-[#193025] hover:text-primary focus-visible:bg-[#193025] disabled:cursor-wait disabled:text-[#536159] disabled:hover:bg-transparent"
+                >
+                  {cloningId && group.sessions.some((session) => session.id === cloningId)
+                    ? <LoaderCircle className="size-3 animate-spin" />
+                    : <Plus className="size-3.5" />}
+                </button>
               </section>
             )
           })}
@@ -389,24 +328,38 @@ export function TerminalTabsBar({
         )}
       </nav>
 
-      <Dialog open={searchOpen} onOpenChange={(open) => { setSearchOpen(open); if (!open) setQuery('') }}>
+      <Dialog
+        open={searchOpen}
+        onOpenChange={(open) => {
+          setSearchOpen(open)
+          if (!open) {
+            setQuery('')
+            setSearchIntent({ mode: 'reveal' })
+          }
+        }}
+      >
         <DialogContent
           className="grid max-h-[min(720px,calc(100dvh-2rem))] grid-rows-[auto_auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-[720px]"
           onCloseAutoFocus={(event) => {
             const sessionId = pendingFocusSessionRef.current
             if (!sessionId) return
             pendingFocusSessionRef.current = null
-            // 避免 Radix 把焦点送回搜索按钮；新终端挂载后直接恢复键盘输入。
+            // 避免 Radix 把焦点送回搜索按钮。App 会用带竞态保护的
+            // focusTerminalInput 恢复键盘输入；这里不再无条件抢走用户新焦点。
             event.preventDefault()
-            window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-              const pane = document.querySelector(`[data-terminal-id="${sessionId}"]`)
-              pane?.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus({ preventScroll: true })
-            }))
           }}
         >
           <DialogHeader className="border-b border-[#293641] px-5 pt-5 pb-4 pr-12">
-            <DialogTitle className="text-base">查找终端</DialogTitle>
-            <DialogDescription className="text-[10px]">搜索设备、终端、工作区、服务端口或运行状态。</DialogDescription>
+            <DialogTitle className="text-base">
+              {searchIntent.mode === 'attach-unassigned'
+                ? `向窗格 ${targetPaneNumber > 0 ? targetPaneNumber : ''} 添加终端`
+                : '查找终端'}
+            </DialogTitle>
+            <DialogDescription className="text-[10px]">
+              {searchIntent.mode === 'attach-unassigned'
+                ? '仅显示尚未归属任何窗格的后台终端，不会暗中移动其他窗格的标签。'
+                : '搜索设备、终端、工作区、服务端口或运行状态。'}
+            </DialogDescription>
           </DialogHeader>
           <div className="relative border-b border-[#26323c] p-3">
             <Search className="pointer-events-none absolute top-1/2 left-6 size-4 -translate-y-1/2 text-[#657580]" />
@@ -477,7 +430,13 @@ export function TerminalTabsBar({
                 </button>
               )
             })}
-            {!searchResults.length && <div className="px-4 py-12 text-center text-[11px] text-[#65747f]">没有匹配的终端</div>}
+            {!searchResults.length && (
+              <div className="px-4 py-12 text-center text-[11px] text-[#65747f]">
+                {searchIntent.mode === 'attach-unassigned'
+                  ? '没有可添加的未归属终端，可先在设备组中新建。'
+                  : '没有匹配的终端'}
+              </div>
+            )}
           </div>
           <footer className="flex items-center justify-between border-t border-[#26323c] px-4 py-2 font-mono text-[8px] text-[#61707a]">
             <span>{searchResults.length} 个终端</span>

@@ -2,6 +2,124 @@ import { chromium } from 'playwright'
 
 const base = process.env.E2E_BASE || 'http://127.0.0.1:18124'
 const password = process.env.E2E_PASSWORD || 'e2e-test-password'
+
+function fail(message) {
+  throw new Error(message)
+}
+
+async function waitForPaneCount(page, expected) {
+  await page.waitForFunction((count) => (
+    document.querySelectorAll('[data-terminal-pane-root="true"]').length === count
+  ), expected)
+}
+
+async function paneSnapshot(page) {
+  return page.locator('[data-terminal-pane-root="true"]').evaluateAll((nodes) => (
+    nodes.map((node) => {
+      const tabs = [...node.querySelectorAll('[role="tab"]')]
+      return {
+        number: Number(node.getAttribute('data-terminal-pane-number')),
+        leafId: node.getAttribute('data-terminal-leaf-id'),
+        empty: node.getAttribute('data-terminal-pane-empty') === 'true',
+        tabs: tabs.map((tab) => tab.getAttribute('data-terminal-tab-id')),
+        active: tabs.find((tab) => tab.getAttribute('aria-selected') === 'true')
+          ?.getAttribute('data-terminal-tab-id') || null,
+      }
+    }).sort((first, second) => first.number - second.number)
+  ))
+}
+
+function paneFromSnapshot(snapshot, number) {
+  const pane = snapshot.find((item) => item.number === number)
+  if (!pane) fail(`pane P${number} is missing: ${JSON.stringify(snapshot)}`)
+  return pane
+}
+
+async function assertPaneTablists(page, expectedPaneCount) {
+  const panes = page.locator('[data-terminal-pane-root="true"]')
+  const paneCount = await panes.count()
+  if (paneCount !== expectedPaneCount) {
+    fail(`expected ${expectedPaneCount} pane frames, received ${paneCount}`)
+  }
+  const totalTablists = await page.getByRole('tablist').count()
+  if (totalTablists !== expectedPaneCount) {
+    fail(`expected one tablist per pane (${expectedPaneCount}), received ${totalTablists}`)
+  }
+  for (let index = 0; index < paneCount; index += 1) {
+    const root = panes.nth(index)
+    const nestedTablists = await root.getByRole('tablist').count()
+    if (nestedTablists !== 1) {
+      fail(`pane frame ${index + 1} contains ${nestedTablists} tablists instead of one`)
+    }
+  }
+}
+
+async function waitForPaneTabCount(page, paneNumber, expected) {
+  await page.waitForFunction(({ number, count }) => {
+    const pane = document.querySelector(`[data-terminal-pane-number="${number}"]`)
+    return pane?.querySelectorAll('[role="tab"]').length === count
+  }, { number: paneNumber, count: expected })
+}
+
+async function activatePaneTab(page, paneNumber, sessionId) {
+  const tab = page.locator(
+    `[data-terminal-pane-number="${paneNumber}"] [data-terminal-tab-id="${sessionId}"]`,
+  )
+  await tab.click()
+  await page.waitForFunction(({ number, id }) => {
+    const pane = document.querySelector(`[data-terminal-pane-number="${number}"]`)
+    return pane?.querySelector(`[data-terminal-tab-id="${id}"]`)
+      ?.getAttribute('aria-selected') === 'true'
+  }, { number: paneNumber, id: sessionId })
+}
+
+async function fillSearchAndChoose(page, query) {
+  const dialog = page.getByRole('dialog')
+  await dialog.waitFor()
+  const search = dialog.getByRole('combobox', { name: '搜索设备、终端、工作区或服务' })
+  await search.fill(query)
+  await dialog.getByRole('option').waitFor()
+  await page.waitForFunction(() => {
+    const combobox = document.querySelector('[role="dialog"] [role="combobox"]')
+    const activeId = combobox?.getAttribute('aria-activedescendant')
+    return Boolean(activeId && document.getElementById(activeId))
+  })
+  await search.press('Enter')
+  await dialog.waitFor({ state: 'hidden' })
+}
+
+async function chooseFromGlobalSearch(page, query) {
+  await page.getByRole('button', { name: '搜索终端', exact: true }).click()
+  await fillSearchAndChoose(page, query)
+}
+
+async function closePaneTerminal(page, paneNumber, sessionId) {
+  const pane = page.locator(`[data-terminal-pane-number="${paneNumber}"]`)
+  const tab = pane.locator(`[data-terminal-tab-id="${sessionId}"]`)
+  const tabWrapper = tab.locator('..')
+  await tabWrapper.getByRole('button', { name: new RegExp(`^关闭窗格 ${paneNumber} 的终端 `) }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.waitFor()
+  await dialog.getByRole('button', { name: '关闭终端', exact: true }).click()
+  await page.waitForFunction((id) => !document.querySelector(`[data-terminal-tab-id="${id}"]`), sessionId)
+}
+
+async function visibleTerminalIds(page) {
+  return page.locator('[data-terminal-visible="true"]').evaluateAll((nodes) => (
+    nodes.map((node) => node.getAttribute('data-terminal-id')).filter(Boolean).sort()
+  ))
+}
+
+async function backendHasSessions(page, sessionIds) {
+  return page.evaluate(async (ids) => {
+    const response = await fetch('/api/terminals')
+    if (!response.ok) return false
+    const sessions = await response.json()
+    const available = new Set(sessions.map((session) => session.id))
+    return ids.every((id) => available.has(id))
+  }, sessionIds)
+}
+
 const browser = await chromium.launch({
   headless: true,
   executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
@@ -12,9 +130,12 @@ const consoleErrors = []
 const terminalDeleteRequests = []
 const contractName = `contract-check-${Date.now().toString(36)}`
 const switchName = `${contractName}-switch`
+const unassignedName = `${contractName}-unassigned`
 const scalePrefix = `${contractName}-scale-`
 let terminalId = ''
 let switchTerminalId = ''
+let unassignedTerminalId = ''
+
 page.on('pageerror', (error) => pageErrors.push(error.message))
 page.on('console', (message) => {
   if (message.type() === 'error') consoleErrors.push(message.text())
@@ -59,6 +180,8 @@ try {
     return session.id
   }, switchName)
 
+  // Keep the existing workspace/file/artifact/read-image backend contract in
+  // the same end-to-end flow. Pane behavior must not regress these APIs.
   await page.evaluate(async (sessionId) => {
     const request = async (path, init) => {
       const response = await fetch(path, init)
@@ -102,8 +225,9 @@ try {
     if (contentResponse.headers.get('x-content-type-options') !== 'nosniff') {
       throw new Error('range read has no nosniff protection')
     }
-    const prefix = await contentResponse.text()
-    if (!prefix.startsWith('# AgentServer')) throw new Error('range read returned unexpected bytes')
+    if (!(await contentResponse.text()).startsWith('# AgentServer')) {
+      throw new Error('range read returned unexpected bytes')
+    }
 
     const createArtifactResponse = await request(
       `/api/terminals/${encodeURIComponent(sessionId)}/artifacts`,
@@ -133,8 +257,9 @@ try {
       `/api/terminals/${encodeURIComponent(sessionId)}/artifacts`,
     )
     const artifacts = await artifactsResponse.json()
-    if (!Array.isArray(artifacts)) throw new Error('artifact snapshot is not an array')
-    const persisted = artifacts.find((event) => event.id === createdArtifact.id)
+    const persisted = Array.isArray(artifacts)
+      ? artifacts.find((event) => event.id === createdArtifact.id)
+      : null
     if (!persisted || persisted.source !== 'e2e-contract' || persisted.schema_version !== 1) {
       throw new Error('created artifact was not present in the durable snapshot')
     }
@@ -167,6 +292,8 @@ try {
     }
   }, terminalId)
 
+  // Compatibility guard: old agents may omit services, but the UI must still
+  // be able to construct every pane and its tab strip.
   await page.route('**/api/terminals', async (route) => {
     if (route.request().method() !== 'GET') {
       await route.continue()
@@ -178,181 +305,212 @@ try {
     await route.fulfill({ response, json: sessions })
   })
 
-  await page.goto(`${base}/terminals`, { waitUntil: 'networkidle' })
-  await page.locator('.terminal-host').first().waitFor({ timeout: 10000 })
+  // A route opens only that terminal into P1. Other backend sessions remain
+  // unassigned until the user chooses them; server polling must not flood P1.
+  await page.goto(`${base}/terminal/${encodeURIComponent(terminalId)}`, { waitUntil: 'networkidle' })
+  await waitForPaneCount(page, 1)
+  await page.locator(`[data-terminal-id="${terminalId}"][data-terminal-visible="true"]`).waitFor()
+  await assertPaneTablists(page, 1)
 
-  // A real split creates a second local terminal, mounts both panes, supports
-  // keyboard sash adjustment, and survives a page reload through localStorage.
-  await page.getByRole('button', { name: '新建同设备终端并向右分屏' }).first().click()
-  await page.waitForFunction(() => {
-    const hosts = [...document.querySelectorAll('.terminal-host')]
-    return hosts.filter((host) => {
-      const rect = host.getBoundingClientRect()
-      return rect.width > 0 && rect.height > 0
-    }).length >= 2
-  })
+  const deviceGroups = page.getByRole('list', { name: '终端设备组' })
+  await deviceGroups.waitFor()
+  if (await deviceGroups.getByRole('tab').count() !== 0) {
+    fail('global device navigation still exposes session tabs')
+  }
+  if (await deviceGroups.getByRole('listitem').count() < 1) {
+    fail('global terminal navigation has no device/local group card')
+  }
+  let snapshot = await paneSnapshot(page)
+  if (JSON.stringify(paneFromSnapshot(snapshot, 1).tabs) !== JSON.stringify([terminalId])) {
+    fail(`P1 did not start with only the routed terminal: ${JSON.stringify(snapshot)}`)
+  }
 
-  // Every entry point uses the same reveal rule. A hidden terminal remains in
-  // its owning pane and focuses that pane; selecting it must never implicitly
-  // move it into whichever pane happened to be focused last.
-  const primaryPane = page.locator(`[data-terminal-id="${terminalId}"]`)
-  const visiblePanes = page.locator('[data-terminal-visible="true"]')
-  const initialVisible = await visiblePanes.evaluateAll((nodes) => nodes.map((node) => ({
-    id: node.getAttribute('data-terminal-id'),
-    left: node.getBoundingClientRect().left,
-  })).sort((first, second) => first.left - second.left))
-  if (initialVisible.length !== 2 || initialVisible[0].id !== terminalId) {
-    throw new Error(`unexpected initial split placement: ${JSON.stringify(initialVisible)}`)
-  }
-  const rightTerminalId = initialVisible[1].id
-  const rightPane = page.locator(`[data-terminal-id="${rightTerminalId}"]`)
-  const rightLeafId = await rightPane.getAttribute('data-terminal-leaf-id')
-  await primaryPane.locator('.terminal-host').click({ position: { x: 80, y: 80 } })
-  await page.waitForFunction((id) => (
-    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
-  ), terminalId)
-  await rightPane.locator('.terminal-host').click({ position: { x: 80, y: 80 } })
-  await page.waitForFunction((id) => (
-    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
-  ), rightTerminalId)
-  await page.getByRole('button', { name: '搜索终端' }).click()
-  const terminalSearch = page.getByRole('combobox')
-  await terminalSearch.fill(switchName)
-  await terminalSearch.press('Enter')
-  await page.waitForFunction(({ targetId, rightId }) => {
-    const right = document.querySelector(`[data-terminal-id="${rightId}"]`)
-    const target = document.querySelector(`[data-terminal-id="${targetId}"]`)
-    if (!right || !target) return false
-    const rightRect = right.getBoundingClientRect()
-    const targetRect = target.getBoundingClientRect()
-    return (
-      right.getAttribute('data-terminal-visible') === 'true' &&
-      target.getAttribute('data-terminal-visible') === 'true' &&
-      target.getAttribute('data-terminal-focused') === 'true' &&
-      targetRect.left < rightRect.left
-    )
-  }, { targetId: switchTerminalId, rightId: rightTerminalId })
-  if (await rightPane.getAttribute('data-terminal-visible') !== 'true') {
-    throw new Error('revealing a hidden terminal unexpectedly replaced the other pane')
-  }
-  const targetPane = page.locator(`[data-terminal-id="${switchTerminalId}"]`)
+  // Global search attaches an unassigned backend session to the focused P1.
+  await chooseFromGlobalSearch(page, switchTerminalId)
+  await waitForPaneTabCount(page, 1, 2)
+  snapshot = await paneSnapshot(page)
+  const initialP1LeafId = paneFromSnapshot(snapshot, 1).leafId
   if (
-    !rightLeafId ||
-    await targetPane.getAttribute('data-terminal-leaf-id') === rightLeafId ||
-    await rightPane.getAttribute('data-terminal-leaf-id') !== rightLeafId
+    JSON.stringify(paneFromSnapshot(snapshot, 1).tabs) !== JSON.stringify([terminalId, switchTerminalId]) ||
+    paneFromSnapshot(snapshot, 1).active !== switchTerminalId
   ) {
-    throw new Error('selected terminal was implicitly moved into the focused right pane')
+    fail(`P1 did not receive and activate its second local tab: ${JSON.stringify(snapshot)}`)
   }
-  await page.getByRole('button', { name: new RegExp(`^\u5207\u6362\u5230 .* ${terminalId.slice(0, 8)}$`) }).click()
-  await page.waitForFunction((id) => (
-    document.querySelector(`[data-terminal-id="${id}"]`)?.getAttribute('data-terminal-focused') === 'true'
-  ), terminalId)
+  await activatePaneTab(page, 1, terminalId)
+  await activatePaneTab(page, 1, switchTerminalId)
+  if (paneFromSnapshot(await paneSnapshot(page), 1).active !== switchTerminalId) {
+    fail('P1 pane-local switching did not update its own active tab')
+  }
+  await activatePaneTab(page, 1, terminalId)
+
+  // Split P1 to the right. The new P2 owns its own tab list and its + action
+  // appends to P2 without changing P1's selected tab.
+  await page.getByRole('button', {
+    name: '从窗格 1 新建同设备终端并向右分屏',
+    exact: true,
+  }).click()
+  await waitForPaneCount(page, 2)
+  await assertPaneTablists(page, 2)
+  snapshot = await paneSnapshot(page)
+  const p1AfterFirstSplit = paneFromSnapshot(snapshot, 1)
+  const p2AfterFirstSplit = paneFromSnapshot(snapshot, 2)
+  if (p1AfterFirstSplit.active !== terminalId || p1AfterFirstSplit.tabs.length !== 2) {
+    fail(`splitting P1 changed its tabs or selection: ${JSON.stringify(snapshot)}`)
+  }
+  if (p2AfterFirstSplit.tabs.length !== 1 || !p2AfterFirstSplit.active) {
+    fail(`new P2 did not contain exactly one active tab: ${JSON.stringify(snapshot)}`)
+  }
+  const p2LeafId = p2AfterFirstSplit.leafId
+  const p2FirstTerminalId = p2AfterFirstSplit.active
+
+  await page.getByRole('button', { name: '在窗格 2 新建终端标签', exact: true }).click()
+  await waitForPaneTabCount(page, 2, 2)
+  snapshot = await paneSnapshot(page)
+  const p2AfterNewTab = paneFromSnapshot(snapshot, 2)
+  const p2SecondTerminalId = p2AfterNewTab.active
+  if (!p2SecondTerminalId || p2SecondTerminalId === p2FirstTerminalId) {
+    fail(`P2 + action did not create and activate a second tab: ${JSON.stringify(snapshot)}`)
+  }
+  if (paneFromSnapshot(snapshot, 1).active !== terminalId) {
+    fail('creating a P2 tab changed P1 selection')
+  }
+  await activatePaneTab(page, 2, p2FirstTerminalId)
+  if (paneFromSnapshot(await paneSnapshot(page), 1).active !== terminalId) {
+    fail('switching to P2 first tab changed P1 selection')
+  }
+  await activatePaneTab(page, 2, p2SecondTerminalId)
+  if (paneFromSnapshot(await paneSnapshot(page), 1).active !== terminalId) {
+    fail('switching to P2 second tab changed P1 selection')
+  }
+
+  // Split downward from P2, then prove P3 has the same independent +/switch
+  // semantics while both P1 and P2 retain their own active tabs.
+  await page.getByRole('button', {
+    name: '从窗格 2 新建同设备终端并向下分屏',
+    exact: true,
+  }).click()
+  await waitForPaneCount(page, 3)
+  await assertPaneTablists(page, 3)
+  snapshot = await paneSnapshot(page)
+  const p3AfterSplit = paneFromSnapshot(snapshot, 3)
+  const p3LeafId = p3AfterSplit.leafId
+  const p3FirstTerminalId = p3AfterSplit.active
+  if (!p3FirstTerminalId || p3AfterSplit.tabs.length !== 1) {
+    fail(`new P3 did not contain exactly one active tab: ${JSON.stringify(snapshot)}`)
+  }
   if (
-    await targetPane.getAttribute('data-terminal-visible') !== 'false' ||
-    await rightPane.getAttribute('data-terminal-visible') !== 'true'
+    paneFromSnapshot(snapshot, 1).active !== terminalId ||
+    paneFromSnapshot(snapshot, 2).active !== p2SecondTerminalId
   ) {
-    throw new Error('switching a pane-local tab changed the other visible pane')
+    fail(`splitting P2 changed an existing pane selection: ${JSON.stringify(snapshot)}`)
   }
 
-  // Focus mode is a view-only toggle: it temporarily shows one terminal and
-  // restores the persisted split without changing pane membership.
-  await page.getByRole('button', { name: '聚焦当前终端' }).click()
-  await page.waitForFunction(() => (
-    document.querySelectorAll('[data-terminal-visible="true"]').length === 1
-  ))
-  await page.getByRole('button', { name: '恢复分屏' }).click()
-  await page.waitForFunction(() => (
-    document.querySelectorAll('[data-terminal-visible="true"]').length === 2
-  ))
+  await page.getByRole('button', { name: '在窗格 3 新建终端标签', exact: true }).click()
+  await waitForPaneTabCount(page, 3, 2)
+  snapshot = await paneSnapshot(page)
+  const p3SecondTerminalId = paneFromSnapshot(snapshot, 3).active
+  if (!p3SecondTerminalId || p3SecondTerminalId === p3FirstTerminalId) {
+    fail(`P3 + action did not create a second tab: ${JSON.stringify(snapshot)}`)
+  }
+  await activatePaneTab(page, 3, p3FirstTerminalId)
+  snapshot = await paneSnapshot(page)
+  if (
+    paneFromSnapshot(snapshot, 1).active !== terminalId ||
+    paneFromSnapshot(snapshot, 2).active !== p2SecondTerminalId
+  ) {
+    fail('switching P3 first tab changed P1 or P2')
+  }
+  await activatePaneTab(page, 3, p3SecondTerminalId)
+  snapshot = await paneSnapshot(page)
+  if (
+    paneFromSnapshot(snapshot, 1).active !== terminalId ||
+    paneFromSnapshot(snapshot, 2).active !== p2SecondTerminalId
+  ) {
+    fail('switching P3 second tab changed P1 or P2')
+  }
 
-  const separator = page.getByRole('separator', { name: '调整左右终端宽度' }).first()
-  await separator.focus()
+  // Both nested split sashes remain keyboard operable.
+  const horizontalSash = page.getByRole('separator', { name: '调整左右终端宽度' })
+  const verticalSash = page.getByRole('separator', { name: '调整上下终端高度' })
+  await horizontalSash.focus()
   await page.keyboard.press('End')
   await page.waitForFunction(() => (
-    document.querySelector('[role="separator"][aria-label="调整左右终端宽度"]')?.getAttribute('aria-valuenow') === '85'
+    document.querySelector('[role="separator"][aria-label="调整左右终端宽度"]')
+      ?.getAttribute('aria-valuenow') === '85'
   ))
-  await separator.focus()
+  await verticalSash.focus()
   await page.keyboard.press('Home')
   await page.waitForFunction(() => (
-    document.querySelector('[role="separator"][aria-label="调整左右终端宽度"]')?.getAttribute('aria-valuenow') === '15'
+    document.querySelector('[role="separator"][aria-label="调整上下终端高度"]')
+      ?.getAttribute('aria-valuenow') === '15'
   ))
-  await page.reload({ waitUntil: 'networkidle' })
-  await page.getByRole('separator', { name: '调整左右终端宽度' }).waitFor()
-  await page.waitForFunction(() => {
-    const hosts = [...document.querySelectorAll('.terminal-host')]
-    return hosts.filter((host) => {
-      const rect = host.getBoundingClientRect()
-      return rect.width > 0 && rect.height > 0
-    }).length >= 2
-  })
 
-  // A larger session pool must remain searchable without mounting one xterm
-  // and WebSocket per hidden terminal. The result list itself must scroll.
-  await page.evaluate(async ({ prefix, count }) => {
-    await Promise.all(Array.from({ length: count }, async (_, index) => {
-      const response = await fetch('/api/terminals', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `${prefix}${index + 1}` }),
-      })
-      if (!response.ok) throw new Error(`failed to create scale terminal ${index + 1}: ${response.status}`)
-    }))
-  }, { prefix: scalePrefix, count: 18 })
+  // Persist exact leaf membership and each leaf's selected tab across reload.
+  const persistedThreePaneSnapshot = await paneSnapshot(page)
   await page.reload({ waitUntil: 'networkidle' })
-  await page.getByRole('separator', { name: '调整左右终端宽度' }).waitFor()
-  const mountedTerminalCount = Number(await page.locator('[data-mounted-terminal-count]').getAttribute('data-mounted-terminal-count'))
-  if (!Number.isFinite(mountedTerminalCount) || mountedTerminalCount > 8) {
-    throw new Error(`hidden terminal cache mounted ${mountedTerminalCount} terminals, expected at most 8`)
+  await waitForPaneCount(page, 3)
+  await assertPaneTablists(page, 3)
+  snapshot = await paneSnapshot(page)
+  if (JSON.stringify(snapshot) !== JSON.stringify(persistedThreePaneSnapshot)) {
+    fail(`pane membership/selection changed on reload: ${JSON.stringify({ before: persistedThreePaneSnapshot, after: snapshot })}`)
   }
-  await page.getByRole('button', { name: '搜索终端' }).click()
-  await page.getByRole('combobox').fill(scalePrefix)
-  await page.waitForFunction((expected) => document.querySelectorAll('[role="option"]').length === expected, 18)
-  const searchListMetrics = await page.getByRole('listbox', { name: '终端搜索结果' }).evaluate((element) => ({
-    clientHeight: element.clientHeight,
-    scrollHeight: element.scrollHeight,
-    overflowY: getComputedStyle(element).overflowY,
-  }))
-  if (searchListMetrics.scrollHeight <= searchListMetrics.clientHeight || !['auto', 'scroll'].includes(searchListMetrics.overflowY)) {
-    throw new Error(`terminal search results are not scrollable: ${JSON.stringify(searchListMetrics)}`)
+  if (await deviceGroups.getByRole('tab').count() !== 0) {
+    fail('reload reintroduced session tabs into the device-group navigation')
   }
-  await page.keyboard.press('Escape')
 
-  // Visible groups expand automatically, but remain an explicit user choice.
-  // Collapsing a busy group must actually hide its chips instead of immediately
-  // reopening it, and the responsive search dialog must stay usable on phones.
-  const localGroup = page.locator('section[aria-label^="本机，"]').first()
-  const localGroupToggle = localGroup.locator('button[aria-expanded]').first()
-  await localGroupToggle.click()
-  if (await localGroupToggle.getAttribute('aria-expanded') !== 'false') {
-    throw new Error('the visible terminal group could not be collapsed')
+  // Revealing an already assigned hidden P1 tab focuses its original leaf. It
+  // must not be moved into the currently focused P3.
+  const membershipBeforeReveal = (await paneSnapshot(page)).map(({ number, leafId, tabs }) => ({ number, leafId, tabs }))
+  await chooseFromGlobalSearch(page, switchTerminalId)
+  await page.locator(`[data-terminal-id="${switchTerminalId}"][data-terminal-focused="true"]`).waitFor()
+  snapshot = await paneSnapshot(page)
+  const membershipAfterReveal = snapshot.map(({ number, leafId, tabs }) => ({ number, leafId, tabs }))
+  if (JSON.stringify(membershipAfterReveal) !== JSON.stringify(membershipBeforeReveal)) {
+    fail(`global reveal moved an assigned tab: ${JSON.stringify({ membershipBeforeReveal, membershipAfterReveal })}`)
   }
-  if (await localGroup.getByRole('button', { name: /^切换到 / }).count() !== 0) {
-    throw new Error('collapsed terminal group still exposes session chips')
-  }
-  await localGroupToggle.click()
-  await page.setViewportSize({ width: 390, height: 844 })
-  await page.getByRole('button', { name: '搜索终端' }).click()
-  await page.getByRole('combobox').fill(scalePrefix)
-  await page.waitForFunction((expected) => document.querySelectorAll('[role="option"]').length === expected, 18)
-  const mobileDialog = await page.getByRole('dialog').boundingBox()
-  if (!mobileDialog || mobileDialog.x < 0 || mobileDialog.x + mobileDialog.width > 390) {
-    throw new Error(`terminal search dialog overflows the mobile viewport: ${JSON.stringify(mobileDialog)}`)
-  }
-  const mobileSearchListMetrics = await page.getByRole('listbox', { name: '终端搜索结果' }).evaluate((element) => ({
-    clientHeight: element.clientHeight,
-    scrollHeight: element.scrollHeight,
-    overflowY: getComputedStyle(element).overflowY,
-  }))
   if (
-    mobileSearchListMetrics.scrollHeight <= mobileSearchListMetrics.clientHeight ||
-    !['auto', 'scroll'].includes(mobileSearchListMetrics.overflowY)
+    paneFromSnapshot(snapshot, 1).leafId !== initialP1LeafId ||
+    paneFromSnapshot(snapshot, 1).active !== switchTerminalId ||
+    paneFromSnapshot(snapshot, 2).active !== p2SecondTerminalId ||
+    paneFromSnapshot(snapshot, 3).active !== p3SecondTerminalId
   ) {
-    throw new Error(`mobile terminal search results are not scrollable: ${JSON.stringify(mobileSearchListMetrics)}`)
+    fail(`assigned reveal did not stay independent per leaf: ${JSON.stringify(snapshot)}`)
   }
-  await page.keyboard.press('Escape')
-  await page.setViewportSize({ width: 1280, height: 800 })
 
-  await page.getByRole('button', { name: '打开工作区文件' }).first().click()
+  // A newly discovered backend session stays unassigned after reconciliation.
+  // Global search attaches it to the leaf focused when the search was invoked.
+  await activatePaneTab(page, 2, p2SecondTerminalId)
+  unassignedTerminalId = await page.evaluate(async (name) => {
+    const response = await fetch('/api/terminals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+    if (!response.ok) throw new Error(`failed to create unassigned terminal: ${response.status}`)
+    return (await response.json()).id
+  }, unassignedName)
+  const beforeUnassignedReload = await paneSnapshot(page)
+  await page.reload({ waitUntil: 'networkidle' })
+  await waitForPaneCount(page, 3)
+  if (JSON.stringify(await paneSnapshot(page)) !== JSON.stringify(beforeUnassignedReload)) {
+    fail('server reconciliation auto-inserted an unassigned session into a pane')
+  }
+  await chooseFromGlobalSearch(page, unassignedTerminalId)
+  await waitForPaneTabCount(page, 2, 3)
+  snapshot = await paneSnapshot(page)
+  if (
+    paneFromSnapshot(snapshot, 2).active !== unassignedTerminalId ||
+    !paneFromSnapshot(snapshot, 2).tabs.includes(unassignedTerminalId) ||
+    paneFromSnapshot(snapshot, 1).tabs.length !== 2 ||
+    paneFromSnapshot(snapshot, 3).tabs.length !== 2
+  ) {
+    fail(`unassigned session was not attached only to focused P2: ${JSON.stringify(snapshot)}`)
+  }
+
+  // Workspace affordances still belong to the active terminal within a pane.
+  await chooseFromGlobalSearch(page, terminalId)
+  const primaryPane = page.locator(`[data-terminal-id="${terminalId}"]`)
+  await primaryPane.getByRole('button', { name: '打开工作区文件' }).click()
   const workspacePane = page.getByRole('complementary', { name: /工作区/ })
   await workspacePane.waitFor()
   await workspacePane.getByRole('button', { name: /README\.md/ }).click()
@@ -363,67 +521,200 @@ try {
   await workspacePane.getByRole('img', { name: 'favicon.png' }).waitFor()
   await workspacePane.getByRole('button', { name: /Artifacts/ }).click()
   await workspacePane.getByText('不可变').first().waitFor()
-
-  // Closing a pane is a layout-only operation. The backend terminal remains
-  // available after the split geometry collapses.
   await workspacePane.getByRole('button', { name: '关闭工作区' }).click()
-  const receiverLeafId = await primaryPane.getAttribute('data-terminal-leaf-id')
-  await rightPane.getByRole('button', { name: '关闭窗格（保留终端）' }).click()
-  await page.waitForFunction(() => document.querySelectorAll('[role="separator"]').length === 0)
+
+  // Focus and responsive single-pane modes are view projections only. They
+  // show the focused leaf's complete tab list and restore the same tree.
+  await activatePaneTab(page, 2, unassignedTerminalId)
+  const beforeFocusMode = await paneSnapshot(page)
+  await page.getByRole('button', { name: '聚焦当前终端', exact: true }).click()
+  await waitForPaneCount(page, 1)
+  await assertPaneTablists(page, 1)
+  let projected = await paneSnapshot(page)
   if (
-    !receiverLeafId ||
-    await rightPane.getAttribute('data-terminal-leaf-id') !== receiverLeafId
+    projected[0]?.number !== 2 ||
+    JSON.stringify(projected[0]?.tabs) !== JSON.stringify(paneFromSnapshot(beforeFocusMode, 2).tabs) ||
+    projected[0]?.active !== unassignedTerminalId
   ) {
-    throw new Error('closing a pane did not retain its terminal in the receiving leaf')
+    fail(`focus mode did not project the complete focused P2: ${JSON.stringify(projected)}`)
   }
-  if (terminalDeleteRequests.some((url) => url.endsWith(`/api/terminals/${rightTerminalId}`))) {
-    throw new Error('closing a pane issued a terminal DELETE request')
+  await page.getByRole('button', { name: '恢复分屏', exact: true }).click()
+  await waitForPaneCount(page, 3)
+  if (JSON.stringify(await paneSnapshot(page)) !== JSON.stringify(beforeFocusMode)) {
+    fail('restoring focus mode mutated the persisted pane layout')
   }
-  const retainedAfterPaneClose = await page.evaluate(async (sessionId) => {
-    const response = await fetch('/api/terminals')
-    if (!response.ok) return false
-    const currentSessions = await response.json()
-    return currentSessions.some((session) => session.id === sessionId)
-  }, rightTerminalId)
-  if (!retainedAfterPaneClose) throw new Error('closing a pane terminated its backend session')
-  await page.getByRole('button', { name: '搜索终端' }).click()
-  await page.getByRole('combobox').fill(rightTerminalId)
-  await page.getByRole('combobox').press('Enter')
-  await page.waitForFunction(({ sessionId, leafId }) => {
-    const pane = document.querySelector(`[data-terminal-id="${sessionId}"]`)
-    return (
-      pane?.getAttribute('data-terminal-visible') === 'true' &&
-      pane.getAttribute('data-terminal-focused') === 'true' &&
-      pane.getAttribute('data-terminal-leaf-id') === leafId &&
-      document.querySelectorAll('[role="separator"]').length === 0
-    )
-  }, { sessionId: rightTerminalId, leafId: receiverLeafId })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await waitForPaneCount(page, 1)
+  await assertPaneTablists(page, 1)
+  projected = await paneSnapshot(page)
+  if (
+    projected[0]?.number !== 2 ||
+    JSON.stringify(projected[0]?.tabs) !== JSON.stringify(paneFromSnapshot(beforeFocusMode, 2).tabs)
+  ) {
+    fail(`mobile mode lost the focused pane's local tabs: ${JSON.stringify(projected)}`)
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await waitForPaneCount(page, 3)
+  if (JSON.stringify(await paneSnapshot(page)) !== JSON.stringify(beforeFocusMode)) {
+    fail('leaving mobile mode mutated the desktop pane layout')
+  }
+
+  // A large backend session pool remains searchable but unassigned. It must
+  // not add tabs to any pane or mount one xterm/WebSocket per session.
+  await page.evaluate(async ({ prefix, count }) => {
+    await Promise.all(Array.from({ length: count }, async (_, index) => {
+      const response = await fetch('/api/terminals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `${prefix}${index + 1}` }),
+      })
+      if (!response.ok) throw new Error(`failed to create scale terminal ${index + 1}: ${response.status}`)
+    }))
+  }, { prefix: scalePrefix, count: 18 })
+  const beforeScaleReload = await paneSnapshot(page)
   await page.reload({ waitUntil: 'networkidle' })
-  await page.waitForFunction((sessionId) => (
-    document.querySelector(`[data-terminal-id="${sessionId}"]`)?.getAttribute('data-terminal-visible') === 'true' &&
-    document.querySelectorAll('[role="separator"]').length === 0
-  ), rightTerminalId)
+  await waitForPaneCount(page, 3)
+  await assertPaneTablists(page, 3)
+  if (JSON.stringify(await paneSnapshot(page)) !== JSON.stringify(beforeScaleReload)) {
+    fail('scale sessions were automatically inserted into pane tabs')
+  }
+  const mountedTerminalCount = Number(
+    await page.locator('[data-mounted-terminal-count]').getAttribute('data-mounted-terminal-count'),
+  )
+  if (!Number.isFinite(mountedTerminalCount) || mountedTerminalCount > 8) {
+    fail(`hidden terminal cache mounted ${mountedTerminalCount} terminals, expected at most 8`)
+  }
+  const visibleIdsAtScale = await visibleTerminalIds(page)
+  if (visibleIdsAtScale.length !== 3) {
+    fail(`three-pane layout exposed ${visibleIdsAtScale.length} active terminals instead of three`)
+  }
+
+  await page.getByRole('button', { name: '搜索终端', exact: true }).click()
+  let searchDialog = page.getByRole('dialog')
+  await searchDialog.getByRole('combobox').fill(scalePrefix)
+  await page.waitForFunction((expected) => (
+    document.querySelectorAll('[role="dialog"] [role="option"]').length === expected
+  ), 18)
+  const searchListMetrics = await searchDialog.getByRole('listbox', { name: '终端搜索结果' }).evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }))
+  if (
+    searchListMetrics.scrollHeight <= searchListMetrics.clientHeight ||
+    !['auto', 'scroll'].includes(searchListMetrics.overflowY)
+  ) {
+    fail(`terminal search results are not scrollable: ${JSON.stringify(searchListMetrics)}`)
+  }
+  await page.keyboard.press('Escape')
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: '搜索终端', exact: true }).click()
+  searchDialog = page.getByRole('dialog')
+  await searchDialog.getByRole('combobox').fill(scalePrefix)
+  await page.waitForFunction((expected) => (
+    document.querySelectorAll('[role="dialog"] [role="option"]').length === expected
+  ), 18)
+  const mobileDialog = await searchDialog.boundingBox()
+  if (!mobileDialog || mobileDialog.x < 0 || mobileDialog.x + mobileDialog.width > 390) {
+    fail(`terminal search dialog overflows the mobile viewport: ${JSON.stringify(mobileDialog)}`)
+  }
+  await page.keyboard.press('Escape')
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await waitForPaneCount(page, 3)
+
+  // Closing both P3 tabs terminates those two backend sessions but preserves
+  // the editor group itself as a focused, explicitly empty pane.
+  await activatePaneTab(page, 3, p3SecondTerminalId)
+  const deleteCountBeforeTabClose = terminalDeleteRequests.length
+  await closePaneTerminal(page, 3, p3FirstTerminalId)
+  await waitForPaneTabCount(page, 3, 1)
+  await closePaneTerminal(page, 3, p3SecondTerminalId)
+  await waitForPaneTabCount(page, 3, 0)
+  await assertPaneTablists(page, 3)
+  snapshot = await paneSnapshot(page)
+  const emptyP3 = paneFromSnapshot(snapshot, 3)
+  if (!emptyP3.empty || emptyP3.active !== null || emptyP3.leafId !== p3LeafId) {
+    fail(`closing P3's final tab collapsed or replaced the pane: ${JSON.stringify(snapshot)}`)
+  }
+  if (terminalDeleteRequests.length !== deleteCountBeforeTabClose + 2) {
+    fail('closing two terminal tabs did not issue exactly two DELETE requests')
+  }
+
+  // Closing P2 is layout-only: all of its live sessions become unassigned,
+  // the empty sibling survives, and its picker can explicitly reattach one.
+  const p2SessionsBeforeClose = [...paneFromSnapshot(snapshot, 2).tabs]
+  const deleteCountBeforePaneClose = terminalDeleteRequests.length
+  await page.getByRole('button', { name: '关闭窗格 2（保留终端）', exact: true }).click()
+  await waitForPaneCount(page, 2)
+  await assertPaneTablists(page, 2)
+  if (terminalDeleteRequests.length !== deleteCountBeforePaneClose) {
+    fail('closing a pane issued a terminal DELETE request')
+  }
+  if (!(await backendHasSessions(page, p2SessionsBeforeClose))) {
+    fail('closing P2 terminated one or more backend sessions')
+  }
+  for (const sessionId of p2SessionsBeforeClose) {
+    if (await page.locator(`[data-terminal-tab-id="${sessionId}"]`).count()) {
+      fail(`closed-pane session ${sessionId} remained assigned to another pane`)
+    }
+  }
+  snapshot = await paneSnapshot(page)
+  const receiverPane = paneFromSnapshot(snapshot, 2)
+  if (!receiverPane.empty || receiverPane.leafId !== p3LeafId || receiverPane.tabs.length !== 0) {
+    fail(`empty sibling pane did not survive P2 close: ${JSON.stringify(snapshot)}`)
+  }
+  if (await page.getByRole('separator').count() !== 1) {
+    fail('closing nested P2 did not collapse exactly its nearest split')
+  }
+
+  await page.getByRole('button', { name: '向窗格 2 添加终端', exact: true }).click()
+  await page.getByRole('dialog').getByText('向窗格 2 添加终端', { exact: true }).waitFor()
+  await fillSearchAndChoose(page, p2FirstTerminalId)
+  await waitForPaneTabCount(page, 2, 1)
+  snapshot = await paneSnapshot(page)
+  if (
+    paneFromSnapshot(snapshot, 2).leafId !== p3LeafId ||
+    JSON.stringify(paneFromSnapshot(snapshot, 2).tabs) !== JSON.stringify([p2FirstTerminalId]) ||
+    paneFromSnapshot(snapshot, 2).active !== p2FirstTerminalId
+  ) {
+    fail(`empty-pane picker did not reattach the chosen unassigned session: ${JSON.stringify(snapshot)}`)
+  }
+  if (await page.getByRole('separator').count() !== 1) {
+    fail('reattaching an unassigned session unexpectedly created a split')
+  }
+  if (!p2LeafId || p2LeafId === p3LeafId) {
+    fail('test setup did not create distinct P2 and P3 leaf identities')
+  }
+
+  const finalPersistedSnapshot = await paneSnapshot(page)
+  await page.reload({ waitUntil: 'networkidle' })
+  await waitForPaneCount(page, 2)
+  await assertPaneTablists(page, 2)
+  if (JSON.stringify(await paneSnapshot(page)) !== JSON.stringify(finalPersistedSnapshot)) {
+    fail('reattached empty-pane membership did not persist across reload')
+  }
 
   await page.waitForTimeout(500)
-  if (pageErrors.length) throw new Error(`page errors: ${pageErrors.join(' | ')}`)
+  if (pageErrors.length) fail(`page errors: ${pageErrors.join(' | ')}`)
   const meaningfulConsoleErrors = consoleErrors.filter(
     (item) => !item.includes('favicon') && !item.includes('401 (Unauthorized)'),
   )
   if (meaningfulConsoleErrors.length) {
-    throw new Error(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
+    fail(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
   }
-  console.log('terminal search/reveal, split focus/close, workspace, file range, artifact, and read-image contracts passed')
+  console.log('VSCode-style independent pane tabs, persistence, reveal/attach, empty-pane, close-pane, responsive, cache, workspace, artifact, and image contracts passed')
 } finally {
-  await page.evaluate(async ({ sessionId, switchSessionId, name, alternateName, scaleNamePrefix }) => {
+  await page.evaluate(async ({ sessionId, switchSessionId, unassignedSessionId, ownedNamePrefix }) => {
     const response = await fetch('/api/terminals')
     if (!response.ok) return
     const sessions = await response.json()
     const owned = sessions.filter((session) => (
       session.id === sessionId ||
       session.id === switchSessionId ||
-      session.name === name ||
-      session.name === alternateName ||
-      session.name.startsWith(scaleNamePrefix)
+      session.id === unassignedSessionId ||
+      (session.name || '').startsWith(ownedNamePrefix)
     ))
     await Promise.all(owned.map((session) => (
       fetch(`/api/terminals/${encodeURIComponent(session.id)}`, { method: 'DELETE' })
@@ -431,9 +722,8 @@ try {
   }, {
     sessionId: terminalId,
     switchSessionId: switchTerminalId,
-    name: contractName,
-    alternateName: switchName,
-    scaleNamePrefix: scalePrefix,
+    unassignedSessionId: unassignedTerminalId,
+    ownedNamePrefix: contractName,
   }).catch(() => {})
   await browser.close()
 }
