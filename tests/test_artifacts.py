@@ -2,6 +2,7 @@ import asyncio
 import io
 import base64
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +56,9 @@ class ArtifactEventStoreTests(unittest.TestCase):
             source="agent-tool",
             version="sha256:file-version",
             created_at=1234.5,
+            task_id="task-1",
+            run_id="run-1",
+            span_id="span-1",
         )
 
         reopened = ArtifactEventStore(self.database_path)
@@ -68,6 +72,9 @@ class ArtifactEventStoreTests(unittest.TestCase):
         self.assertEqual("src/screenshots/result.png", public["path"])
         self.assertEqual("sha256:file-version", public["version"])
         self.assertEqual(1234.5, public["timestamp"])
+        self.assertEqual("task-1", public["task_id"])
+        self.assertEqual("run-1", public["run_id"])
+        self.assertEqual("span-1", public["span_id"])
 
     def test_snapshot_cursor_is_strict_and_ordered(self) -> None:
         first = self.store.append(
@@ -108,6 +115,136 @@ class ArtifactEventStoreTests(unittest.TestCase):
         self.assertEqual(
             events[-2:],
             self.store.recent(owner="alice", terminal_id="terminal-a", limit=2),
+        )
+
+    def test_snapshot_and_recent_filter_run_inside_terminal_scope(self) -> None:
+        run_one = self.store.append(
+            owner="alice",
+            terminal_id="terminal-a",
+            event_type="created",
+            file=WorkspaceFileRef("run-one.txt"),
+            source="tool",
+            run_id="run-1",
+        )
+        self.store.append(
+            owner="alice",
+            terminal_id="terminal-a",
+            event_type="created",
+            file=WorkspaceFileRef("run-two.txt"),
+            source="tool",
+            run_id="run-2",
+        )
+        run_one_later = self.store.append(
+            owner="alice",
+            terminal_id="terminal-a",
+            event_type="modified",
+            file=WorkspaceFileRef("run-one-later.txt"),
+            source="tool",
+            run_id="run-1",
+        )
+        self.store.append(
+            owner="bob",
+            terminal_id="terminal-a",
+            event_type="created",
+            file=WorkspaceFileRef("wrong-owner.txt"),
+            source="tool",
+            run_id="run-1",
+        )
+        self.store.append(
+            owner="alice",
+            terminal_id="terminal-b",
+            event_type="created",
+            file=WorkspaceFileRef("wrong-terminal.txt"),
+            source="tool",
+            run_id="run-1",
+        )
+
+        self.assertEqual(
+            [run_one, run_one_later],
+            self.store.snapshot(
+                owner="alice", terminal_id="terminal-a", run_id="run-1"
+            ),
+        )
+        self.assertEqual(
+            [run_one_later],
+            self.store.snapshot(
+                owner="alice",
+                terminal_id="terminal-a",
+                run_id="run-1",
+                after_sequence=run_one.sequence,
+            ),
+        )
+        self.assertEqual(
+            [run_one_later],
+            self.store.recent(
+                owner="alice", terminal_id="terminal-a", run_id="run-1", limit=1
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "run_id"):
+            self.store.snapshot(
+                owner="alice", terminal_id="terminal-a", run_id=""
+            )
+
+    def test_existing_database_migrates_optional_execution_links(self) -> None:
+        legacy_path = Path(self.directory.name) / "legacy-events.db"
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE artifact_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    owner TEXT NOT NULL,
+                    terminal_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL DEFAULT '',
+                    file_media_type TEXT,
+                    file_size INTEGER,
+                    file_kind TEXT NOT NULL DEFAULT 'file',
+                    source TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    attachment_id TEXT,
+                    attachment_media_type TEXT,
+                    attachment_size INTEGER,
+                    attachment_width INTEGER,
+                    attachment_height INTEGER,
+                    attachment_name TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO artifact_events(
+                    id, owner, terminal_id, event_type, file_path, source, created_at
+                ) VALUES ('legacy-event', 'alice', 'terminal-a', 'created',
+                          'legacy.txt', 'tool', 1.0)
+                """
+            )
+
+        migrated = ArtifactEventStore(legacy_path)
+        [legacy] = migrated.snapshot(owner="alice", terminal_id="terminal-a")
+        self.assertIsNone(legacy.task_id)
+        self.assertIsNone(legacy.run_id)
+        self.assertIsNone(legacy.span_id)
+        linked = migrated.append(
+            owner="alice",
+            terminal_id="terminal-a",
+            event_type="modified",
+            file=WorkspaceFileRef("linked.txt"),
+            source="tool",
+            task_id="task-2",
+            run_id="run-2",
+            span_id="span-2",
+        )
+
+        reopened = ArtifactEventStore(legacy_path)
+        self.assertEqual(
+            [linked],
+            reopened.snapshot(
+                owner="alice", terminal_id="terminal-a", run_id="run-2"
+            ),
         )
 
 
@@ -275,6 +412,9 @@ class AttachmentStoreTests(unittest.TestCase):
             file=file,
             source="agent-tool",
             attachment=ref,
+            task_id="task-1",
+            run_id="run-1",
+            span_id="span-1",
         )
         payload = self.attachments.read_authorized(
             self.events,
@@ -284,13 +424,18 @@ class AttachmentStoreTests(unittest.TestCase):
         )
         self.assertEqual(ref, payload.ref)
         self.assertEqual(data, payload.data)
-        with self.assertRaises(AttachmentAccessDenied):
-            self.attachments.read_authorized(
-                self.events,
-                owner="bob",
-                terminal_id="terminal-a",
-                attachment_id=ref.id,
-            )
+        for owner, terminal_id in (
+            ("bob", "terminal-a"),
+            ("alice", "terminal-b"),
+        ):
+            with self.subTest(owner=owner, terminal_id=terminal_id):
+                with self.assertRaises(AttachmentAccessDenied):
+                    self.attachments.read_authorized(
+                        self.events,
+                        owner=owner,
+                        terminal_id=terminal_id,
+                        attachment_id=ref.id,
+                    )
 
     def test_read_detects_content_tampering(self) -> None:
         data = image_bytes()

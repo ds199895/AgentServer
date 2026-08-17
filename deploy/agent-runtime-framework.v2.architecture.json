@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AgentServer 任务与运行状态同步框架",
+    "output": "agent-runtime-framework.html",
+    "quality_profile": "showcase",
+    "viewBox": [1320, 760],
+    "views": [
+      {
+        "id": "dispatch_path",
+        "label": "任务委派链路",
+        "focus": ["web_ui", "control_plane", "runtime_registry", "terminal_adapter", "agent_runtime"],
+        "note": "从用户委派任务到设备终端获得可验证的任务上下文。"
+      },
+      {
+        "id": "active_reporting",
+        "label": "主动上报链路",
+        "focus": ["agent_runtime", "agent_bridge", "event_ingest", "event_bus", "state_projector", "event_store"],
+        "note": "Agent 通过统一事件协议主动报告阶段、进度、工具调用和结果。"
+      },
+      {
+        "id": "passive_observation",
+        "label": "被动观测与降级",
+        "focus": ["agent_runtime", "passive_observer", "event_ingest", "state_projector", "web_ui"],
+        "note": "未集成协议的 Agent 由 PTY、进程树和输出特征提供低置信度状态。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "web_ui",
+      "type": "frontend",
+      "label": "AgentServer UI",
+      "sublabel": "任务、终端、时间线与房间",
+      "tag": "现有 + 扩展",
+      "pos": [70, 110],
+      "size": [180, 72]
+    },
+    {
+      "id": "control_plane",
+      "type": "backend",
+      "label": "任务控制面",
+      "sublabel": "创建、委派、取消、重试",
+      "tag": "新增",
+      "pos": [330, 110],
+      "size": [180, 72]
+    },
+    {
+      "id": "runtime_registry",
+      "type": "backend",
+      "label": "运行时注册表",
+      "sublabel": "设备 / 终端 / Agent / Run 绑定",
+      "tag": "扩展",
+      "pos": [590, 110],
+      "size": [190, 72]
+    },
+    {
+      "id": "terminal_adapter",
+      "type": "external",
+      "label": "终端适配器",
+      "sublabel": "环境注入 + 控制通道",
+      "tag": "设备侧新增",
+      "pos": [860, 110],
+      "size": [180, 72]
+    },
+    {
+      "id": "agent_runtime",
+      "type": "external",
+      "label": "Agent Runtime",
+      "sublabel": "Codex / Claude / Kimi / 自定义",
+      "tag": "设备侧",
+      "pos": [1080, 300],
+      "size": [190, 76]
+    },
+    {
+      "id": "agent_bridge",
+      "type": "external",
+      "label": "Agent Bridge / SDK",
+      "sublabel": "结构化主动上报",
+      "tag": "首选",
+      "pos": [850, 500],
+      "size": [190, 72]
+    },
+    {
+      "id": "passive_observer",
+      "type": "backend",
+      "label": "被动观测器",
+      "sublabel": "PTY + 进程树 + 输出规则",
+      "tag": "降级",
+      "pos": [1080, 610],
+      "size": [190, 72]
+    },
+    {
+      "id": "event_ingest",
+      "type": "security",
+      "label": "事件接入层",
+      "sublabel": "鉴权、校验、幂等、排序",
+      "tag": "新增",
+      "pos": [590, 500],
+      "size": [190, 72]
+    },
+    {
+      "id": "event_bus",
+      "type": "messagebus",
+      "label": "运行事件流",
+      "sublabel": "append-only RunEvent",
+      "tag": "新增",
+      "pos": [330, 500],
+      "size": [180, 72]
+    },
+    {
+      "id": "state_projector",
+      "type": "backend",
+      "label": "状态投影器",
+      "sublabel": "归并、置信度与状态机",
+      "tag": "新增",
+      "pos": [330, 300],
+      "size": [180, 72]
+    },
+    {
+      "id": "event_store",
+      "type": "database",
+      "label": "事件与状态存储",
+      "sublabel": "事件日志 + 当前快照",
+      "tag": "扩展 SQLite",
+      "pos": [70, 500],
+      "size": [180, 72]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "AgentServer 控制面与事件面",
+      "wraps": ["web_ui", "control_plane", "runtime_registry", "event_ingest", "event_bus", "state_projector", "event_store"],
+      "pad": 28
+    },
+    {
+      "kind": "security-group",
+      "label": "受管设备 / 终端信任边界",
+      "wraps": ["terminal_adapter", "agent_runtime", "agent_bridge", "passive_observer"],
+      "pad": 26
+    }
+  ],
+  "connections": [
+    {"id": "ui_dispatch", "from": "web_ui", "to": "control_plane", "label": "创建 Task / Run", "variant": "emphasis"},
+    {"id": "control_bind", "from": "control_plane", "to": "runtime_registry", "label": "绑定设备与终端", "variant": "emphasis"},
+    {"id": "registry_launch", "from": "runtime_registry", "to": "terminal_adapter", "label": "启动上下文", "variant": "emphasis"},
+    {"id": "adapter_start", "from": "terminal_adapter", "to": "agent_runtime", "label": "启动 / 委派 / 取消", "variant": "emphasis"},
+    {"id": "agent_report", "from": "agent_runtime", "to": "agent_bridge", "label": "RunEvent 主动上报", "variant": "emphasis"},
+    {"id": "bridge_ingest", "from": "agent_bridge", "to": "event_ingest", "label": "Unix Socket / HTTP", "labelAt": [815, 482]},
+    {"id": "observer_sample", "from": "agent_runtime", "to": "passive_observer", "label": "进程与终端信号", "variant": "dashed", "labelAt": [1175, 390]},
+    {"id": "observer_ingest", "from": "passive_observer", "to": "event_ingest", "label": "ObservedEvent", "variant": "dashed"},
+    {"id": "ingest_append", "from": "event_ingest", "to": "event_bus", "label": "校验后追加"},
+    {"id": "bus_project", "from": "event_bus", "to": "state_projector", "label": "按 Run 顺序归并"},
+    {"id": "project_store", "from": "state_projector", "to": "event_store", "label": "快照 + 时间线"},
+    {"id": "store_ui", "from": "event_store", "to": "web_ui", "label": "初始快照 / 历史"},
+    {"id": "project_push", "from": "state_projector", "to": "web_ui", "label": "WebSocket 增量推送"},
+    {"id": "registry_context", "from": "runtime_registry", "to": "event_ingest", "label": "验证 Run 归属", "variant": "security", "labelAt": [685, 196]}
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "事实来源",
+      "items": ["主动协议是权威状态", "被动观测只做降级与校验", "用户与系统控制事件不可被 Agent 覆盖"]
+    },
+    {
+      "dot": "cyan",
+      "title": "一致性",
+      "items": ["每个 Run 单调 sequence", "event_id 保证幂等", "事件日志可回放生成当前快照"]
+    },
+    {
+      "dot": "amber",
+      "title": "安全边界",
+      "items": ["终端只获得短期 Run Token", "服务端校验终端与任务绑定", "输出文本永远不直接成为可信控制指令"]
+    }
+  ]
+}

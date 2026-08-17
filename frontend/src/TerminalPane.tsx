@@ -6,6 +6,11 @@ import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, FolderOpen, Keyboard, LoaderCircle, MonitorPlay, Radio, RadioTower } from 'lucide-react'
 
 import type { DetectedService, TerminalSession } from '@/api'
+import { RunStatusBadge } from '@/components/RunStatusBadge'
+import { RunTimeline } from '@/components/RunTimeline'
+import { useExecutionContext } from '@/execution-context'
+import { activeAgentForTerminal, activeRunForTerminal } from '@/execution-state'
+import { AGENT_OUTFITS } from '@/pixel/sprites'
 import { cn } from '@/lib/utils'
 import {
   EMPTY_VIRTUAL_MODIFIERS,
@@ -115,12 +120,21 @@ export default function TerminalPane({
   const [notice, setNotice] = useState('')
   const [showAllServices, setShowAllServices] = useState(false)
   const [scrolledUp, setScrolledUp] = useState(false)
+  const [timelineRunId, setTimelineRunId] = useState<string | null>(null)
   const [servicesCollapsed, setServicesCollapsed] = useState(
     () => window.matchMedia('(max-width: 767px), (pointer: coarse)').matches,
   )
   const onlineServices = session.services.filter((service) => service.status === 'online')
   const visibleServices = showAllServices ? onlineServices : onlineServices.slice(0, 3)
   const deviceLabel = session.device_name || '本机'
+  const execution = useExecutionContext()
+  const executionRun = activeRunForTerminal(execution.snapshot, session.id)
+  const executionAgent = activeAgentForTerminal(execution.snapshot, session.id)
+  const timelineRun = timelineRunId
+    ? execution.snapshot?.runs.find((run) => run.run_id === timelineRunId) ?? null
+    : null
+  const agentKind = executionAgent?.kind || executionRun?.agent_kind || session.agent?.kind || null
+  const agentName = agentKind ? (AGENT_OUTFITS[agentKind]?.name ?? agentKind) : null
   const connectionLabel = !session.active
     ? '进程已退出'
     : connection === 'online'
@@ -632,6 +646,22 @@ export default function TerminalPane({
           <span className="min-w-0 truncate font-mono text-[8px] text-[#667782]" title={workspaceLabel}>
             {workspaceLabel}
           </span>
+          {(executionRun || executionAgent) && (
+            <RunStatusBadge
+              run={executionRun}
+              agent={executionAgent}
+              compact
+              onClick={executionRun ? () => setTimelineRunId(executionRun.run_id) : undefined}
+            />
+          )}
+          {!executionRun && !executionAgent && agentName && (
+            <span
+              className="flex-none rounded border border-[#2b3741] bg-[#111920] px-1 py-0.5 font-mono text-[7px] text-[#9caab4]"
+              title={session.agent?.cwd ? `${agentName} · ${session.agent.cwd}` : agentName}
+            >
+              {agentName}
+            </span>
+          )}
           <button
             type="button"
             onClick={onOpenWorkspace}
@@ -876,6 +906,14 @@ export default function TerminalPane({
         <div className="absolute top-2 right-3 flex items-center gap-[7px] rounded-md border border-[#315a48] bg-[#12241ddd] px-[9px] py-1.5 font-mono text-[9px] text-primary max-md:top-1.5 max-md:right-2">
           {notice}
         </div>
+      )}
+      {execution.snapshot && timelineRun && (
+        <RunTimeline
+          snapshot={execution.snapshot}
+          run={timelineRun}
+          open
+          onOpenChange={(open) => { if (!open) setTimelineRunId(null) }}
+        />
       )}
       </div>
     </div>

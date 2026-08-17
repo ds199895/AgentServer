@@ -3,6 +3,8 @@
 [![CI](https://github.com/ds199895/AgentServer/actions/workflows/ci.yml/badge.svg)](https://github.com/ds199895/AgentServer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![AgentServer 2D 像素设备房间总览](docs/images/pixel-rooms.png)
+
 AgentServer 是一个集中式 FRP 设备管理和 Web SSH 终端。受管设备只需要运行 OpenSSH
 Server 和 frpc；设备发现、SSH 探测、登录鉴权、终端、工作区和服务预览统一运行在
 AgentServer 所在服务器。
@@ -20,8 +22,33 @@ AgentServer 所在服务器。
 - 每个终端绑定只读工作区；本地终端访问受限目录，SSH 终端通过 SFTP 访问远端文件。
 - 支持文本、图片和 PDF 预览，以及持久化 Artifact 事件和 `read-image` 图片附件。
 - 自动识别设备上的 Vite、Next.js、Storybook 等开发服务，并通过 SSH 隧道安全预览。
+- 2D 像素游戏风设备房间：终端会话映射为可交互小人，编码 Agent 自动换上品牌服装。
+- 提供 Agent 任务、Run、阶段、等待、进度、时间线和父子委派关系的统一状态视图。
 - 提供 Linux/macOS、Windows 设备安装器，以及 systemd、frpc/frps 和 Nginx 配置示例。
 - 通过 GitHub Actions 构建不可变发布制品、原子部署、线上校验和失败回滚。
+
+## 2D 像素房间总览
+
+AgentServer 把所有受管设备渲染成一层像素游戏风格的「设备公寓」：每台设备一间房，
+每个终端会话是房间里的一个小人，整层楼的运转状态一眼可见。
+
+![2D 像素设备房间：每台设备一间房，每个终端一个小人](docs/images/pixel-rooms.png)
+
+- **设备即房间**：地板色带和名牌直接标出 SSH 可用、仅隧道在线、离线三种状态；
+  离线房间整体变暗并亮起告警灯。
+- **终端即小人**：每个会话一个小人，第一个会话坐在工位前（背面朝向，手在键盘上），
+  其余站在地毯上（正面朝向）。当前聚焦的终端脚下有光环，已退出的会话变暗并飘起
+  Zzz；点击小人可直接跳转到对应终端。
+- **Agent 穿品牌服装**：后端通过终端输出特征加进程树校准，自动识别会话中运行的
+  Codex、Claude、Kimi 等编码 Agent，小人会实时换上对应品牌色和像素 Logo 的工服——
+  正面胸口和背面衣背都有 Logo，站立和就坐两种朝向都能一眼认出是谁在干活；
+  Agent 启动、退出、切换时服装即时更换。
+- **工作区跟随**：检测到 Agent 的工作目录与当前工作区不一致时，会弹出确认提示，
+  用户确认后自动打开文件树并跳转到 Agent 正在工作的目录。
+- **游戏化交互**：支持拖动平移、滚轮缩放，机柜 LED、显示器屏幕、台灯等环境元素
+  持续运转，让整层楼是「活的」。
+
+终端页右上角常驻房间缩略图，点击可放大为全屏总览；设备列表页同样内嵌完整世界。
 
 ## 架构
 
@@ -36,6 +63,27 @@ FRP 暴露的 SSH 端口创建终端、SFTP 工作区和开发服务预览。
 生产环境将终端进程与 Web 服务分离：`agentserver-tmux.service` 持有实际 Shell、SSH 和
 Codex 进程，`agentserver.service` 负责 API、WebSocket 和前端。部署时只重启 Web 服务，
 已有 tmux 终端不会被终止。
+
+## Agent 运行状态（v1）
+
+[![Agent Runtime v1 架构图](deploy/agent-runtime-framework.visual-check.1440x900.light.png)](deploy/agent-runtime-framework.html)
+
+当前版本已经具备不可变 Execution Event、Task / Assignment / Run / Agent 投影、字段级证据、
+Run 时间线、父子 Run 树、Linux 本地控制通道和浏览器断线重同步。没有主动接入的 Agent
+仍可由进程树与 PTY 特征保守识别；无法唯一归属的远端进程会保留为设备级观测，不会猜测
+它属于最近使用的终端。
+
+主动上报入口包括 [Reporter CLI](scripts/agentserver_report.py)、HTTP batch API 和
+[Device Bridge](scripts/agentserver_bridge.py)，Codex Hook/JSONL 可通过
+[Provider Hook](scripts/agentserver_provider_hook.py) 归一化。Reporter 可上报
+`thinking`、`coding`、`tooling`、`testing`、`waiting`、进度、Span、Artifact、完成与失败。
+详细运行方式、REST / WebSocket 契约、安全边界、配置和当前限制见
+[Agent Runtime v1 文档](docs/agent-runtime-framework.md)。
+
+Reporter 凭据由已登录的管理端按 Run 短期签发，绑定 owner、设备、终端、launch、Agent 与
+能力，并由持久 registry 校验失效状态。它不是浏览器 Cookie，也不应写进 `.env`、终端启动
+环境、命令历史或仓库。本地控制 socket 和远端 Bridge 的协议只用于公开运行阶段与结果，
+不应上报隐藏推理内容。
 
 ## 参与贡献
 
@@ -300,9 +348,11 @@ sudo systemctl enable --now frpc
 ```bash
 ./.venv/bin/python -m unittest discover -s tests -v
 npm --prefix frontend ci
+npm --prefix frontend test
 npm --prefix frontend run test:layout
 AGENTSERVER_BUILD_SHA="$(git rev-parse HEAD)" npm --prefix frontend run build
 npm --prefix e2e ci
+./.venv/bin/python -m compileall -q app tests
 bash -n scripts/*.sh
 git diff --check
 ```
@@ -417,12 +467,23 @@ AgentServer 使用或受到以下开源项目启发，感谢所有维护者和�
 - [x] 提供 Linux/macOS、Windows 设备安装器和完整 FRP Token 指引。
 - [x] 建立不可变制品、GitHub Actions 生产部署、线上校验和失败回滚流程。
 - [x] 提供像素风设备房间，并可从场景跳转到终端。
+- [x] 识别终端中的 Codex、Claude、Kimi 等编码 Agent（输出特征 + 进程树校准），
+  为房间小人换上对应品牌服装（正面与背面均可见），Agent 切换时自动换装。
+  远端进程只有在 PID、唯一输出特征或唯一候选能够证明时才绑定终端；歧义结果保持未归属。
+- [x] 检测编码 Agent 的工作目录，与当前工作区不一致时提示用户确认后跳转文件树。
+- [x] 建立 Task / Assignment / Run / Agent 事件核心，统一 lifecycle、activity、等待、
+  进度、完成、失败、证据来源与 freshness。
+- [x] 提供 Run 时间线、父子 Run 树、终端精确绑定和 projection 驱动的状态动画。
+- [x] 提供 Linux 本地控制 Broker、Reporter CLI/API、离线 spool、短期 Token 轮换和
+  带 Lease fence 的命令 ACK journal。
+- [x] 接入 Codex Hook/JSONL 原生事件，默认丢弃 prompt、命令参数、tool output 和 transcript。
+- [x] 提供 CloudEvents、OpenTelemetry、A2A、MCP 的脱敏映射库，并强制显式 key/sink 边界。
 
 ### TODO
 
-- [ ] 统一 Agent 的思考、编码、读取、等待、报错、完成和等待输入状态。
-- [ ] 将 Agent、Tool 和任务状态映射为房间内的角色动画与物件交互。
-- [ ] 增加 Agent 事件时间线、任务回放和关键节点快照。
-- [ ] 展示多 Agent 委派、并行执行、交接和结果汇总关系。
+- [ ] 为远端 Bridge 增加设备级 enrollment、长期凭据换取、自动安装/升级和 Windows 安全管道。
+- [ ] 完成 Claude、Kimi 原生事件 Adapter，并用真实 Provider 事件夹具持续回归。
+- [ ] 增加经过 tenant ACL、持久 pseudonym key 与背压保护的 OTel/CloudEvents/A2A/MCP exporter。
+- [ ] 需要横向扩展时迁移共享 EventStore / live transport；v1 会主动拒绝多个 API worker。
 - [ ] 支持自定义房间、工位、角色外观和场景主题。
 - [ ] 提供插件式 Agent、Tool 和场景行为 API。

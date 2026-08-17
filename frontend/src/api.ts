@@ -11,6 +11,13 @@ export type TerminalSession = {
   device_name: string | null
   remote_port: number | null
   services: DetectedService[]
+  /** Detected coding agent running in this session; null/absent = plain shell. */
+  agent?: {
+    kind: string
+    cwd: string
+    source: string
+    since: number
+  } | null
   workspace?: {
     kind: 'local' | 'sftp' | string
     root: string

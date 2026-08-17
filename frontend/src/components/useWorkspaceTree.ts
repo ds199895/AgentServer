@@ -164,12 +164,21 @@ function restoredExpanded(sessionId: string): Record<string, true> {
   }
 }
 
-export function useWorkspaceTree(sessionId: string) {
+export function useWorkspaceTree(
+  sessionId: string,
+  focusPath: string | null = null,
+  onFocusPathConsumed?: () => void,
+) {
   const [state, dispatch] = useReducer(reducer, initialState)
   const stateRef = useRef(state)
   const requestSequence = useRef(0)
   const controllers = useRef(new Map<string, AbortController>())
+  // focusPath 可能在根目录尚未加载时到达;挂起后等目录数据就绪再统一应用,
+  // 应用完毕通过 onFocusPathConsumed 通知外部清空,避免每次渲染重复跳转。
+  const pendingFocusRef = useRef<string | null>(null)
+  const onFocusPathConsumedRef = useRef(onFocusPathConsumed)
   stateRef.current = state
+  onFocusPathConsumedRef.current = onFocusPathConsumed
 
   const loadDirectory = useCallback(async (
     rawPath: string,
@@ -240,6 +249,31 @@ export function useWorkspaceTree(sessionId: string) {
       }
     }
   }, [loadDirectory, state.directories, state.expanded, state.nodes])
+
+  // 应用外部传入的 focusPath:等根目录加载完成后,展开所有祖先目录并选中目标。
+  // 深层祖先的节点要等上一层目录加载后才出现在 nodes 里,上面的 expanded 加载
+  // 效应会逐级接力拉取,因此这里一次性展开全部祖先即可。
+  useEffect(() => {
+    if (focusPath) pendingFocusRef.current = normalizePath(focusPath)
+    const pending = pendingFocusRef.current
+    if (!pending) return
+    if (state.directories['']?.status !== 'loaded') return
+    const segments = pending.split('/')
+    const ancestors: string[] = []
+    for (let index = 1; index < segments.length; index += 1) {
+      ancestors.push(segments.slice(0, index).join('/'))
+    }
+    for (const path of ancestors) {
+      if (!state.expanded[path]) dispatch({ type: 'toggle', path })
+      const directory = state.directories[path]
+      if (!directory || directory.status === 'idle' || directory.status === 'error') {
+        void loadDirectory(path)
+      }
+    }
+    dispatch({ type: 'select', path: pending })
+    pendingFocusRef.current = null
+    onFocusPathConsumedRef.current?.()
+  }, [focusPath, loadDirectory, state.directories, state.expanded])
 
   const toggleDirectory = useCallback((rawPath: string) => {
     const path = normalizePath(rawPath)

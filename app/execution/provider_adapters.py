@@ -1,0 +1,722 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import math
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any, Mapping
+
+from .models import RunActivity, SpanLifecycle, WaitReason
+
+
+_MACHINE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_PROCESS_TRANSPORT_REFERENCE_KEY = os.urandom(32)
+_RUN_ACTIVITIES = frozenset(item.value for item in RunActivity)
+_WAIT_REASONS = frozenset(item.value for item in WaitReason)
+_SPAN_OUTCOMES = frozenset(
+    item.value for item in SpanLifecycle if item is not SpanLifecycle.RUNNING
+)
+_PROVIDER_KINDS = frozenset({"generic", "codex", "claude", "kimi", "deepseek"})
+_STOP_REASONS = frozenset(
+    {"clear", "completed", "failed", "logout", "other", "prompt_input_exit", "shutdown"}
+)
+_CANCEL_REASONS = frozenset(
+    {
+        "dependency_cancelled",
+        "server_requested",
+        "shutdown",
+        "timeout",
+        "unknown",
+        "user_requested",
+    }
+)
+_FAILURE_CODES = frozenset(
+    {
+        "agent_failed",
+        "authentication_failed",
+        "codex_runtime_error",
+        "provider_error",
+        "rate_limited",
+        "resource_exhausted",
+        "runtime_error",
+        "timeout",
+        "tool_failed",
+        "unknown",
+    }
+)
+_TOOL_KIND_ALIASES = {
+    "agent": "subagent",
+    "apply_patch": "file_change",
+    "bash": "command_execution",
+    "command": "command_execution",
+    "command_execution": "command_execution",
+    "edit": "file_change",
+    "file_change": "file_change",
+    "glob": "file_read",
+    "grep": "file_read",
+    "mcp_tool_call": "mcp_tool_call",
+    "read": "file_read",
+    "shell": "command_execution",
+    "spawn_agent": "subagent",
+    "task": "subagent",
+    "web_fetch": "web_search",
+    "web_search": "web_search",
+    "webfetch": "web_search",
+    "websearch": "web_search",
+    "write": "file_change",
+}
+_ARTIFACT_KINDS = frozenset({"file", "image", "log", "report"})
+_MEDIA_TYPE = re.compile(
+    r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}$"
+)
+_UNTYPED_EVENT_TYPES = frozenset(
+    {
+        "agent.registered",
+        "agent.stopping",
+        "run.started",
+        "run.activity.changed",
+        "run.progress.updated",
+        "run.input.requested",
+        "span.started",
+        "span.updated",
+        "span.ended",
+        "child_run.requested",
+        "artifact.published",
+        "run.succeeded",
+        "run.failed",
+        "run.cancelled",
+    }
+)
+
+
+def _identifier(value: object, field: str, *, required: bool = True) -> str | None:
+    if value is None or value == "":
+        if required:
+            raise ValueError(f"provider {field} is required")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"provider {field} must be a string machine identifier")
+    result = value
+    if not _MACHINE_IDENTIFIER.fullmatch(result):
+        raise ValueError(f"provider {field} must be a machine identifier")
+    return result
+
+
+def _known_code(
+    value: object,
+    field: str,
+    allowed: frozenset[str],
+    *,
+    default: str | None = None,
+) -> str:
+    result = str(value or default or "").strip().lower()
+    if result not in allowed:
+        raise ValueError(f"provider {field} is not a supported machine code")
+    return result
+
+
+def _provider_reference(
+    namespace: str,
+    value: object,
+    field: str,
+    *,
+    reference_key: bytes | None = None,
+) -> str | None:
+    """Remove a raw provider ID while preserving local transport correlation.
+
+    Managed hooks use a launch-domain HMAC; the control Broker rekeys it with a
+    private owner/terminal/launch key before persistence. This transport value is
+    not an external anonymity boundary, so exports apply separate keyed aliases.
+    """
+
+    raw = _identifier(value, field, required=False)
+    if raw is None:
+        return None
+    if reference_key is not None and (
+        not isinstance(reference_key, bytes) or len(reference_key) < 32
+    ):
+        raise ValueError("provider reference_key must be at least 32 bytes")
+    if reference_key is None:
+        launch_domain = os.getenv("AGENTSERVER_LAUNCH_ID", "").strip()
+        reference_key = (
+            hashlib.sha256(
+                f"agentserver-provider-transport-v1\0{launch_domain}".encode("utf-8")
+            ).digest()
+            if launch_domain
+            else _PROCESS_TRANSPORT_REFERENCE_KEY
+        )
+    message = f"agentserver-provider-ref-v1\0{namespace}\0{raw}".encode("utf-8")
+    digest = hmac.new(reference_key, message, hashlib.sha256).hexdigest()[:32]
+    return f"provider-{namespace}-{digest}"
+
+
+def _tool_kind(value: object) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _TOOL_KIND_ALIASES.get(normalized, "other_tool")
+
+
+def _progress_payload(payload: Mapping[str, Any]) -> dict[str, int | float]:
+    result: dict[str, int | float] = {}
+    if "progress" in payload:
+        progress = payload["progress"]
+        if (
+            not isinstance(progress, (int, float))
+            or isinstance(progress, bool)
+            or not math.isfinite(progress)
+            or not 0 <= progress <= 1
+        ):
+            raise ValueError("provider progress must be between 0 and 1")
+        result["progress"] = float(progress)
+    if "current" in payload or "total" in payload:
+        current = payload.get("current")
+        total = payload.get("total")
+        if (
+            not isinstance(current, (int, float))
+            or isinstance(current, bool)
+            or not math.isfinite(current)
+            or not isinstance(total, (int, float))
+            or isinstance(total, bool)
+            or not math.isfinite(total)
+            or current < 0
+            or total <= 0
+            or current > total
+        ):
+            raise ValueError("provider current/total progress is invalid")
+        result.update(current=current, total=total, progress=current / total)
+    if not result:
+        raise ValueError("provider progress event requires numeric progress")
+    return result
+
+
+def _artifact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    path = payload.get("path")
+    if not isinstance(path, str) or not path or len(path) > 4_096 or "\x00" in path:
+        raise ValueError("provider artifact path is invalid")
+    normalized = path.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    windows = PureWindowsPath(normalized)
+    if posix.is_absolute() or windows.is_absolute() or windows.drive:
+        raise ValueError("provider artifact path must be workspace-relative")
+    parts = tuple(part for part in posix.parts if part not in {"", "."})
+    if not parts or ".." in parts:
+        raise ValueError("provider artifact path must be workspace-relative")
+    result: dict[str, Any] = {
+        "path": "/".join(parts),
+        "kind": _known_code(
+            payload.get("kind"), "artifact kind", _ARTIFACT_KINDS, default="file"
+        ),
+    }
+    media_type = payload.get("media_type")
+    if media_type is not None and media_type != "":
+        if not isinstance(media_type, str):
+            raise ValueError("provider artifact media_type must be a string")
+        normalized_media_type = media_type.strip().lower()
+        if len(normalized_media_type) > 192 or not _MEDIA_TYPE.fullmatch(
+            normalized_media_type
+        ):
+            raise ValueError("provider artifact media_type is invalid")
+        result["media_type"] = normalized_media_type
+    return result
+
+
+def sanitize_runtime_payload(
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    provider_kind: str,
+    reference_key: bytes | None = None,
+) -> dict[str, Any]:
+    """Rebuild a runtime event from its event-specific public contract.
+
+    ``reference_key`` is required at a persistence boundary. Without it, the
+    deterministic references are transport-only correlation values and are not
+    an anonymity boundary.
+    """
+
+    if event_type not in _UNTYPED_EVENT_TYPES:
+        raise ValueError("unsupported untyped provider event type")
+    if event_type == "agent.registered":
+        return {"kind": provider_kind if provider_kind in _PROVIDER_KINDS else "generic"}
+    if event_type == "agent.stopping":
+        return {
+            "reason": _known_code(
+                payload.get("reason"), "reason", _STOP_REASONS, default="other"
+            )
+        }
+    if event_type == "run.started":
+        return {
+            "activity": _known_code(
+                payload.get("activity"), "activity", _RUN_ACTIVITIES, default="unknown"
+            )
+        }
+    if event_type == "run.activity.changed":
+        activity = _known_code(payload.get("activity"), "activity", _RUN_ACTIVITIES)
+        result: dict[str, Any] = {"activity": activity}
+        if activity == RunActivity.WAITING.value:
+            reason = _known_code(payload.get("wait_reason"), "wait_reason", _WAIT_REASONS)
+            result["wait_reason"] = reason
+            target = _identifier(
+                payload.get("wait_target_run_id"),
+                "wait_target_run_id",
+                required=False,
+            )
+            if reason == WaitReason.CHILD_RUN.value and target is None:
+                raise ValueError("child_run waiting requires wait_target_run_id")
+            if reason == WaitReason.CHILD_RUN.value and target is not None:
+                result["wait_target_run_id"] = target
+        return result
+    if event_type == "run.progress.updated":
+        return _progress_payload(payload)
+    if event_type == "artifact.published":
+        return _artifact_payload(payload)
+    if event_type == "run.input.requested":
+        return {
+            "wait_reason": _known_code(
+                payload.get("wait_reason"),
+                "wait_reason",
+                _WAIT_REASONS,
+                default=WaitReason.USER_INPUT.value,
+            )
+        }
+    if event_type in {"span.started", "span.updated", "span.ended"}:
+        span_id = _provider_reference(
+            "span",
+            payload.get("span_id"),
+            "span_id",
+            reference_key=reference_key,
+        )
+        assert span_id is not None
+        result = {"span_id": span_id}
+        if event_type == "span.updated":
+            result.update(_progress_payload(payload))
+            return result
+        result.update({"name": _tool_kind(payload.get("name")), "kind": "tool"})
+        if event_type == "span.ended":
+            result["outcome"] = _known_code(
+                payload.get("outcome"), "outcome", _SPAN_OUTCOMES
+            )
+        return result
+    if event_type == "child_run.requested":
+        delegation_id = _provider_reference(
+            "delegation",
+            payload.get("delegation_id"),
+            "delegation_id",
+            reference_key=reference_key,
+        )
+        assert delegation_id is not None
+        return {
+            "delegation_id": delegation_id,
+            "agent_kind": _known_code(
+                payload.get("agent_kind"),
+                "agent_kind",
+                _PROVIDER_KINDS,
+                default=provider_kind if provider_kind in _PROVIDER_KINDS else "generic",
+            ),
+            "title": "Observed provider delegation",
+        }
+    if event_type == "run.failed":
+        return {
+            "code": _known_code(
+                payload.get("code"), "code", _FAILURE_CODES, default="provider_error"
+            )
+        }
+    if event_type == "run.cancelled":
+        return {
+            "reason": _known_code(
+                payload.get("reason"), "reason", _CANCEL_REASONS, default="unknown"
+            )
+        }
+    # run.succeeded carries no provider text. Summaries remain an explicitly
+    # authenticated active-reporter concern, not an untyped adapter field.
+    return {}
+
+
+@dataclass(frozen=True)
+class NormalizedRuntimeEvent:
+    """A public, provider-neutral runtime fact.
+
+    Adapters intentionally discard prompts, tool arguments, tool output and
+    assistant text.  Those values can contain secrets or hidden reasoning and
+    are not required to render a lifecycle/activity projection.
+    """
+
+    type: str
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+
+class ProviderAdapter:
+    """Normalize a provider event without treating transcripts as an API."""
+
+    kind = "generic"
+    capabilities = frozenset(
+        {"phase_reporting", "progress_reporting", "artifact_reporting"}
+    )
+
+    def normalize_many(
+        self, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        event_type = str(event.get("type") or "").strip()
+        if not event_type:
+            raise ValueError("provider event type is required")
+        payload = event.get("payload") or {}
+        if not isinstance(payload, Mapping):
+            raise ValueError("provider payload must be an object")
+        return (
+            NormalizedRuntimeEvent(
+                event_type,
+                sanitize_runtime_payload(
+                    event_type, payload, provider_kind=self.kind
+                ),
+            ),
+        )
+
+    def normalize(self, event: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Backward-compatible single-event boundary."""
+        values = self.normalize_many(event)
+        if len(values) != 1:
+            raise ValueError("provider event expands to multiple runtime events")
+        return values[0].type, dict(values[0].payload)
+
+
+def _tool_activity(tool_name: str, tool_input: object = None) -> str:
+    kind = _tool_kind(tool_name)
+    if kind == "file_change":
+        return "coding"
+    if kind == "subagent":
+        return "waiting"
+    # Do not inspect or persist the command itself.  A small verb-only check is
+    # intentionally avoided because even command text can contain credentials.
+    _ = tool_input
+    return "tooling"
+
+
+def _tool_outcome(response: object) -> str:
+    if not isinstance(response, Mapping) or not response:
+        return "failed"
+    for key in ("isError", "is_error", "error"):
+        if response.get(key):
+            return "failed"
+    status = str(response.get("status") or "").lower()
+    if status in {"error", "failed", "failure"}:
+        return "failed"
+    if status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if status and status not in {"complete", "completed", "ok", "success", "succeeded"}:
+        return "failed"
+    if "exit_code" in response:
+        exit_code = response.get("exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            return "failed"
+        return "succeeded" if exit_code == 0 else "failed"
+    return "succeeded" if status else "failed"
+
+
+class CodexAdapter(ProviderAdapter):
+    """Normalize stable Codex Hook and ``codex exec --json`` events.
+
+    Hook fields follow the documented command-hook contract.  JSONL events use
+    only the documented top-level and item type/status fields; rollout
+    transcripts are deliberately unsupported because their format is not a
+    stable interface.
+    """
+
+    kind = "codex"
+    capabilities = ProviderAdapter.capabilities | {
+        "tool_events",
+        "delegation_observation",
+        "cancel",
+        "native_hooks",
+        "jsonl",
+    }
+
+    def normalize_many(
+        self, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        hook_name = str(event.get("hook_event_name") or "")
+        if hook_name:
+            return self._normalize_hook(hook_name, event)
+        return self._normalize_jsonl(event)
+
+    def _normalize_hook(
+        self, hook_name: str, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        metadata: dict[str, Any] = {}
+        if hook_name == "SessionStart":
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.registered",
+                    {
+                        **metadata,
+                        "kind": self.kind,
+                        "source": "codex_hook",
+                    },
+                ),
+            )
+        if hook_name == "SessionEnd":
+            reason = str(event.get("reason") or "other").strip().lower()
+            if reason not in _STOP_REASONS:
+                reason = "other"
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.stopping",
+                    {**metadata, "reason": reason},
+                ),
+            )
+        if hook_name == "UserPromptSubmit":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "PermissionRequest":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "waiting",
+                        "wait_reason": "approval",
+                    },
+                ),
+            )
+        if hook_name == "PreToolUse":
+            raw_tool_name = str(event.get("tool_name") or "")
+            tool_name = _tool_kind(raw_tool_name)
+            tool_id = _provider_reference(
+                "tool", event.get("tool_use_id"), "tool_use_id"
+            )
+            activity = _tool_activity(raw_tool_name, event.get("tool_input"))
+            activity_payload: dict[str, Any] = {
+                **metadata,
+                "activity": activity,
+            }
+            if activity == "waiting":
+                # There is no canonical child Run yet; do not invent a target
+                # identity.  The child_run.requested event below is the durable
+                # delegation handshake input.
+                activity_payload["activity"] = "tooling"
+            values = [NormalizedRuntimeEvent("run.activity.changed", activity_payload)]
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.started",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "kind": "tool",
+                        },
+                    )
+                )
+            return tuple(values)
+        if hook_name == "PostToolUse":
+            tool_name = _tool_kind(event.get("tool_name"))
+            tool_id = _provider_reference(
+                "tool", event.get("tool_use_id"), "tool_use_id"
+            )
+            values: list[NormalizedRuntimeEvent] = []
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "outcome": _tool_outcome(event.get("tool_response")),
+                        },
+                    )
+                )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        if hook_name == "SubagentStart":
+            delegation_id = _provider_reference(
+                "delegation", event.get("agent_id"), "agent_id"
+            )
+            assert delegation_id is not None
+            agent_kind = str(event.get("agent_type") or "codex").strip().lower()
+            if agent_kind not in _PROVIDER_KINDS:
+                agent_kind = "codex"
+            return (
+                NormalizedRuntimeEvent(
+                    "child_run.requested",
+                    {
+                        **metadata,
+                        "delegation_id": delegation_id,
+                        "agent_kind": agent_kind,
+                        "title": "Observed Codex delegation",
+                    },
+                ),
+            )
+        if hook_name == "SubagentStop":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "PreCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "planning"},
+                ),
+            )
+        if hook_name == "PostCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "Stop":
+            # Stop is a turn boundary, not proof that the delegated Task has
+            # succeeded.  Keep result authority with explicit completion.
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "finalizing"},
+                ),
+            )
+        raise ValueError("unsupported Codex hook event")
+
+    def _normalize_jsonl(
+        self, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        event_type = str(event.get("type") or "")
+        metadata: dict[str, Any] = {}
+        if event_type == "thread.started":
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.registered",
+                    {**metadata, "kind": self.kind, "source": "codex_jsonl"},
+                ),
+            )
+        if event_type == "turn.started":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed", {**metadata, "activity": "thinking"}
+                ),
+            )
+        if event_type in {"turn.completed"}:
+            # A Codex turn can belong to a provider subagent sharing the parent
+            # terminal.  It is not proof that the AgentServer Task succeeded.
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "finalizing", "provider_status": "completed"},
+                ),
+            )
+        if event_type in {"turn.failed", "error"}:
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "finalizing",
+                        "provider_status": "failed",
+                        "code": "codex_runtime_error",
+                    },
+                ),
+            )
+        if event_type.startswith("item."):
+            item = event.get("item")
+            if not isinstance(item, Mapping):
+                raise ValueError("Codex item event requires an item object")
+            item_id = _provider_reference("item", item.get("id"), "item.id")
+            item_type = str(item.get("type") or "unknown").strip().lower()
+            activity = {
+                "reasoning": "thinking",
+                "plan": "planning",
+                "file_change": "coding",
+                "command_execution": "tooling",
+                "mcp_tool_call": "tooling",
+                "web_search": "tooling",
+            }.get(item_type, "thinking")
+            if event_type == "item.started":
+                values = [
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed",
+                        {**metadata, "activity": activity},
+                    )
+                ]
+                if item_id and item_type in {
+                    "file_change",
+                    "command_execution",
+                    "mcp_tool_call",
+                    "web_search",
+                }:
+                    values.append(
+                        NormalizedRuntimeEvent(
+                            "span.started",
+                            {
+                                **metadata,
+                                "span_id": item_id,
+                                "name": item_type,
+                                "kind": "tool",
+                            },
+                        )
+                    )
+                return tuple(values)
+            if event_type == "item.completed" and item_id and item_type in {
+                "file_change",
+                "command_execution",
+                "mcp_tool_call",
+                "web_search",
+            }:
+                status = str(item.get("status") or "").strip().lower()
+                if status in {"failed", "error", "failure"}:
+                    outcome = "failed"
+                elif status in {"cancelled", "canceled"}:
+                    outcome = "cancelled"
+                elif status in {"complete", "completed", "ok", "success", "succeeded"}:
+                    outcome = "succeeded"
+                else:
+                    raise ValueError("unsupported Codex item completion status")
+                return (
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": item_id,
+                            "name": item_type,
+                            "outcome": outcome,
+                        },
+                    ),
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed",
+                        {**metadata, "activity": "thinking"},
+                    ),
+                )
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        raise ValueError("unsupported Codex JSONL event")
+
+
+class ClaudeAdapter(ProviderAdapter):
+    kind = "claude"
+    capabilities = ProviderAdapter.capabilities | {"tool_events", "cancel"}
+
+
+class KimiAdapter(ProviderAdapter):
+    kind = "kimi"
+    capabilities = ProviderAdapter.capabilities | {"tool_events", "cancel"}
+
+
+ADAPTERS: dict[str, ProviderAdapter] = {
+    adapter.kind: adapter
+    for adapter in (CodexAdapter(), ClaudeAdapter(), KimiAdapter(), ProviderAdapter())
+}

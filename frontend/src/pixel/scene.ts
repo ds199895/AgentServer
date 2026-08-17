@@ -2,6 +2,7 @@
 // All variety is derived from hash(device.id) so re-renders never jump around.
 
 import type { Device, TerminalSession } from '../api'
+import type { RunActivity, RunLifecycle, WaitReason } from '../execution-state'
 import { hashString, type StatusKind } from './sprites'
 
 export const TILE = 16
@@ -19,6 +20,24 @@ export interface CharSlot {
   x: number // relative to room origin
   y: number
   variant: number
+  /** Detected agent kind (AGENT_OUTFITS key), null for plain shell sessions. */
+  agent: string | null
+  lifecycle: RunLifecycle | null
+  activity: RunActivity | null
+  waitReason: WaitReason | null
+  stale: boolean
+  agentCwd: string
+  runLabel: string | null
+}
+
+export type TerminalExecutionVisual = {
+  agentKind: string | null
+  lifecycle: RunLifecycle | null
+  activity: RunActivity | null
+  waitReason: WaitReason | null
+  stale: boolean
+  agentCwd: string
+  runLabel: string | null
 }
 
 export interface RoomModel {
@@ -56,17 +75,23 @@ export function deviceStatus(device: Device): StatusKind {
 }
 
 // Standing slots on the rug (relative to room origin), in fill order.
+// Spaced ~20px apart for the 16×22 sprites; all stay on the 64×40 rug.
 const STAND_SLOTS = [
-  { x: 92, y: 96 },
+  { x: 82, y: 96 },
+  { x: 102, y: 96 },
   { x: 122, y: 96 },
-  { x: 78, y: 114 },
-  { x: 107, y: 116 },
-  { x: 136, y: 114 },
-  { x: 63, y: 98 },
-  { x: 151, y: 98 },
+  { x: 82, y: 114 },
+  { x: 102, y: 114 },
+  { x: 122, y: 114 },
+  { x: 92, y: 105 },
 ]
 
-export function buildScene(devices: Device[], sessions: TerminalSession[], aspect: number): SceneModel {
+export function buildScene(
+  devices: Device[],
+  sessions: TerminalSession[],
+  aspect: number,
+  executionByTerminal: ReadonlyMap<string, TerminalExecutionVisual> = new Map(),
+): SceneModel {
   const count = devices.length
   const safeAspect = Math.min(2.4, Math.max(0.6, aspect || 1.6))
   let columns = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count * safeAspect))))
@@ -94,13 +119,24 @@ export function buildScene(devices: Device[], sessions: TerminalSession[], aspec
     const deviceSessions = sessionsByDevice.get(device.id) || []
     const chars: CharSlot[] = deviceSessions.slice(0, STAND_SLOTS.length + 1).map((session, slot) => {
       const variant = hashString(session.id)
+      const execution = executionByTerminal.get(session.id)
+      const agent = execution?.agentKind ?? session.agent?.kind ?? null
+      const runState = {
+        lifecycle: execution?.lifecycle ?? null,
+        activity: execution?.activity ?? null,
+        waitReason: execution?.waitReason ?? null,
+        stale: execution?.stale ?? false,
+        agentCwd: execution?.agentCwd ?? session.agent?.cwd ?? '',
+        runLabel: execution?.runLabel ?? null,
+      }
       if (slot === 0) {
         // Seated at the desk, back to the viewer; the sprite includes the
-        // chair and is anchored so the hands land on the keyboard.
-        return { sessionId: session.id, active: session.active, pose: 'sit', x: deskX + 17, y: 30, variant }
+        // chair and is anchored so the hands land on the keyboard (desk-local
+        // x 18-30, y 26-31) and the feet stay clear of the y+64 nameplate.
+        return { sessionId: session.id, active: session.active, pose: 'sit', x: deskX + 15, y: 28, variant, agent, ...runState }
       }
       const spot = STAND_SLOTS[(slot - 1) % STAND_SLOTS.length]
-      return { sessionId: session.id, active: session.active, pose: 'stand', x: spot.x, y: spot.y, variant }
+      return { sessionId: session.id, active: session.active, pose: 'stand', x: spot.x, y: spot.y, variant, agent, ...runState }
     })
 
     const decorRoll = (hash >>> 3) % 3

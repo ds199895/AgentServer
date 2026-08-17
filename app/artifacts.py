@@ -139,6 +139,9 @@ class ArtifactEvent:
     created_at: float
     attachment: AttachmentRef | None = None
     schema_version: int = 1
+    task_id: str | None = None
+    run_id: str | None = None
+    span_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return the nested canonical form plus convenient UI fields."""
@@ -149,6 +152,9 @@ class ArtifactEvent:
             "event": self.event_type,
             "owner": self.owner,
             "terminal_id": self.terminal_id,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "span_id": self.span_id,
             "file": self.file.as_dict(),
             "path": self.file.path,
             "name": self.file.display_name,
@@ -249,6 +255,9 @@ class ArtifactEventStore:
                     version TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     schema_version INTEGER NOT NULL DEFAULT 1,
+                    task_id TEXT,
+                    run_id TEXT,
+                    span_id TEXT,
                     attachment_id TEXT,
                     attachment_media_type TEXT,
                     attachment_size INTEGER,
@@ -258,10 +267,26 @@ class ArtifactEventStore:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(artifact_events)")
+            }
+            for column in ("task_id", "run_id", "span_id"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE artifact_events ADD COLUMN {column} TEXT"
+                    )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS artifact_events_terminal
                 ON artifact_events(owner, terminal_id, sequence)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS artifact_events_run
+                ON artifact_events(owner, terminal_id, run_id, sequence)
+                WHERE run_id IS NOT NULL
                 """
             )
             connection.execute(
@@ -307,6 +332,9 @@ class ArtifactEventStore:
             source=row["source"],
             version=row["version"],
             created_at=float(row["created_at"]),
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            span_id=row["span_id"],
             attachment=attachment,
             schema_version=int(row["schema_version"]),
         )
@@ -323,12 +351,22 @@ class ArtifactEventStore:
         created_at: float | None = None,
         attachment: AttachmentRef | None = None,
         event_id: str | None = None,
+        task_id: str | None = None,
+        run_id: str | None = None,
+        span_id: str | None = None,
     ) -> ArtifactEvent:
         self._require_scope(owner, terminal_id)
         if not event_type:
             raise ValueError("artifact event_type must not be empty")
         if not source:
             raise ValueError("artifact source must not be empty")
+        for field_name, value in (
+            ("task_id", task_id),
+            ("run_id", run_id),
+            ("span_id", span_id),
+        ):
+            if value is not None and not value:
+                raise ValueError(f"artifact {field_name} must not be empty")
         if attachment and file.media_type and attachment.media_type != file.media_type:
             raise ValueError("file and attachment media types do not match")
         timestamp = time.time() if created_at is None else float(created_at)
@@ -354,9 +392,10 @@ class ArtifactEventStore:
                         id, owner, terminal_id, event_type,
                         file_path, file_name, file_media_type, file_size, file_kind,
                         source, version, created_at, schema_version,
+                        task_id, run_id, span_id,
                         attachment_id, attachment_media_type, attachment_size,
                         attachment_width, attachment_height, attachment_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         durable_id,
@@ -371,6 +410,9 @@ class ArtifactEventStore:
                         source,
                         version,
                         timestamp,
+                        task_id,
+                        run_id,
+                        span_id,
                         *attachment_values,
                     ),
                 )
@@ -391,18 +433,24 @@ class ArtifactEventStore:
         terminal_id: str,
         after_sequence: int = 0,
         limit: int | None = None,
+        run_id: str | None = None,
     ) -> list[ArtifactEvent]:
         self._require_scope(owner, terminal_id)
         if after_sequence < 0:
             raise ValueError("after_sequence must not be negative")
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive")
+        if run_id is not None and not run_id:
+            raise ValueError("run_id must not be empty")
         query = (
             "SELECT * FROM artifact_events "
             "WHERE owner = ? AND terminal_id = ? AND sequence > ? "
-            "ORDER BY sequence"
         )
         parameters: tuple[object, ...] = (owner, terminal_id, after_sequence)
+        if run_id is not None:
+            query += "AND run_id = ? "
+            parameters += (run_id,)
+        query += "ORDER BY sequence"
         if limit is not None:
             query += " LIMIT ?"
             parameters += (limit,)
@@ -416,20 +464,26 @@ class ArtifactEventStore:
         owner: str,
         terminal_id: str,
         limit: int = 500,
+        run_id: str | None = None,
     ) -> list[ArtifactEvent]:
         """Return the newest bounded history in chronological order."""
         self._require_scope(owner, terminal_id)
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if run_id is not None and not run_id:
+            raise ValueError("run_id must not be empty")
+        query = (
+            "SELECT * FROM artifact_events "
+            "WHERE owner = ? AND terminal_id = ? "
+        )
+        parameters: tuple[object, ...] = (owner, terminal_id)
+        if run_id is not None:
+            query += "AND run_id = ? "
+            parameters += (run_id,)
+        query += "ORDER BY sequence DESC LIMIT ?"
+        parameters += (limit,)
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM artifact_events
-                WHERE owner = ? AND terminal_id = ?
-                ORDER BY sequence DESC LIMIT ?
-                """,
-                (owner, terminal_id, limit),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [self._from_row(row) for row in reversed(rows)]
 
     def subscribe(

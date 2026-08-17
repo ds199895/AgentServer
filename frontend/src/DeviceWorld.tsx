@@ -1,11 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUpRight, LayoutGrid, XIcon } from 'lucide-react'
 import type { Device, TerminalSession } from './api'
-import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type SceneModel } from './pixel/scene'
-import { getAtlas, getCharacter, getScreen, makeFloorLabel, RACK_LEDS, STATUS_COLOR } from './pixel/sprites'
+import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type SceneModel, type TerminalExecutionVisual } from './pixel/scene'
+import { AGENT_OUTFITS, CHAR_DIMS, getAtlas, getCharacter, getScreen, makeFloorLabel, RACK_LEDS, STATUS_COLOR } from './pixel/sprites'
 import { DeviceIcon } from '@/components/device-bits'
 import { Eyebrow } from '@/components/Eyebrow'
+import { RunStatusBadge } from '@/components/RunStatusBadge'
 import { Button } from '@/components/ui/button'
+import { useExecutionContext } from '@/execution-context'
+import {
+  activeAgentForTerminal,
+  activeRunForTerminal,
+  evidenceFreshness,
+  fieldEvidence,
+  runStatusLabel,
+} from '@/execution-state'
 import { cn } from '@/lib/utils'
 
 type Props = {
@@ -32,8 +41,15 @@ type HoveredPerson = {
   sessionName: string
   deviceName: string
   active: boolean
+  agentName: string | null
+  agentCwd: string
+  runLabel: string | null
   left: number
   top: number
+}
+
+function agentDisplayName(kind: string): string {
+  return AGENT_OUTFITS[kind]?.name ?? kind
 }
 
 function quantizeScale(scale: number): number {
@@ -42,6 +58,7 @@ function quantizeScale(scale: number): number {
 }
 
 export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe, onEdit, onSelectTerminal, compact = false, activeSessionId = null }: Props) {
+  const execution = useExecutionContext()
   const hostRef = useRef<HTMLDivElement>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
@@ -57,14 +74,49 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   )
   const selectedSession = useMemo(() => sessions.find((session) => session.id === selectedSessionId) || null, [sessions, selectedSessionId])
   const selectedSessionDevice = useMemo(() => devices.find((device) => device.id === selectedSession?.device_id) || null, [devices, selectedSession])
+  const executionByTerminal = useMemo(() => {
+    const result = new Map<string, TerminalExecutionVisual>()
+    if (!execution.snapshot) return result
+    for (const session of sessions) {
+      const run = activeRunForTerminal(execution.snapshot, session.id)
+      const agent = activeAgentForTerminal(execution.snapshot, session.id)
+      if (!run && !agent) continue
+      result.set(session.id, {
+        agentKind: agent?.kind || run?.agent_kind || null,
+        lifecycle: run?.lifecycle ?? null,
+        activity: run?.activity ?? null,
+        waitReason: run?.wait_reason ?? null,
+        stale: run
+          ? run.stale === true
+            || evidenceFreshness(fieldEvidence(run, 'activity'), execution.freshness_now) === 'stale'
+          : agent?.stale === true,
+        agentCwd: agent?.cwd || '',
+        runLabel: run ? runStatusLabel(run, execution.freshness_now) : null,
+      })
+    }
+    return result
+  }, [execution.freshness_now, execution.snapshot, sessions])
+  const selectedExecutionRun = selectedSession
+    ? activeRunForTerminal(execution.snapshot, selectedSession.id)
+    : null
+  const selectedExecutionAgent = selectedSession
+    ? activeAgentForTerminal(execution.snapshot, selectedSession.id)
+    : null
+  const selectedAgentKind = selectedExecutionAgent?.kind
+    || selectedExecutionRun?.agent_kind
+    || selectedSession?.agent?.kind
+    || null
+  const selectedAgentCwd = selectedExecutionAgent?.cwd || selectedSession?.agent?.cwd || ''
   const sceneVersion = useMemo(() => [
     ...devices.map((device) => `${device.id}:${device.name}:${device.remote_port}:${Number(device.frp_online)}:${Number(device.ssh_available)}:${device.last_error ? 1 : 0}`),
-    ...sessions.map((session) => `${session.id}:${session.device_id || ''}:${Number(session.active)}`),
-  ].join('|'), [devices, sessions])
+    ...sessions.map((session) => `${session.id}:${session.device_id || ''}:${Number(session.active)}:${session.agent?.kind || ''}`),
+    `execution:${execution.snapshot?.as_of_sequence ?? 'legacy'}`,
+    `freshness:${execution.freshness_now}`,
+  ].join('|'), [devices, execution.freshness_now, execution.snapshot?.as_of_sequence, sessions])
   const scene = useMemo<SceneModel>(() => {
     const host = hostRef.current
     const aspect = host ? host.clientWidth / Math.max(1, host.clientHeight) : 1.6
-    return buildScene(devices, sessions, aspect)
+    return buildScene(devices, sessions, aspect, executionByTerminal)
     // sceneVersion captures every input that affects layout
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sceneVersion])
@@ -186,8 +238,8 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
         const room = scene.rooms[roomIndex]
         for (let charIndex = room.chars.length - 1; charIndex >= 0; charIndex -= 1) {
           const char = room.chars[charIndex]
-          const width = char.pose === 'sit' ? 14 : 12
-          const height = char.pose === 'sit' ? 23 : 16
+          const width = CHAR_DIMS[char.pose].w
+          const height = CHAR_DIMS[char.pose].h
           if (
             point.x >= room.x + char.x - padding && point.x <= room.x + char.x + width + padding
             && point.y >= room.y + char.y - padding && point.y <= room.y + char.y + height + padding
@@ -210,7 +262,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       if (person) {
         const session = sessions.find((item) => item.id === person.char.sessionId)
         const popoverWidth = Math.min(260, Math.max(220, cssW - 18))
-        const spriteWidth = person.char.pose === 'sit' ? 14 : 12
+        const spriteWidth = CHAR_DIMS[person.char.pose].w
         const anchor = canvasPoint(
           person.room.x + person.char.x + spriteWidth / 2,
           person.room.y + person.char.y,
@@ -223,6 +275,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           sessionName: session?.name || `终端 ${person.char.sessionId.slice(0, 8)}`,
           deviceName: person.room.device.name,
           active: person.char.active,
+          agentName: person.char.agent ? agentDisplayName(person.char.agent) : null,
+          agentCwd: person.char.agentCwd,
+          runLabel: person.char.runLabel,
           left: Math.min(cssW - popoverWidth / 2 - 9, Math.max(popoverWidth / 2 + 9, anchor.x)),
           top: anchor.y - Math.max(5, 4 * camera.scale),
         }
@@ -232,6 +287,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           && current.sessionName === nextHoveredPerson.sessionName
           && current.deviceName === nextHoveredPerson.deviceName
           && current.active === nextHoveredPerson.active
+          && current.agentName === nextHoveredPerson.agentName
+          && current.agentCwd === nextHoveredPerson.agentCwd
+          && current.runLabel === nextHoveredPerson.runLabel
           && current.left === nextHoveredPerson.left
           && current.top === nextHoveredPerson.top
             ? current
@@ -508,31 +566,85 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       const hasSitter = room.chars.some((char) => char.pose === 'sit')
       if (!hasSitter) context.drawImage(atlas.chair, x + layout.chairX, y + layout.chairY)
       room.chars.forEach((char, slotIndex) => {
+        const terminalOutcome = char.lifecycle === 'succeeded'
+          || char.lifecycle === 'failed'
+          || char.lifecycle === 'cancelled'
+          || char.lifecycle === 'lost'
+        const phaseRate = char.activity === 'coding' || char.activity === 'tooling'
+          ? 7
+          : char.activity === 'testing'
+            ? 5
+            : 4
+        const freezeCharacter = reduceMotion || char.activity === 'waiting' || char.stale || terminalOutcome
         const sprite = getCharacter(
           char.pose,
           char.variant,
-          reduceMotion ? 0 : Math.floor(time * 4 + slotIndex * 1.3) % 2,
-          !reduceMotion && (time + slotIndex * 2.1) % 3.7 < 0.15,
-          char.active,
+          freezeCharacter ? 0 : Math.floor(time * phaseRate + slotIndex * 1.3) % 2,
+          !freezeCharacter && (time + slotIndex * 2.1) % 3.7 < 0.15,
+          char.active && char.lifecycle !== 'lost',
+          char.agent,
         )
         if (char.pose === 'stand') {
           context.fillStyle = 'rgba(0,0,0,.3)'
           context.beginPath()
-          context.ellipse(x + char.x + 6, y + char.y + 15, 6, 2, 0, 0, Math.PI * 2)
+          context.ellipse(x + char.x + 8, y + char.y + 21, 7, 2, 0, 0, Math.PI * 2)
           context.fill()
         }
         context.drawImage(sprite, x + char.x, y + char.y)
+        const markerX = x + char.x + (char.pose === 'sit' ? 9 : 8)
+        const markerY = y + char.y - 5
+        context.save()
+        if (char.stale) {
+          context.fillStyle = '#6f7d89'
+          context.beginPath()
+          context.arc(markerX, markerY, 5, 0, Math.PI * 2)
+          context.fill()
+          context.fillStyle = '#10161c'
+          context.font = 'bold 7px monospace'
+          context.textAlign = 'center'
+          context.textBaseline = 'middle'
+          context.fillText('?', markerX, markerY + 0.5)
+        } else if (char.lifecycle === 'failed' || char.lifecycle === 'lost') {
+          context.drawImage(atlas.alert, markerX - 7, markerY - 7, 14, 14)
+        } else if (char.lifecycle === 'succeeded') {
+          const sparkle = atlas.sparkles[reduceMotion ? 0 : Math.floor(time * 5) % 2]
+          context.drawImage(sparkle, markerX - 7, markerY - 7, 14, 14)
+        } else if (char.activity === 'thinking' || char.activity === 'planning' || char.activity === 'reviewing') {
+          context.fillStyle = '#c9a9f4'
+          context.globalAlpha = reduceMotion ? 0.85 : 0.6 + Math.sin(time * 3 + slotIndex) * 0.25
+          for (let dot = 0; dot < 3; dot += 1) {
+            context.beginPath()
+            context.arc(markerX - 4 + dot * 4, markerY, dot === 2 ? 2 : 1.5, 0, Math.PI * 2)
+            context.fill()
+          }
+        } else if (char.activity === 'testing') {
+          const radius = reduceMotion ? 6 : 6 + Math.sin(time * 4 + slotIndex) * 1.5
+          context.strokeStyle = '#91cce8'
+          context.lineWidth = 1.25 / camera.scale
+          context.beginPath()
+          context.arc(markerX, markerY, radius, 0, Math.PI * 2)
+          context.stroke()
+        } else if (char.activity === 'waiting') {
+          context.fillStyle = '#e9bd68'
+          context.fillRect(markerX - 4, markerY - 5, 3, 10)
+          context.fillRect(markerX + 1, markerY - 5, 3, 10)
+        } else if (char.activity === 'coding' || char.activity === 'tooling') {
+          const alpha = reduceMotion ? 0.18 : 0.14 + 0.08 * Math.sin(time * 6 + slotIndex)
+          glow(markerX, markerY + 8, 13, '#77f2b4', alpha)
+        }
+        context.restore()
         if (char.sessionId === activeSessionIdRef.current) {
           // pulsing ground ring under the character whose terminal tab is active
-          const centerX = char.pose === 'sit' ? char.x + 7 : char.x + 6
-          const baseY = char.pose === 'sit' ? char.y + 21 : char.y + 15
+          const centerX = char.pose === 'sit' ? char.x + 9 : char.x + 8
+          const baseY = char.pose === 'sit' ? char.y + 28 : char.y + 21
+          const radiusX = char.pose === 'sit' ? 10 : 9
           const pulse = reduceMotion ? 0.65 : 0.65 + 0.35 * Math.sin(time * 4)
           glow(x + centerX, y + baseY - 5, 16, '#8affd2', 0.22 * pulse)
           context.globalAlpha = 0.45 + 0.4 * pulse
           context.strokeStyle = '#8affd2'
           context.lineWidth = 1.5 / camera.scale
           context.beginPath()
-          context.ellipse(x + centerX, y + baseY, 9, 3.5, 0, 0, Math.PI * 2)
+          context.ellipse(x + centerX, y + baseY, radiusX, 3.5, 0, 0, Math.PI * 2)
           context.stroke()
           context.globalAlpha = 1
         }
@@ -541,7 +653,8 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           context.globalAlpha = 0.85
           // sitters are taller and face the desk, so the Zzz floats beside the head
           const zzzY = char.pose === 'sit' ? y + char.y + 1 + bob : y + char.y - 9 + bob
-          context.drawImage(atlas.zzz, x + char.x + 12, zzzY, 10, 10)
+          const zzzX = char.pose === 'sit' ? x + char.x + 16 : x + char.x + 14
+          context.drawImage(atlas.zzz, zzzX, zzzY, 10, 10)
           context.globalAlpha = 1
         }
       })
@@ -643,8 +756,8 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
         for (const room of scene.rooms) {
           const char = room.chars.find((item) => item.sessionId === sessionId)
           if (!char) continue
-          const width = char.pose === 'sit' ? 14 : 12
-          const height = char.pose === 'sit' ? 23 : 16
+          const width = CHAR_DIMS[char.pose].w
+          const height = CHAR_DIMS[char.pose].h
           context.fillStyle = selectedTarget ? `${color}24` : `${color}14`
           context.strokeStyle = color
           context.lineWidth = (selectedTarget ? 2 : 1.25) / camera.scale
@@ -758,6 +871,11 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           <div className="grid min-w-0 gap-[3px]">
             <strong className="truncate text-[10px]">{hoveredPerson.sessionName}</strong>
             <small className="truncate font-mono text-[8px] text-[#70877c]">{hoveredPerson.deviceName} · {hoveredPerson.sessionId.slice(0, 8)}</small>
+            {hoveredPerson.agentName && (
+              <small className="truncate font-mono text-[8px] text-[#9adfca]" title={hoveredPerson.agentCwd || undefined}>
+                {hoveredPerson.agentName}{hoveredPerson.runLabel ? ` · ${hoveredPerson.runLabel}` : ''}{hoveredPerson.agentCwd ? ` · ${hoveredPerson.agentCwd}` : ''}
+              </small>
+            )}
           </div>
           <button
             onClick={() => { clearPersonHover(); onSelectTerminal(hoveredPerson.sessionId) }}
@@ -789,6 +907,20 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
               <strong className="truncate text-[10px] text-[#d7e7df]">{selectedSession.active ? '运行中' : '已暂停'}</strong>
             </span>
           </div>
+          {(selectedExecutionRun || selectedExecutionAgent) && (
+            <div className="mt-[-4px] mb-[13px] min-w-0">
+              <RunStatusBadge run={selectedExecutionRun} agent={selectedExecutionAgent} />
+            </div>
+          )}
+          {selectedAgentKind && (
+            <div className="mt-[-4px] mb-[13px] grid min-w-0 gap-1 rounded-[7px] border border-[#223b30] bg-[#0a1410] p-2">
+              <small className="text-[8px] text-[#637a6e]">Agent</small>
+              <strong className="truncate text-[10px] text-[#d7e7df]">{agentDisplayName(selectedAgentKind)}</strong>
+              {selectedAgentCwd && (
+                <code className="block truncate font-mono text-[8px] text-[#687985]" title={selectedAgentCwd}>{selectedAgentCwd}</code>
+              )}
+            </div>
+          )}
           <Button size="sm" className="h-auto px-3 py-[9px] text-[10px] font-bold" onClick={() => onSelectTerminal(selectedSession.id)}>打开对应终端</Button>
         </aside>
       )}

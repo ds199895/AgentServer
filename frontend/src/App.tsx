@@ -6,6 +6,7 @@ import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
 import { Eyebrow } from '@/components/Eyebrow'
+import { ExecutionStatusNotice } from '@/components/ExecutionStatusNotice'
 import { Login } from '@/components/Login'
 import { PasswordDialog } from '@/components/PasswordDialog'
 import { PreviewDialog } from '@/components/PreviewDialog'
@@ -39,7 +40,10 @@ import {
 } from '@/terminal-layout'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { ExecutionProvider } from '@/execution-context'
+import { activeAgentForTerminal, evidenceFreshness, fieldEvidence } from '@/execution-state'
 import { cn } from '@/lib/utils'
+import { useExecutionStream } from '@/useExecutionStream'
 
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
 const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
@@ -68,6 +72,26 @@ function initialLayout(): { layout: LayoutNode | null; focusedLeafId: string | n
 
 function isCoarseLayout(): boolean {
   return window.matchMedia('(max-width: 767px), (pointer: coarse)').matches
+}
+
+// 与 pixel/sprites.ts 的 AGENT_OUTFITS 名称保持一致;这里用小表避免把
+// 像素图模块拉进主包。
+const AGENT_DISPLAY_NAMES: Record<string, string> = {
+  codex: 'Codex',
+  claude: 'Claude',
+  kimi: 'Kimi',
+  deepseek: 'DeepSeek',
+}
+
+function agentDisplayName(kind: string): string {
+  return AGENT_DISPLAY_NAMES[kind] ?? kind
+}
+
+type AgentSwitchTarget = {
+  sessionId: string
+  kind: string
+  cwd: string
+  relPath: string
 }
 
 function storedTerminalId(): string | null {
@@ -139,6 +163,8 @@ export default function App() {
   const [closeTarget, setCloseTarget] = useState<TerminalSession | null>(null)
   const [previewBusy, setPreviewBusy] = useState<{ terminalId: string; port: number } | null>(null)
   const [workspaceSessionId, setWorkspaceSessionId] = useState<string | null>(null)
+  const [agentSwitchTarget, setAgentSwitchTarget] = useState<AgentSwitchTarget | null>(null)
+  const [workspaceFocusPath, setWorkspaceFocusPath] = useState<string | null>(null)
   // initialLayout() parses localStorage; hold it in one state slot so bootstrap
   // validates the persisted layout once instead of once per derived field.
   const [persistedBoot] = useState(initialLayout)
@@ -148,6 +174,7 @@ export default function App() {
   const [focusMode, setFocusMode] = useState(false)
   const [error, setError] = useState('')
   const [startupError, setStartupError] = useState('')
+  const execution = useExecutionStream(Boolean(username))
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
   const activePreviewRef = useRef<{ preview: Preview; url: string } | null>(null)
@@ -164,6 +191,8 @@ export default function App() {
   const sessionsSignatureRef = useRef('')
   const previewsSignatureRef = useRef('')
   const sessionsPushHealthyRef = useRef(false)
+  // sessionId → 已提示过的 agent cwd;同一路径只问一次,换目录再问。
+  const agentPromptedRef = useRef(new Map<string, string>())
 
   // 布局操作需要同步读取最新值(轮询 load 与事件处理器都会触发),
   // 因此通过 ref 镜像 + 成对 setter,避免在 setState updater 里产生副作用。
@@ -775,6 +804,61 @@ export default function App() {
     }
   }
 
+  // Agent 工作目录跟随:当前聚焦终端的 agent cwd 落在其 workspace.root 之内
+  // 且相对路径非空时,提示是否跳转文件树。windows 设备路径处理不在本期范围。
+  useEffect(() => {
+    const agentWorkingDirectory = (session: TerminalSession) => {
+      const projected = activeAgentForTerminal(execution.snapshot, session.id)
+      if (projected) {
+        const cwdEvidence = fieldEvidence(projected, 'cwd')
+        if (
+          projected.kind
+          && projected.cwd
+          && cwdEvidence
+          && evidenceFreshness(cwdEvidence, execution.freshness_now) === 'fresh'
+        ) {
+          return { kind: projected.kind, cwd: projected.cwd }
+        }
+        // cwd is not yet part of every projection shape. Preserve the legacy
+        // terminal-session compatibility view until its field-level evidence
+        // is available, without borrowing lifecycle evidence as cwd evidence.
+        return session.agent?.cwd
+          ? { kind: session.agent.kind, cwd: session.agent.cwd }
+          : null
+      }
+      return session.agent?.cwd
+        ? { kind: session.agent.kind, cwd: session.agent.cwd }
+        : null
+    }
+    if (agentSwitchTarget) {
+      // 弹窗期间 agent 退出/换目录或会话被关闭时,自动收起弹窗。
+      const session = sessions.find((item) => item.id === agentSwitchTarget.sessionId)
+      if (!session || agentWorkingDirectory(session)?.cwd !== agentSwitchTarget.cwd) setAgentSwitchTarget(null)
+      return
+    }
+    const session = sessions.find((item) => item.id === activeId)
+    if (!session?.active) return
+    const agent = agentWorkingDirectory(session)
+    const workspace = session.workspace
+    if (!agent?.cwd || !workspace?.root || workspace.platform !== 'posix') return
+    const root = workspace.root.replace(/\/+$/, '')
+    const cwd = agent.cwd
+    if (cwd !== root && !cwd.startsWith(`${root}/`)) return
+    const relPath = cwd === root ? '' : cwd.slice(root.length + 1)
+    if (!relPath) return
+    if (agentPromptedRef.current.get(session.id) === cwd) return
+    agentPromptedRef.current.set(session.id, cwd)
+    setAgentSwitchTarget({ sessionId: session.id, kind: agent.kind, cwd, relPath })
+  }, [sessions, activeId, agentSwitchTarget, execution.freshness_now, execution.snapshot])
+
+  const jumpToAgentDirectory = () => {
+    const target = agentSwitchTarget
+    if (!target) return
+    setAgentSwitchTarget(null)
+    if (workspaceSessionId !== target.sessionId) setWorkspaceSessionId(target.sessionId)
+    setWorkspaceFocusPath(target.relPath)
+  }
+
   if (startupError) {
     return (
       <div className="grid h-full w-full place-items-center bg-background p-6 text-center text-sm text-[#ffadb5]">
@@ -794,6 +878,7 @@ export default function App() {
   const workspaceSession = sessions.find((item) => item.id === workspaceSessionId)
   const showTerminalTabs = page === 'terminals' && sessions.length > 0
   return (
+    <ExecutionProvider value={execution}>
     <main className="grid h-full w-full grid-rows-[58px_minmax(0,1fr)] bg-background">
       <Topbar
         username={username}
@@ -862,7 +947,13 @@ export default function App() {
                   />
                 </div>
                 {page === 'terminals' && activeSession && workspaceSession?.id === activeSession.id && (
-                  <WorkspacePane key={workspaceSession.id} session={workspaceSession} onClose={() => setWorkspaceSessionId(null)} />
+                  <WorkspacePane
+                    key={workspaceSession.id}
+                    session={workspaceSession}
+                    focusPath={workspaceFocusPath}
+                    onFocusPathConsumed={() => setWorkspaceFocusPath(null)}
+                    onClose={() => setWorkspaceSessionId(null)}
+                  />
                 )}
               </div>
             </div>
@@ -930,6 +1021,24 @@ export default function App() {
           </DialogContent>
         </Dialog>
       )}
+      {agentSwitchTarget && (
+        <Dialog open onOpenChange={(open) => { if (!open) setAgentSwitchTarget(null) }}>
+          <DialogContent className="sm:max-w-[410px]">
+            <DialogHeader>
+              <Eyebrow>AGENT</Eyebrow>
+              <DialogTitle>{agentDisplayName(agentSwitchTarget.kind)} 正在其他目录工作</DialogTitle>
+              <DialogDescription>
+                {agentDisplayName(agentSwitchTarget.kind)} 正在 {agentSwitchTarget.cwd} 工作
+                （工作区内路径 {agentSwitchTarget.relPath}），是否跳转文件树？
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setAgentSwitchTarget(null)}>忽略</Button>
+              <Button onClick={jumpToAgentDirectory}>跳转</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
       {deviceDialog && (
         <DeviceDialog
           device={deviceDialog === 'new' ? undefined : deviceDialog}
@@ -968,6 +1077,8 @@ export default function App() {
           onStop={() => void stopPreview(activePreview.preview)}
         />
       )}
+      <ExecutionStatusNotice />
     </main>
+    </ExecutionProvider>
   )
 }

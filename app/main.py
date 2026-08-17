@@ -9,10 +9,11 @@ import re
 import shlex
 import sqlite3
 import socket
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Coroutine, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -20,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect as websocket_connect
@@ -38,6 +39,18 @@ from .artifacts import (
 )
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
+from .execution import ExecutionError, ExecutionStore, new_id
+from .execution.api import build_execution_router
+from .execution.control import ExecutionControlBroker, read_linux_process_identity
+from .execution.observations import ObservationPublisher
+from .execution.runtime_lock import RuntimeInstanceLock
+from .execution.security import (
+    ReporterTokenRegistry,
+    ReporterTokenSigner,
+    load_or_create_reporter_secret,
+)
+from .execution.service import ExecutionService
+from .execution.terminal_observer import TerminalObservationTranslator
 from .preview import (
     PREVIEW_COOKIE_NAME,
     PreviewHostMiddleware,
@@ -49,13 +62,19 @@ from .preview import (
     upstream_cookie,
 )
 from .terminal import (
+    AGENT_RECORD_MARKER,
+    AGENT_SCAN_MARKER,
+    KNOWN_AGENT_KINDS,
     LISTENER_SCAN_MARKER,
     ListeningProcess,
     RESIZE_MESSAGE,
     SNAPSHOT_COMPLETE_MESSAGE,
     STREAM_GAP,
+    RemoteAgent,
     TerminalManager,
-    parse_listener_scan,
+    TerminalSession,
+    parse_agent_scan_snapshot,
+    parse_listener_scan_snapshot,
     remote_shell_command,
 )
 from .version import resolve_build_sha, verify_release_pair
@@ -115,9 +134,506 @@ DOWNLOAD_FILES = {
 }
 
 
+def managed_terminal_environment(
+    *,
+    control_socket: str | None = None,
+    remote: bool = False,
+    verify_server_process: bool = True,
+) -> dict[str, str]:
+    """Return only non-secret static discovery values for terminal children."""
+    result: dict[str, str] = {}
+    for key in ("AGENTSERVER_BASE_URL",):
+        value = os.getenv(key, "").strip()
+        if value:
+            result[key] = value
+    socket_value = control_socket
+    if socket_value is None:
+        socket_value = os.getenv(
+            "AGENTSERVER_REMOTE_CONTROL_SOCKET" if remote else "AGENTSERVER_CONTROL_SOCKET",
+            "",
+        ).strip()
+    if socket_value:
+        result["AGENTSERVER_CONTROL_SOCKET"] = socket_value
+        if remote:
+            result["AGENTSERVER_CONTROL_TRANSPORT"] = "device-bridge"
+        elif verify_server_process:
+            identity = read_linux_process_identity(os.getpid())
+            if identity is not None:
+                result["AGENTSERVER_CONTROL_TRANSPORT"] = "local-broker"
+                result["AGENTSERVER_CONTROL_SERVER_PID"] = str(identity.pid)
+                result["AGENTSERVER_CONTROL_SERVER_START_TIME"] = str(
+                    identity.start_time_ticks
+                )
+            else:
+                raise RuntimeError(
+                    "direct local control requires the AgentServer process identity"
+                )
+        else:
+            # tmux panes outlive the API process, so a PID captured in the
+            # pane's initial environment would become permanently stale after
+            # a normal web-service restart. The server still authenticates the
+            # caller lineage in this explicit compatibility mode.
+            result["AGENTSERVER_CONTROL_TRANSPORT"] = "local-broker-path-compat"
+    return result
+
+
+class TerminalExecutionLifecycle:
+    """Serialize TerminalManager lifecycle evidence into durable projections."""
+
+    _PRE_READY = frozenset({"requested", "provisioning", "connecting"})
+    _TERMINAL = frozenset({"exited", "failed"})
+
+    def __init__(
+        self,
+        service: ExecutionService,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        ready_grace: float,
+    ) -> None:
+        self.service = service
+        self.loop = loop
+        self.ready_grace = max(0.0, float(ready_grace))
+        self.manager: TerminalManager | None = None
+        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._recovered: set[tuple[str, str, str]] = set()
+        self._accepting = True
+
+    def bind_manager(self, manager: TerminalManager) -> None:
+        self.manager = manager
+
+    @staticmethod
+    def _identity(session: TerminalSession) -> tuple[str, str, str] | None:
+        owner_id = str(session.owner or "")
+        terminal_id = str(session.id or "")
+        launch_id = str(session.launch_id or "")
+        if not session.managed or not owner_id or not terminal_id or not launch_id:
+            return None
+        return owner_id, terminal_id, launch_id
+
+    def remember_recovered(self, session: TerminalSession) -> None:
+        identity = self._identity(session)
+        if identity is not None:
+            self._recovered.add(identity)
+
+    def callback(
+        self, session: TerminalSession, payload: dict[str, object]
+    ) -> None:
+        identity = self._identity(session)
+        if identity is None:
+            return
+        event_type = str(payload.get("type") or "")
+        if event_type == "terminal.ready":
+            manager = self.manager
+            delayed = session.kind == "ssh" or (
+                manager is not None and manager.backend == "tmux"
+            )
+            if not delayed:
+                return
+            self._schedule(lambda: self._ready_after_grace(session))
+            return
+        if event_type != "terminal.exited":
+            return
+        value = payload.get("return_code")
+        return_code = (
+            value
+            if isinstance(value, int) and not isinstance(value, bool)
+            else session.return_code
+        )
+        self._schedule(lambda: self.mark_unavailable(session, return_code=return_code))
+
+    def _schedule(self, factory: Callable[[], Coroutine[object, object, None]]) -> None:
+        def start() -> None:
+            if not self._accepting:
+                return
+            task = self.loop.create_task(self._run_safely(factory))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self.loop:
+            start()
+        elif not self.loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(start)
+
+    async def _run_safely(
+        self, factory: Callable[[], Coroutine[object, object, None]]
+    ) -> None:
+        for attempt in range(3):
+            try:
+                await factory()
+                return
+            except Exception:
+                # A concurrent CAS winner or brief SQLite busy window is safe
+                # to replay because every service transition is idempotent.
+                if attempt < 2:
+                    await asyncio.sleep(0.05 * (attempt + 1))
+        # Reconciliation is the long-tail retry; callback failures must never
+        # escape into TerminalManager's PTY reader.
+
+    def _lock(self, owner_id: str, terminal_id: str) -> asyncio.Lock:
+        return self._locks.setdefault((owner_id, terminal_id), asyncio.Lock())
+
+    async def register_connecting(
+        self,
+        *,
+        owner_id: str,
+        terminal_id: str,
+        launch_id: str,
+        device_id: str | None = None,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        async with self._lock(owner_id, terminal_id):
+            await asyncio.to_thread(
+                self.service.register_terminal,
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                launch_id=launch_id,
+                device_id=device_id,
+                attributes=attributes,
+            )
+            await asyncio.to_thread(
+                self.service.terminal_connecting,
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+            )
+
+    def _is_current_and_active(self, session: TerminalSession) -> bool:
+        manager = self.manager
+        identity = self._identity(session)
+        if manager is None or identity is None:
+            return False
+        current = manager.sessions.get(session.id)
+        return (
+            current is session
+            and session.active
+            and session.owner == identity[0]
+            and session.launch_id == identity[2]
+        )
+
+    async def _projection(
+        self, owner_id: str, terminal_id: str, launch_id: str
+    ):
+        # terminal_context performs the launch-id ownership check before a
+        # stale callback is allowed to mutate a reused terminal identity.
+        await asyncio.to_thread(
+            self.service.terminal_context,
+            owner_id=owner_id,
+            terminal_id=terminal_id,
+            launch_id=launch_id,
+        )
+        return await asyncio.to_thread(
+            self.service.projection,
+            owner_id=owner_id,
+            kind="terminal",
+            entity_id=terminal_id,
+        )
+
+    async def _ready_after_grace(self, session: TerminalSession) -> None:
+        if self.ready_grace:
+            await asyncio.sleep(self.ready_grace)
+        await self.mark_ready(session)
+
+    async def mark_ready(self, session: TerminalSession) -> bool:
+        identity = self._identity(session)
+        if identity is None:
+            return False
+        owner_id, terminal_id, launch_id = identity
+        async with self._lock(owner_id, terminal_id):
+            projection = await self._projection(owner_id, terminal_id, launch_id)
+            if projection is None:
+                return False
+            lifecycle = str(projection.state.get("lifecycle") or "")
+            if lifecycle == "ready":
+                self._recovered.discard(identity)
+                return True
+            if lifecycle in self._TERMINAL:
+                return False
+            if not self._is_current_and_active(session):
+                await self._mark_unavailable_locked(
+                    owner_id,
+                    terminal_id,
+                    launch_id,
+                    return_code=session.return_code,
+                    summary="terminal exited before becoming ready",
+                    projection=projection,
+                )
+                return False
+            await asyncio.to_thread(
+                self.service.terminal_ready,
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                recovered=identity in self._recovered,
+            )
+            self._recovered.discard(identity)
+            return True
+
+    async def mark_unavailable(
+        self,
+        session: TerminalSession,
+        *,
+        return_code: int | None,
+    ) -> None:
+        identity = self._identity(session)
+        if identity is None:
+            return
+        owner_id, terminal_id, launch_id = identity
+        await self.mark_durable_unavailable(
+            owner_id=owner_id,
+            terminal_id=terminal_id,
+            launch_id=launch_id,
+            return_code=return_code,
+            summary="terminal exited before becoming ready",
+        )
+
+    async def mark_durable_unavailable(
+        self,
+        *,
+        owner_id: str,
+        terminal_id: str,
+        launch_id: str,
+        return_code: int | None,
+        summary: str,
+    ) -> None:
+        async with self._lock(owner_id, terminal_id):
+            projection = await self._projection(owner_id, terminal_id, launch_id)
+            if projection is None:
+                return
+            await self._mark_unavailable_locked(
+                owner_id,
+                terminal_id,
+                launch_id,
+                return_code=return_code,
+                summary=summary,
+                projection=projection,
+            )
+
+    async def _mark_unavailable_locked(
+        self,
+        owner_id: str,
+        terminal_id: str,
+        launch_id: str,
+        *,
+        return_code: int | None,
+        summary: str,
+        projection,
+    ) -> None:
+        lifecycle = str(projection.state.get("lifecycle") or "")
+        if lifecycle in self._TERMINAL:
+            return
+        if lifecycle in self._PRE_READY:
+            detail = summary
+            if return_code is not None:
+                detail = f"{summary} (return code {return_code})"
+            await asyncio.to_thread(
+                self.service.terminal_launch_failed,
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                summary=detail,
+            )
+        elif lifecycle in {"ready", "disconnected"}:
+            await asyncio.to_thread(
+                self.service.terminal_exited,
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                return_code=return_code,
+            )
+        self._recovered.discard((owner_id, terminal_id, launch_id))
+
+    async def drain(self) -> None:
+        while self._tasks:
+            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+
+    async def close(self) -> None:
+        self._accepting = False
+        try:
+            await asyncio.wait_for(self.drain(), timeout=2)
+        except asyncio.TimeoutError:
+            for task in tuple(self._tasks):
+                task.cancel()
+            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+
+
+async def resolve_execution_artifact_scope(
+    app,
+    owner_id: str,
+    terminal_id: str,
+    launch_id: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve optional execution linkage without breaking legacy app fixtures."""
+    resolver = getattr(app.state, "execution_artifact_scope", None)
+    if not callable(resolver):
+        return None, None, None
+    try:
+        result = await asyncio.to_thread(
+            resolver, owner_id, terminal_id, launch_id
+        )
+    except (ExecutionError, AttributeError, RuntimeError, ValueError):
+        return None, None, None
+    if not isinstance(result, tuple) or len(result) != 3:
+        return None, None, None
+    return result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     artifact_events = ArtifactEventStore(DATA_DIR / "agent_server.db")
+
+    def publish_runtime_artifact(event) -> None:
+        path = event.payload.get("path")
+        if not isinstance(path, str) or not path or len(path) > 4096:
+            raise ValueError("artifact.published requires a valid path")
+        try:
+            artifact_events.append(
+                owner=event.scope.owner_id,
+                terminal_id=event.scope.terminal_id or "",
+                task_id=event.scope.task_id,
+                run_id=event.scope.run_id,
+                span_id=event.scope.span_id,
+                event_type="published",
+                file=ArtifactFileRef(
+                    path=path,
+                    name=str(event.payload.get("name") or "")[:255],
+                    media_type=(
+                        str(event.payload["media_type"])[:255]
+                        if event.payload.get("media_type")
+                        else None
+                    ),
+                    size=(
+                        int(event.payload["size"])
+                        if isinstance(event.payload.get("size"), int)
+                        and int(event.payload["size"]) >= 0
+                        else None
+                    ),
+                    kind=str(event.payload.get("kind") or "file")[:40],
+                ),
+                source="agent-runtime",
+                version=str(event.payload.get("version") or "")[:255],
+                event_id=event.event_id,
+            )
+        except sqlite3.IntegrityError:
+            # The execution event is the idempotency authority; a replay may
+            # encounter the already-linked ArtifactEvent.
+            return
+
+    execution_store = ExecutionStore(
+        DATA_DIR / "agent_server.db",
+        max_subscription_queue=max(
+            1, int(os.getenv("EXECUTION_SUBSCRIPTION_QUEUE_SIZE", "1024"))
+        ),
+        max_parent_depth=max(1, int(os.getenv("EXECUTION_MAX_PARENT_DEPTH", "16"))),
+    )
+    reporter_tokens = ReporterTokenRegistry(
+        DATA_DIR / "agent_server.db",
+        ReporterTokenSigner(
+            load_or_create_reporter_secret(DATA_DIR),
+            default_ttl=int(os.getenv("REPORTER_TOKEN_TTL", "900")),
+        ),
+    )
+    execution = ExecutionService(
+        execution_store,
+        reporter_tokens=reporter_tokens,
+        artifact_publisher=publish_runtime_artifact,
+        lease_ttl=float(os.getenv("AGENT_LEASE_TTL", "30")),
+        lost_grace=float(os.getenv("AGENT_LOST_GRACE", "90")),
+        max_child_runs=int(os.getenv("EXECUTION_MAX_CHILD_RUNS", "8")),
+    )
+    observation_publisher = ObservationPublisher(execution.record_observation)
+    observation_translator = TerminalObservationTranslator(
+        default_owner=ADMIN_USERNAME,
+        local_device_id=os.getenv(
+            "AGENTSERVER_LOCAL_DEVICE_ID", "agentserver-local"
+        ).strip()
+        or "agentserver-local",
+        process_ttl_ms=int(os.getenv("AGENT_PROCESS_OBSERVATION_TTL_MS", "15000")),
+        pty_ttl_ms=int(os.getenv("AGENT_PTY_OBSERVATION_TTL_MS", "5000")),
+        context_resolver=lambda owner_id, terminal_id, launch_id: (
+            execution.terminal_context(
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                launch_id=launch_id,
+            )
+        ),
+    )
+    observation_ingest_queue: asyncio.Queue[
+        tuple[dict[str, object] | None, dict[str, object]]
+    ] = asyncio.Queue(
+        maxsize=max(1, int(os.getenv("OBSERVATION_INGEST_QUEUE_SIZE", "1024")))
+    )
+    observation_ingest_stats = {"dropped": 0, "failed": 0, "accepted": 0}
+    server_loop = asyncio.get_running_loop()
+    terminal_execution_lifecycle = TerminalExecutionLifecycle(
+        execution,
+        server_loop,
+        ready_grace=float(os.getenv("TERMINAL_PTY_READY_GRACE", "0.25")),
+    )
+
+    def enqueue_agent_observation(
+        item: tuple[dict[str, object] | None, dict[str, object]]
+    ) -> None:
+        try:
+            observation_ingest_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            observation_ingest_stats["dropped"] += 1
+
+    def record_agent_observation(session, payload: dict[str, object]) -> None:
+        # Copy stable launch identity now; TerminalSession's compatibility Agent
+        # fields may change again before the async worker runs.
+        session_values = (
+            {
+                "id": session.id,
+                "launch_id": session.launch_id,
+                "owner": session.owner,
+                "device_id": session.device_id,
+            }
+            if session is not None
+            else None
+        )
+        server_loop.call_soon_threadsafe(
+            enqueue_agent_observation, (session_values, dict(payload))
+        )
+
+    async def observation_ingest_worker() -> None:
+        while True:
+            session_values, payload = await observation_ingest_queue.get()
+            try:
+                draft = await asyncio.to_thread(
+                    observation_translator.translate, session_values, payload
+                )
+                if draft is not None:
+                    await asyncio.to_thread(observation_publisher, draft)
+                    observation_ingest_stats["accepted"] += 1
+            except Exception:
+                observation_ingest_stats["failed"] += 1
+            finally:
+                observation_ingest_queue.task_done()
+    execution_control = ExecutionControlBroker(
+        execution,
+        Path(
+            os.getenv(
+                "AGENTSERVER_CONTROL_SOCKET",
+                str(DATA_DIR / "control" / "agentserver.sock"),
+            )
+        ).expanduser(),
+    )
+
+    def bind_execution_control_launch(session: TerminalSession) -> None:
+        """Bind a local terminal to its kernel process before it can report."""
+
+        root_pid = session.control_pid
+        if root_pid is None:
+            raise RuntimeError("managed terminal control process is unavailable")
+        execution_control.bind_launch(
+            owner_id=session.owner,
+            terminal_id=session.id,
+            launch_id=session.launch_id,
+            root_pid=root_pid,
+        )
+
     attachments = AttachmentStore(
         DATA_DIR / "attachments",
         max_image_bytes=int(
@@ -131,10 +647,49 @@ async def lifespan(app: FastAPI):
     artifact_rate_windows: dict[str, deque[float]] = {}
     artifact_ingest_stats = {"dropped": 0, "failed": 0}
 
+    def execution_artifact_scope(
+        owner_id: str, terminal_id: str, launch_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        try:
+            context = execution.terminal_context(
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                launch_id=launch_id,
+            )
+        except (ExecutionError, ValueError, RuntimeError):
+            return None, None, None
+        run_id = context.get("active_run_id")
+        recent_run = context.get("recent_run")
+        if (
+            not run_id
+            or not isinstance(recent_run, dict)
+            or recent_run.get("id") != run_id
+        ):
+            return None, None, None
+        attributes = recent_run.get("attributes")
+        if not isinstance(attributes, dict):
+            return None, str(run_id), None
+        return (
+            str(attributes.get("task_id") or "") or None,
+            str(run_id),
+            None,
+        )
+
     async def artifact_ingest_worker() -> None:
         while True:
             values = await artifact_ingest_queue.get()
             try:
+                launch_id = str(values.pop("_launch_id", "") or "")
+                if launch_id and not values.get("run_id"):
+                    task_id, run_id, span_id = await asyncio.to_thread(
+                        execution_artifact_scope,
+                        str(values["owner"]),
+                        str(values["terminal_id"]),
+                        launch_id,
+                    )
+                    values.update(
+                        task_id=task_id, run_id=run_id, span_id=span_id
+                    )
                 await asyncio.to_thread(artifact_events.append, **values)
             except Exception:
                 artifact_ingest_stats["failed"] += 1
@@ -160,6 +715,10 @@ async def lifespan(app: FastAPI):
             {
                 "owner": session.owner,
                 "terminal_id": session.id,
+                "_launch_id": session.launch_id,
+                "task_id": None,
+                "run_id": None,
+                "span_id": None,
                 "event_type": str(payload.get("type") or "created")[:80],
                 "file": ArtifactFileRef(
                     path=path,
@@ -178,10 +737,18 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.artifacts = artifact_events
+    app.state.execution_store = execution_store
+    app.state.execution = execution
+    app.state.reporter_tokens = reporter_tokens
+    app.state.execution_control = execution_control
+    app.state.observation_ingest_queue = observation_ingest_queue
+    app.state.observation_ingest_stats = observation_ingest_stats
     app.state.attachments = attachments
     app.state.artifact_ingest_queue = artifact_ingest_queue
     app.state.artifact_ingest_stats = artifact_ingest_stats
     app.state.artifact_rate_windows = artifact_rate_windows
+    app.state.execution_artifact_scope = execution_artifact_scope
+    app.state.terminal_execution_lifecycle = terminal_execution_lifecycle
     app.state.workspaces = WorkspaceService(
         grant_ttl=float(os.getenv("FILE_GRANT_TTL", "120")),
         max_file_bytes=int(
@@ -193,74 +760,252 @@ async def lifespan(app: FastAPI):
         max_list_entries=int(os.getenv("MAX_WORKSPACE_LIST_ENTRIES", "1000")),
         max_image_pixels=int(os.getenv("MAX_IMAGE_ATTACHMENT_PIXELS", "40000000")),
     )
-    app.state.terminals = TerminalManager(
-        command=os.getenv("TERMINAL_CMD", "codex"),
-        cwd=os.getenv("TERMINAL_CWD", str(ROOT)),
-        shell=os.getenv("TERMINAL_SHELL") or None,
-        proxy=os.getenv("TERMINAL_PROXY") or None,
-        scrollback_bytes=int(os.getenv("TERMINAL_SCROLLBACK_BYTES", str(2 * 1024 * 1024))),
-        backend=os.getenv(
-            "TERMINAL_BACKEND",
-            "tmux" if os.getenv("ENVIRONMENT") == "production" else "direct",
-        ),
-        database_path=DATA_DIR / "agent_server.db",
-        tmux_binary=os.getenv("TMUX_BINARY", "tmux"),
-        tmux_socket=Path(
-            os.getenv("TMUX_SOCKET", str(DATA_DIR / "tmux" / "agentserver.sock"))
-        ),
-        default_owner=ADMIN_USERNAME,
-        artifact_callback=record_terminal_artifact,
-    )
-    app.state.devices = devices
-    for session in tuple(app.state.terminals.sessions.values()):
-        if not session.owner:
-            continue
+
+    async def create_managed_terminal(
+        *,
+        owner_id: str,
+        device_id: str | None,
+        config: dict[str, object],
+        agent_kind: str | None,
+    ) -> dict[str, object]:
+        if not device_id:
+            raise ValueError("device_id is required for a remote managed terminal")
+        device = await asyncio.to_thread(devices.get, device_id)
+        if not device:
+            raise ValueError("设备不存在")
+        if not device["frp_online"] or not device["ssh_available"]:
+            raise RuntimeError("设备 FRP 或 SSH 当前不可用")
+        terminal_id = new_id()
+        launch_id = new_id()
+        session: TerminalSession | None = None
         try:
-            await bind_terminal_workspace(app, session)
-        except WorkspaceError:
-            # A stale device or root must not prevent terminal recovery. The
-            # workspace endpoint will return the precise configuration error.
-            pass
-    app.state.artifact_ingest_task = asyncio.create_task(artifact_ingest_worker())
-    app.state.previews = PreviewManager(
-        idle_timeout=float(os.getenv("PREVIEW_IDLE_TIMEOUT", "1800"))
+            await terminal_execution_lifecycle.register_connecting(
+                owner_id=owner_id,
+                terminal_id=terminal_id,
+                launch_id=launch_id,
+                device_id=device_id,
+                attributes={"intended_agent_kind": agent_kind},
+            )
+            session = app.state.terminals.create_process(
+                name=str(config.get("name") or device["name"]),
+                argv=ssh_command(device),
+                cols=int(config.get("cols") or 120),
+                rows=int(config.get("rows") or 32),
+                device_id=device_id,
+                device_name=str(device["name"]),
+                remote_port=int(device["remote_port"]),
+                owner=owner_id,
+                workspace_root=str(config.get("workspace_root") or ".").strip() or ".",
+                workspace_platform=(
+                    "windows"
+                    if str(device.get("remote_shell") or "system")
+                    in {"powershell", "cmd"}
+                    else "posix"
+                ),
+                agent_hint=agent_kind,
+                session_id=terminal_id,
+                launch_id=launch_id,
+                managed_env=managed_terminal_environment(remote=True),
+            )
+        except BaseException as error:
+            if session is not None:
+                with contextlib.suppress(BaseException):
+                    await app.state.terminals.delete(session.id)
+            with contextlib.suppress(BaseException):
+                await asyncio.to_thread(
+                    execution.terminal_launch_failed,
+                    owner_id=owner_id,
+                    terminal_id=terminal_id,
+                    summary=str(error),
+                )
+            raise
+        assert session is not None
+        payload = session.as_dict()
+        try:
+            binding = await bind_terminal_workspace(app, session)
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "binding_id": binding.id,
+                "available": True,
+            }
+        except WorkspaceError as error:
+            payload["workspace"] = {
+                **dict(payload["workspace"]),
+                "available": False,
+                "error": str(error),
+            }
+        return payload
+
+    app.state.create_managed_terminal = create_managed_terminal
+    app.state.devices = devices
+
+    async def recover_managed_terminals() -> None:
+        for session in tuple(app.state.terminals.sessions.values()):
+            if not session.owner or not session.managed or not session.launch_id:
+                continue
+            terminal_execution_lifecycle.remember_recovered(session)
+            try:
+                await terminal_execution_lifecycle.register_connecting(
+                    owner_id=session.owner,
+                    terminal_id=session.id,
+                    launch_id=session.launch_id,
+                    device_id=session.device_id,
+                    attributes={"intended_agent_kind": session.agent_hint},
+                )
+                if not session.active:
+                    await terminal_execution_lifecycle.mark_unavailable(
+                        session,
+                        return_code=session.return_code,
+                    )
+            except Exception:
+                # One damaged durable aggregate must not block recovery of the
+                # remaining managed tmux sessions.
+                continue
+            try:
+                await bind_terminal_workspace(app, session)
+            except WorkspaceError:
+                # The workspace endpoint will return the precise stale-device
+                # or root configuration error when the user opens it.
+                pass
+
+    terminal_manager_instance: TerminalManager | None = None
+    preview_manager: PreviewManager | None = None
+    artifact_ingest_task: asyncio.Task[None] | None = None
+    observation_ingest_task: asyncio.Task[None] | None = None
+    service_monitor_task: asyncio.Task[None] | None = None
+    agent_probe_task: asyncio.Task[None] | None = None
+    execution_reconcile_task: asyncio.Task[None] | None = None
+    frp_monitor_task: asyncio.Task[None] | None = None
+    cleanup_started = False
+    runtime_instance_lock = RuntimeInstanceLock(
+        DATA_DIR / "agentserver-runtime.lock"
     )
-    app.state.previews.start()
-    app.state.service_monitor_task = asyncio.create_task(service_monitor_loop(app))
-    dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
+
+    async def stop_task(task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def cleanup() -> None:
+        nonlocal cleanup_started
+        if cleanup_started:
+            return
+        cleanup_started = True
+
+        # Stop every periodic/external producer before closing terminals and
+        # draining the ingestion queues. Each cleanup is isolated so one bad
+        # resource cannot strand the rest.
+        for task in (
+            frp_monitor_task,
+            service_monitor_task,
+            agent_probe_task,
+            execution_reconcile_task,
+        ):
+            with contextlib.suppress(BaseException):
+                await stop_task(task)
+        if terminal_manager_instance is not None:
+            with contextlib.suppress(BaseException):
+                await terminal_manager_instance.close()
+        with contextlib.suppress(BaseException):
+            await execution_control.close()
+        # Terminal callbacks use call_soon_threadsafe even on the server loop;
+        # let those final queue writes and lifecycle tasks become visible.
+        with contextlib.suppress(BaseException):
+            await asyncio.sleep(0)
+        with contextlib.suppress(BaseException):
+            await terminal_execution_lifecycle.close()
+
+        if observation_ingest_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(observation_ingest_queue.join(), timeout=2)
+            with contextlib.suppress(BaseException):
+                await stop_task(observation_ingest_task)
+        if artifact_ingest_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(artifact_ingest_queue.join(), timeout=2)
+            with contextlib.suppress(BaseException):
+                await stop_task(artifact_ingest_task)
+        if preview_manager is not None:
+            with contextlib.suppress(BaseException):
+                await preview_manager.close()
+        with contextlib.suppress(BaseException):
+            await asyncio.to_thread(app.state.workspaces.close)
+
     app.state.frp_monitor = None
     app.state.frp_monitor_task = None
-    if dashboard_url:
-        monitor = FrpMonitor(
-            devices,
-            dashboard_url,
-            os.getenv("FRPS_DASHBOARD_USER", ""),
-            os.getenv("FRPS_DASHBOARD_PASSWORD", ""),
-            interval=float(os.getenv("FRPS_SYNC_INTERVAL", "15")),
-            proxy_host=os.getenv("FRP_PROXY_HOST", "127.0.0.1"),
-            auto_discover=os.getenv("FRPS_AUTO_DISCOVER", "1") == "1",
-        )
-        app.state.frp_monitor = monitor
-        try:
-            await monitor.sync_once()
-        except Exception:
-            pass
-        app.state.frp_monitor_task = asyncio.create_task(monitor.run())
-    yield
-    if app.state.frp_monitor_task:
-        app.state.frp_monitor_task.cancel()
-        await asyncio.gather(app.state.frp_monitor_task, return_exceptions=True)
-    app.state.service_monitor_task.cancel()
-    await asyncio.gather(app.state.service_monitor_task, return_exceptions=True)
-    await app.state.previews.close()
-    await asyncio.to_thread(app.state.workspaces.close)
-    await app.state.terminals.close()
     try:
-        await asyncio.wait_for(artifact_ingest_queue.join(), timeout=2)
-    except asyncio.TimeoutError:
-        pass
-    app.state.artifact_ingest_task.cancel()
-    await asyncio.gather(app.state.artifact_ingest_task, return_exceptions=True)
+        runtime_instance_lock.acquire()
+        await execution_control.start()
+        terminal_manager_instance = TerminalManager(
+            command=os.getenv("TERMINAL_CMD", "codex"),
+            cwd=os.getenv("TERMINAL_CWD", str(ROOT)),
+            shell=os.getenv("TERMINAL_SHELL") or None,
+            proxy=os.getenv("TERMINAL_PROXY") or None,
+            scrollback_bytes=int(
+                os.getenv("TERMINAL_SCROLLBACK_BYTES", str(2 * 1024 * 1024))
+            ),
+            backend=os.getenv(
+                "TERMINAL_BACKEND",
+                "tmux" if os.getenv("ENVIRONMENT") == "production" else "direct",
+            ),
+            database_path=DATA_DIR / "agent_server.db",
+            tmux_binary=os.getenv("TMUX_BINARY", "tmux"),
+            tmux_socket=Path(
+                os.getenv(
+                    "TMUX_SOCKET", str(DATA_DIR / "tmux" / "agentserver.sock")
+                )
+            ),
+            default_owner=ADMIN_USERNAME,
+            artifact_callback=record_terminal_artifact,
+            agent_observation_callback=record_agent_observation,
+            terminal_lifecycle_callback=terminal_execution_lifecycle.callback,
+            control_binding_callback=bind_execution_control_launch,
+        )
+        app.state.terminals = terminal_manager_instance
+        terminal_execution_lifecycle.bind_manager(terminal_manager_instance)
+        await recover_managed_terminals()
+
+        artifact_ingest_task = asyncio.create_task(artifact_ingest_worker())
+        app.state.artifact_ingest_task = artifact_ingest_task
+        observation_ingest_task = asyncio.create_task(observation_ingest_worker())
+        app.state.observation_ingest_task = observation_ingest_task
+        preview_manager = PreviewManager(
+            idle_timeout=float(os.getenv("PREVIEW_IDLE_TIMEOUT", "1800"))
+        )
+        app.state.previews = preview_manager
+        preview_manager.start()
+        service_monitor_task = asyncio.create_task(service_monitor_loop(app))
+        app.state.service_monitor_task = service_monitor_task
+        agent_probe_task = asyncio.create_task(agent_probe_loop(app))
+        app.state.agent_probe_task = agent_probe_task
+        execution_reconcile_task = asyncio.create_task(
+            execution_reconcile_loop(app)
+        )
+        app.state.execution_reconcile_task = execution_reconcile_task
+
+        dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
+        if dashboard_url:
+            monitor = FrpMonitor(
+                devices,
+                dashboard_url,
+                os.getenv("FRPS_DASHBOARD_USER", ""),
+                os.getenv("FRPS_DASHBOARD_PASSWORD", ""),
+                interval=float(os.getenv("FRPS_SYNC_INTERVAL", "15")),
+                proxy_host=os.getenv("FRP_PROXY_HOST", "127.0.0.1"),
+                auto_discover=os.getenv("FRPS_AUTO_DISCOVER", "1") == "1",
+            )
+            app.state.frp_monitor = monitor
+            with contextlib.suppress(Exception):
+                await monitor.sync_once()
+            frp_monitor_task = asyncio.create_task(monitor.run())
+            app.state.frp_monitor_task = frp_monitor_task
+        yield
+    finally:
+        try:
+            await cleanup()
+        finally:
+            runtime_instance_lock.release()
 
 
 app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
@@ -287,6 +1032,17 @@ class CreateTerminalBody(BaseModel):
     cols: int = Field(default=120, ge=2, le=500)
     rows: int = Field(default=32, ge=1, le=300)
     workspace_root: str | None = Field(default=None, max_length=2048)
+    agent: str | None = Field(default=None, max_length=32)
+
+    @field_validator("agent")
+    @classmethod
+    def _known_agent(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized and normalized not in KNOWN_AGENT_KINDS:
+            raise ValueError(f"未知的 agent 类型: {value}")
+        return normalized or None
 
 
 class CreatePreviewBody(BaseModel):
@@ -350,6 +1106,15 @@ def preview_manager(request: Request) -> PreviewManager:
 
 def workspace_service(request: Request) -> WorkspaceService:
     return request.app.state.workspaces
+
+
+app.include_router(
+    build_execution_router(
+        current_user,
+        signer.verify,
+        cookie_name=COOKIE_NAME,
+    )
+)
 
 
 async def bind_terminal_workspace(application: FastAPI, session):
@@ -445,6 +1210,8 @@ async def health(request: Request) -> dict[str, object]:
     monitor: FrpMonitor | None = request.app.state.frp_monitor
     artifact_queue = getattr(request.app.state, "artifact_ingest_queue", None)
     artifact_stats = getattr(request.app.state, "artifact_ingest_stats", {})
+    observation_queue = getattr(request.app.state, "observation_ingest_queue", None)
+    observation_stats = getattr(request.app.state, "observation_ingest_stats", {})
     return {
         "status": "ok",
         "frp": monitor.status() if monitor else {"configured": False},
@@ -452,6 +1219,12 @@ async def health(request: Request) -> dict[str, object]:
             "queued": artifact_queue.qsize() if artifact_queue else 0,
             "dropped": int(artifact_stats.get("dropped", 0)),
             "failed": int(artifact_stats.get("failed", 0)),
+        },
+        "observations": {
+            "queued": observation_queue.qsize() if observation_queue else 0,
+            "accepted": int(observation_stats.get("accepted", 0)),
+            "dropped": int(observation_stats.get("dropped", 0)),
+            "failed": int(observation_stats.get("failed", 0)),
         },
     }
 
@@ -683,19 +1456,35 @@ def preview_tunnel_command(
 
 
 def listener_scan_command(device: dict[str, object]) -> list[str]:
-    """Build a read-only remote command that reports TCP listening processes."""
+    """Build a read-only remote command with independent listener/Agent markers."""
     command = ssh_base_command(device)
     remote_shell = str(device.get("remote_shell") or "system")
     if remote_shell in {"powershell", "cmd"}:
         script = (
             "$ErrorActionPreference='SilentlyContinue'; "
-            "if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { "
-            f"Write-Output '{LISTENER_SCAN_MARKER}:unsupported'; exit 0 }}; "
+            "if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) { "
             f"Write-Output '{LISTENER_SCAN_MARKER}:records'; "
-            "Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object { "
+            "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object { "
             "$p=Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; "
-            "Write-Output ('__AGENTSERVER_LISTENER__|{0}|{1}|{2}' -f "
-            "$_.LocalPort,$_.OwningProcess,$p.ProcessName) }"
+            f"Write-Output ('{LISTENER_RECORD_MARKER}|{{0}}|{{1}}|{{2}}' -f "
+            "$_.LocalPort,$_.OwningProcess,$p.ProcessName) } "
+            f"}} else {{ Write-Output '{LISTENER_SCAN_MARKER}:unsupported' }}; "
+            "$processes=$null; "
+            "if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) { "
+            "$processes=Get-CimInstance Win32_Process -ErrorAction SilentlyContinue "
+            "} elseif (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) { "
+            "$processes=Get-WmiObject Win32_Process -ErrorAction SilentlyContinue }; "
+            "if ($null -eq $processes) { "
+            f"Write-Output '{AGENT_SCAN_MARKER}:unsupported' "
+            "} else { "
+            f"Write-Output '{AGENT_SCAN_MARKER}:records'; "
+            "$processes | Where-Object { "
+            "$_.Name -match '^(codex|claude|kimi)(-|\\.|$)' -or "
+            "$_.CommandLine -match '(^|[\\\\/ ])(codex|claude|kimi)(-|[\\\\/ .]|$)' "
+            "} | ForEach-Object { "
+            "$cmd=([string]$_.CommandLine) -replace '[\r\n]',' '; "
+            f"Write-Output ('{AGENT_RECORD_MARKER}|{{0}}|{{1}}|{{2}}|{{3}}' -f "
+            "$_.ProcessId,$_.ParentProcessId,$_.Name,$cmd) } }"
         )
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         command.append(
@@ -709,7 +1498,14 @@ def listener_scan_command(device: dict[str, object]) -> list[str]:
         f"printf '{LISTENER_SCAN_MARKER}:lsof\\n'; lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null; "
         "elif command -v netstat >/dev/null 2>&1; then "
         f"printf '{LISTENER_SCAN_MARKER}:netstat\\n'; netstat -lntp 2>/dev/null || netstat -an 2>/dev/null; "
-        f"else printf '{LISTENER_SCAN_MARKER}:unsupported\\n'; fi"
+        f"else printf '{LISTENER_SCAN_MARKER}:unsupported\\n'; fi; "
+        # Agent processes ride along on the same connection. The [x] trick
+        # keeps this grep from matching its own command line.
+        "if command -v ps >/dev/null 2>&1; then "
+        f"printf '{AGENT_SCAN_MARKER}:records\\n'; "
+        "ps -eo pid=,ppid=,comm=,args= 2>/dev/null | grep -E '[c]odex|[c]laude|[k]imi' | "
+        f"while read -r pid ppid comm args; do printf '{AGENT_RECORD_MARKER}|%s|%s|%s|%s\\n' \"$pid\" \"$ppid\" \"$comm\" \"$args\"; done; "
+        f"else printf '{AGENT_SCAN_MARKER}:unsupported\\n'; fi"
     )
     command.append(f"sh -lc {shlex.quote(script)}")
     return command
@@ -717,8 +1513,8 @@ def listener_scan_command(device: dict[str, object]) -> list[str]:
 
 async def scan_device_listeners(
     device: dict[str, object],
-) -> tuple[list[ListeningProcess] | None, str]:
-    """Read one remote listener snapshot; None means the snapshot is unusable."""
+) -> tuple[list[ListeningProcess] | None, list[RemoteAgent] | None, str]:
+    """Read independent listener and Agent snapshots over one SSH connection."""
     timeout = max(1.0, float(os.getenv("SERVICE_PROCESS_SCAN_TIMEOUT", "5")))
     process = await asyncio.create_subprocess_exec(
         *listener_scan_command(device),
@@ -730,7 +1526,7 @@ async def scan_device_listeners(
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            return None, "远端监听端口扫描超时"
+            return None, None, "远端进程扫描超时"
     finally:
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -740,15 +1536,17 @@ async def scan_device_listeners(
     output = stdout.decode(errors="replace")
     detail = stderr.decode(errors="replace").strip()
     if process.returncode != 0:
-        return None, detail or f"远端监听端口扫描退出 ({process.returncode})"
-    marker = re.search(rf"^{re.escape(LISTENER_SCAN_MARKER)}:([^\r\n]+)", output, re.MULTILINE)
-    if not marker or marker.group(1).strip().lower() == "unsupported":
-        return None, "远端缺少 ss、lsof 或 netstat"
+        return None, None, detail or f"远端进程扫描退出 ({process.returncode})"
+    agents = parse_agent_scan_snapshot(output)
+    listeners = parse_listener_scan_snapshot(output)
+    if listeners is None:
+        return None, agents, "远端缺少 ss、lsof 或 netstat"
     minimum_port = max(1, int(os.getenv("SERVICE_PROCESS_MIN_PORT", "1024")))
     listeners = [
-        listener for listener in parse_listener_scan(output) if listener.port >= minimum_port
+        listener for listener in listeners if listener.port >= minimum_port
     ]
-    return listeners, ""
+    agent_error = "" if agents is not None else "远端缺少可用的进程扫描能力"
+    return listeners, agents, agent_error
 
 
 def reserve_loopback_port() -> int:
@@ -803,6 +1601,112 @@ async def probe_device_service(
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
                 await process.wait()
+
+
+async def agent_probe_loop(app: FastAPI) -> None:
+    """Periodically reconcile local terminal agents with the process tree."""
+    interval = max(1.0, float(os.getenv("AGENT_SCAN_INTERVAL", "10")))
+    manager = app.state.terminals
+    while True:
+        try:
+            targets = manager.local_agent_probe_targets()
+            observations = await asyncio.to_thread(manager.scan_local_agents, targets)
+            # TerminalSession fields and asyncio subscribers belong to this
+            # event loop; workers only perform the blocking process scan.
+            manager.apply_local_agent_probes(observations)
+        except Exception:
+            # One bad probe cycle must never kill the loop.
+            pass
+        await asyncio.sleep(interval)
+
+
+async def reconcile_execution_state(
+    app: FastAPI, *, now: float | None = None
+) -> None:
+    """Run one isolated durable/live Terminal reconciliation pass."""
+    manager: TerminalManager = app.state.terminals
+    service: ExecutionService = app.state.execution
+    store: ExecutionStore = app.state.execution_store
+    lifecycle: TerminalExecutionLifecycle = (
+        app.state.terminal_execution_lifecycle
+    )
+    orphan_timeout = max(
+        1.0, float(os.getenv("TERMINAL_LAUNCH_ORPHAN_TIMEOUT", "30"))
+    )
+    timestamp = time.time() if now is None else float(now)
+    try:
+        owners = await asyncio.to_thread(store.owners)
+    except Exception:
+        return
+
+    for owner_id in owners:
+        try:
+            await asyncio.to_thread(service.reconcile_liveness, owner_id=owner_id)
+        except Exception:
+            # Terminal reconciliation remains useful if an unrelated Agent/Run
+            # aggregate is temporarily invalid.
+            pass
+        try:
+            view = await asyncio.to_thread(
+                service.execution_view, owner_id=owner_id
+            )
+        except Exception:
+            continue
+        terminals = view.get("terminals")
+        if not isinstance(terminals, list):
+            continue
+        for terminal in terminals:
+            try:
+                terminal_id = str(terminal["id"])
+                state = terminal["state"]
+                attributes = terminal["attributes"]
+                if not isinstance(state, dict) or not isinstance(attributes, dict):
+                    continue
+                terminal_state = str(state.get("lifecycle") or "")
+                launch_id = str(attributes.get("launch_id") or "")
+                session = manager.sessions.get(terminal_id)
+                matches = bool(
+                    session is not None
+                    and session.managed
+                    and session.owner == owner_id
+                    and session.launch_id == launch_id
+                    and launch_id
+                )
+                active = bool(matches and session is not None and session.active)
+                return_code = session.return_code if matches and session else None
+                if terminal_state == "ready" and not active:
+                    await lifecycle.mark_durable_unavailable(
+                        owner_id=owner_id,
+                        terminal_id=terminal_id,
+                        launch_id=launch_id,
+                        return_code=return_code,
+                        summary="ready terminal has no active managed session",
+                    )
+                    continue
+                if terminal_state not in {"requested", "provisioning", "connecting"}:
+                    continue
+                updated_at = float(terminal.get("updated_at") or 0)
+                if active or timestamp - updated_at < orphan_timeout:
+                    continue
+                await lifecycle.mark_durable_unavailable(
+                    owner_id=owner_id,
+                    terminal_id=terminal_id,
+                    launch_id=launch_id,
+                    return_code=return_code,
+                    summary="managed terminal launch was orphaned before ready",
+                )
+            except Exception:
+                # A malformed or concurrently-transitioned Terminal cannot
+                # prevent reconciliation of the remaining durable aggregates.
+                continue
+
+
+async def execution_reconcile_loop(app: FastAPI) -> None:
+    """Project liveness thresholds and unexpected terminal exits at low rate."""
+    interval = max(1.0, float(os.getenv("EXECUTION_RECONCILE_INTERVAL", "5")))
+    while True:
+        await reconcile_execution_state(app)
+        await asyncio.sleep(interval)
 
 
 async def service_monitor_loop(app: FastAPI) -> None:
@@ -877,22 +1781,30 @@ async def service_monitor_loop(app: FastAPI) -> None:
                 }
             )
 
-            async def scan(device_id: str) -> tuple[str, list[ListeningProcess] | None]:
+            async def scan(
+                device_id: str,
+            ) -> tuple[
+                str,
+                list[ListeningProcess] | None,
+                list[RemoteAgent] | None,
+            ]:
                 async with scan_semaphore:
                     try:
                         device = await asyncio.to_thread(devices.get, device_id)
                         if not device or not device["frp_online"] or not device["ssh_available"]:
-                            return device_id, None
-                        listeners, _error = await scan_device_listeners(device)
-                        return device_id, listeners
+                            return device_id, None, None
+                        listeners, agents, _error = await scan_device_listeners(device)
+                        return device_id, listeners, agents
                     except Exception:
-                        return device_id, None
+                        return device_id, None, None
 
             scan_results = await asyncio.gather(
                 *(scan(device_id) for device_id in device_ids),
                 return_exceptions=False,
             )
-            for device_id, listeners in scan_results:
+            for device_id, listeners, agents in scan_results:
+                if agents is not None:
+                    app.state.terminals.sync_device_agents(device_id, agents)
                 if listeners is None:
                     continue
                 removed = app.state.terminals.sync_process_listeners(
@@ -933,47 +1845,22 @@ async def create_device_terminal(
     manager: TerminalManager = Depends(terminal_manager),
     username: str = Depends(current_user),
 ) -> dict[str, object]:
-    device = await asyncio.to_thread(devices.get, device_id)
-    if not device:
-        raise HTTPException(status_code=404, detail="设备不存在")
-    if not device["frp_online"]:
-        raise HTTPException(status_code=409, detail="设备 FRP 隧道当前离线")
-    if not device["ssh_available"]:
-        raise HTTPException(status_code=409, detail="设备 SSH 服务当前不可用")
     try:
-        session = manager.create_process(
-            name=body.name or str(device["name"]),
-            argv=ssh_command(device),
-            cols=body.cols,
-            rows=body.rows,
+        return await request.app.state.create_managed_terminal(
+            owner_id=username,
             device_id=device_id,
-            device_name=str(device["name"]),
-            remote_port=int(device["remote_port"]),
-            owner=username,
-            workspace_root=(body.workspace_root or ".").strip() or ".",
-            workspace_platform=(
-                "windows"
-                if str(device.get("remote_shell") or "system") in {"powershell", "cmd"}
-                else "posix"
-            ),
+            config={
+                "name": body.name,
+                "workspace_root": body.workspace_root,
+                "cols": body.cols,
+                "rows": body.rows,
+            },
+            agent_kind=body.agent,
         )
-        payload = session.as_dict()
-        try:
-            binding = await bind_terminal_workspace(request.app, session)
-            payload["workspace"] = {
-                **dict(payload["workspace"]),
-                "binding_id": binding.id,
-                "available": True,
-            }
-        except WorkspaceError as error:
-            payload["workspace"] = {
-                **dict(payload["workspace"]),
-                "available": False,
-                "error": str(error),
-            }
-        return payload
     except (OSError, RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        detail = str(exc)
+        status_code = 404 if detail == "设备不存在" else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @app.post("/api/terminals", status_code=201)
@@ -1005,13 +1892,49 @@ async def create_terminal(
                     detail="本地工作区目录不存在",
                 )
             workspace_root = str(candidate)
-        session = manager.create(
-            body.name,
-            body.cols,
-            body.rows,
-            owner=username,
-            workspace_root=workspace_root,
+        terminal_id = new_id()
+        launch_id = new_id()
+        execution: ExecutionService = request.app.state.execution
+        lifecycle: TerminalExecutionLifecycle = (
+            request.app.state.terminal_execution_lifecycle
         )
+        session: TerminalSession | None = None
+        try:
+            await lifecycle.register_connecting(
+                owner_id=username,
+                terminal_id=terminal_id,
+                launch_id=launch_id,
+                attributes={"intended_agent_kind": body.agent},
+            )
+            session = manager.create(
+                body.name,
+                body.cols,
+                body.rows,
+                owner=username,
+                workspace_root=workspace_root,
+                agent_hint=body.agent,
+                session_id=terminal_id,
+                launch_id=launch_id,
+                managed_env=managed_terminal_environment(
+                    control_socket=str(request.app.state.execution_control.path),
+                    verify_server_process=manager.backend == "direct",
+                ),
+            )
+            if manager.backend == "direct" and not await lifecycle.mark_ready(session):
+                raise RuntimeError("terminal exited before becoming ready")
+        except BaseException as error:
+            if session is not None:
+                with contextlib.suppress(BaseException):
+                    await manager.delete(session.id)
+            with contextlib.suppress(BaseException):
+                await asyncio.to_thread(
+                    execution.terminal_launch_failed,
+                    owner_id=username,
+                    terminal_id=terminal_id,
+                    summary=str(error),
+                )
+            raise
+        assert session is not None
         payload = session.as_dict()
         try:
             binding = await bind_terminal_workspace(request.app, session)
@@ -1038,12 +1961,17 @@ async def delete_terminal(
     manager: TerminalManager = Depends(terminal_manager),
     username: str = Depends(current_user),
 ) -> dict[str, bool]:
-    if not manager.get_for_owner(session_id, username):
+    session = manager.get_for_owner(session_id, username)
+    if not session:
         raise HTTPException(status_code=404, detail="Terminal not found")
     await request.app.state.previews.delete_for_terminal(session_id)
     await asyncio.to_thread(request.app.state.workspaces.unbind, username, session_id)
     if not await manager.delete(session_id):
         raise HTTPException(status_code=404, detail="Terminal not found")
+    await request.app.state.terminal_execution_lifecycle.mark_unavailable(
+        session,
+        return_code=session.return_code,
+    )
     request.app.state.artifact_rate_windows.pop(session_id, None)
     return {"ok": True}
 
@@ -1224,10 +2152,19 @@ async def read_image_tool(
         media_type=attachment.media_type,
         size=attachment.size,
     )
+    task_id, run_id, span_id = await resolve_execution_artifact_scope(
+        request.app,
+        username,
+        session_id,
+        session.launch_id,
+    )
     event = await asyncio.to_thread(
         request.app.state.artifacts.append,
         owner=username,
         terminal_id=session_id,
+        task_id=task_id,
+        run_id=run_id,
+        span_id=span_id,
         event_type="read_image",
         file=file_ref,
         source="read-image-tool",
@@ -1297,12 +2234,22 @@ async def create_artifact(
     manager: TerminalManager = Depends(terminal_manager),
     username: str = Depends(current_user),
 ) -> dict[str, object]:
-    if not manager.get_for_owner(session_id, username):
+    session = manager.get_for_owner(session_id, username)
+    if not session:
         raise HTTPException(status_code=404, detail="Terminal not found")
+    task_id, run_id, span_id = await resolve_execution_artifact_scope(
+        request.app,
+        username,
+        session_id,
+        session.launch_id,
+    )
     event = await asyncio.to_thread(
         request.app.state.artifacts.append,
         owner=username,
         terminal_id=session_id,
+        task_id=task_id,
+        run_id=run_id,
+        span_id=span_id,
         event_type=body.type,
         file=ArtifactFileRef(
             path=body.path,

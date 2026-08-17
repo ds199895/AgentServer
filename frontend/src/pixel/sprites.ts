@@ -566,6 +566,89 @@ const PANTS = ['#232b34', '#2e3742', '#3a3230']
 
 export type CharPose = 'sit' | 'stand'
 
+/** Character sprite dimensions; hit-tests and layout offsets derive from these. */
+export const CHAR_DIMS = {
+  stand: { w: 16, h: 22 },
+  sit: { w: 18, h: 30 },
+} as const
+
+/** Branded outfit for a detected agent: brand shirt + pixel logo on chest/back. */
+export interface AgentOutfit {
+  name: string
+  shirt: string
+  accent: string
+  logoMain: string
+  logoAccent: string
+  /** ~10 wide × 6 tall pixel logo; 'L' = main color, 'M' = accent, '.' = shirt. */
+  logo: string[]
+}
+
+export const AGENT_OUTFITS: Record<string, AgentOutfit> = {
+  codex: {
+    name: 'Codex',
+    shirt: '#101a16',
+    accent: '#243b31',
+    logoMain: '#10a37f',
+    logoAccent: '#6ee7b7',
+    // GPT blossom knot: thick hexagonal ring with a hollow center
+    logo: [
+      '...LLLL...',
+      '..LLLLLL..',
+      '.LLL..LLL.',
+      '.LLL..LLL.',
+      '..LLLLLL..',
+      '...LLLL...',
+    ],
+  },
+  claude: {
+    name: 'Claude',
+    shirt: '#d97757',
+    accent: '#e8987a',
+    logoMain: '#f7ead9',
+    logoAccent: '#ffe9c7',
+    // Claude Code starburst: dense center with uneven radiating rays
+    logo: [
+      '..LL..LL..',
+      'LLL.LL.LLL',
+      '..LLLLLL..',
+      '..LLLLLL..',
+      'LLL.LL.LLL',
+      '..LL..LL..',
+    ],
+  },
+  kimi: {
+    name: 'Kimi',
+    shirt: '#14141c',
+    accent: '#262632',
+    logoMain: '#f5f7ff',
+    logoAccent: '#4d7cfe',
+    // Kimi Code badge: bold K with the blue dot at the arm tip
+    logo: [
+      '.LL...LLM.',
+      '.LL..LL...',
+      '.LL.LL....',
+      '.LLLLL....',
+      '.LL..LL...',
+      '.LL...LL..',
+    ],
+  },
+  deepseek: {
+    name: 'DeepSeek',
+    shirt: '#4d6bfe',
+    accent: '#6b85ff',
+    logoMain: '#eef2ff',
+    logoAccent: '#16255e',
+    logo: [
+      '.......LL.',
+      '......LLL.',
+      '.LLLLLLLL.',
+      'LLLLLLLLLL',
+      'LLLMLLLLL.',
+      '.LLLLLLL..',
+    ],
+  },
+}
+
 const charCache = new Map<string, HTMLCanvasElement>()
 
 function charPalettes(variant: number, active: boolean) {
@@ -583,97 +666,97 @@ function charPalettes(variant: number, active: boolean) {
   return { ...palette, skin: dim(palette.skin), hair: dim(palette.hair), cap: dim(palette.cap), shirt: dim(palette.shirt), pants: dim(palette.pants) }
 }
 
-function standRows(style: number, frame: number, blink: boolean): string[] {
+function standRows(style: number, frame: number, blink: boolean, logo: string[] | null): string[] {
   const head = [
-    '....hhhh....',
-    '...hhhhhh...',
-    '..hhhhhhhh..',
-    '..hhsssshh..',
-    blink ? '..hssssssh..' : '..hsessesh..',
-    '..hssssssh..',
-    '...ssssss...',
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...hhhhhhhhhh...',
+    '...hhhhhhhhhh...',
+    '...hhsssssshh...',
+    blink ? '...hssssssssh...' : '...hsessssesh...',
+    '...hssssssssh...',
+    '....ssssssss....',
+    '.....ssssss.....',
   ]
   if (style === 1) {
-    head[0] = '.hh.hhhh.hh.'
-    head[1] = '..hhhhhhhh..'
+    head[0] = '..hh..hhhh..hh..'
+    head[1] = '..hhhhhhhhhhhh..'
   } else if (style === 2) {
-    head[3] = '..hhhhhhhh..'
-    head[6] = '..hssssssh..'
+    head[4] = '...hhhhhhhhhh...'
+    head[6] = '..hhsssssssshh..'
+    head[7] = '..hhsssssssshh..'
   } else if (style === 3) {
-    head[0] = '....kkkk....'
-    head[1] = '...kkkkkk...'
-    head[2] = '..kkkkkkkk..'
-    head[3] = '..kksssskk..'
+    head[0] = '.....kkkkkk.....'
+    head[1] = '....kkkkkkkk....'
+    head[2] = '...kkkkkkkkkk...'
+    head[3] = '...kksssssskk...'
   }
-  const torsoA = [
-    '..cccccccc..',
-    '.cccccccccc.',
-    '.cctggggtcc.',
-    '.cctggggtcc.',
-    '..cccccccc..',
-  ]
-  const torsoB = [
-    '..cccccccc..',
-    '.cccccccccc.',
-    '.cccccccccc.',
-    '.cctggggtcc.',
-    '.cctggggtcc.',
-  ]
+  const body = '.cccccccccccccc.'
+  const tablet = '.cctggggggggtcc.'
+  // the outfit logo sits on the chest rows, clearly visible from the front
+  const chest = logo ? logo.map((row) => `.cc${row.replaceAll('.', 'c')}cc.`) : Array(6).fill(body)
   return [
     ...head,
-    ...(frame === 0 ? torsoA : torsoB),
-    '..cccccccc..',
-    '...pp..pp...',
-    '...pp..pp...',
-    '...oo..oo...',
+    '..cccccccccccc..',
+    body,
+    ...chest,
+    frame === 0 ? tablet : body,
+    tablet,
+    '..pppp....pppp..',
+    '..pppp....pppp..',
+    '..oooo....oooo..',
   ]
 }
 
-function sitRows(style: number, frame: number): string[] {
+function sitRows(style: number, frame: number, logo: string[] | null): string[] {
   // Back view, seated on the chair and facing the desk: hands rest on the
   // keyboard, the chair backrest wraps the lower back and the pedestal
-  // peeks out below. 14×23, chair included so layering is always correct.
-  const hands = frame === 0 ? '..ss......ss..' : '...ss....ss...'
+  // peeks out below. 18×30, chair included so layering is always correct.
+  const hands = frame === 0 ? '..sss........sss..' : '...sss......sss...'
+  // the outfit logo sits on the shirt back rows, visible from behind
+  const back = logo ? logo.map((row) => `..cc${row.replaceAll('.', 'c')}cc..`) : Array(6).fill('..cccccccccccccc..')
   const rows = [
     hands,
     hands,
-    '..aahhhhhhaa..',
-    '..aahhhhhhaa..',
-    '..aahhhhhhaa..',
-    '..aahhhhhhaa..',
-    '..aahhhhhhaa..',
-    '...hhhhhhhh...',
-    '.....ssss.....',
-    '..cccccccccc..',
-    '..cccccccccc..',
-    '..cccccccccc..',
-    '..cccccccccc..',
-    '.uUUUUUUUUUUu.',
-    '.uUUUUUUUUUUu.',
-    '.uUUUUUUUUUUu.',
-    '.uUUUUUUUUUUu.',
-    '..uuuuuuuuuu..',
-    '...pppppppp...',
-    '......uu......',
-    '......uu......',
-    '.....uuuu.....',
-    '...uu....uu...',
+    '..aahhhhhhhhhhaa..',
+    '..aahhhhhhhhhhaa..',
+    '..aahhhhhhhhhhaa..',
+    '..aahhhhhhhhhhaa..',
+    '..aahhhhhhhhhhaa..',
+    '..aahhhhhhhhhhaa..',
+    '...hhhhhhhhhhhh...',
+    '......ssssss......',
+    '..cccccccccccccc..',
+    ...back,
+    '..cccccccccccccc..',
+    '.uUUUUUUUUUUUUUUu.',
+    '.uUUUUUUUUUUUUUUu.',
+    '.uUUUUUUUUUUUUUUu.',
+    '.uUUUUUUUUUUUUUUu.',
+    '.uUUUUUUUUUUUUUUu.',
+    '..uuuuuuuuuuuuuu..',
+    '...pppppppppppp...',
+    '........uu........',
+    '........uu........',
+    '.......uuuu.......',
+    '......uuuuuu......',
+    '.....uu....uu.....',
   ]
   if (style === 1) {
     // tufty hair
-    rows[2] = '..aah.hh.haa..'
+    rows[2] = '..aahh.hhhh.hhaa..'
   } else if (style === 2) {
-    // long hair falling down the back
-    rows[8] = '....hssssh....'
-    rows[9] = '..hcccccccch..'
-    rows[10] = '..hcccccccch..'
-    rows[11] = '..hcccccccch..'
+    // long hair falling down the back (flanks the logo without covering it)
+    rows[9] = '.....hssssssh.....'
+    for (let index = 10; index <= 14; index += 1) {
+      rows[index] = `${rows[index].slice(0, 2)}h${rows[index].slice(3, 15)}h${rows[index].slice(16)}`
+    }
   } else if (style === 3) {
     // cap, hair peeking out under it
-    rows[2] = '..aakkkkkkaa..'
-    rows[3] = '..aakkkkkkaa..'
-    rows[4] = '..aakkkkkkaa..'
-    rows[5] = '..aakkhhkkaa..'
+    rows[2] = '..aakkkkkkkkkkaa..'
+    rows[3] = '..aakkkkkkkkkkaa..'
+    rows[4] = '..aakkkkkkkkkkaa..'
+    rows[5] = '..aakkhhhhhhkkaa..'
   }
   return rows
 }
@@ -682,29 +765,39 @@ function sitRows(style: number, frame: number): string[] {
  * Chibi character sprite. Standing characters face the viewer holding a
  * glowing tablet; sitting characters are seen from behind, seated on the
  * desk chair with their hands on the keyboard (the chair is part of the
- * sprite so the layering always reads correctly).
+ * sprite so the layering always reads correctly). `outfit` is an agent kind
+ * into AGENT_OUTFITS; null/unknown renders the plain palette-swapped shirt.
  */
-export function getCharacter(pose: CharPose, variant: number, frame: number, blink: boolean, active: boolean): HTMLCanvasElement {
+export function getCharacter(pose: CharPose, variant: number, frame: number, blink: boolean, active: boolean, outfit: string | null = null): HTMLCanvasElement {
   const style = (variant >>> 10) % 4
-  const key = `${pose}:${variant % 2048}:${frame}:${blink ? 1 : 0}:${active ? 1 : 0}`
+  const outfitDef = outfit ? (AGENT_OUTFITS[outfit] ?? null) : null
+  const key = `${pose}:${variant % 2048}:${frame}:${blink ? 1 : 0}:${active ? 1 : 0}:${outfitDef ? outfit : ''}`
   const cached = charCache.get(key)
   if (cached) return cached
   const palette = charPalettes(variant, active)
-  const rows = pose === 'sit' ? sitRows(style, frame) : standRows(style, frame, blink)
-  const sprite = paint(rows, {
+  const dim = (color: string) => mix(color, '#4a545e', 0.55)
+  const shirt = outfitDef ? outfitDef.shirt : palette.shirt
+  const accent = outfitDef ? outfitDef.accent : mix(palette.shirt, '#ffffff', 0.18)
+  const colors: Record<string, string> = {
     h: palette.hair,
     k: palette.cap,
     s: palette.skin,
     e: '#20262e',
-    c: palette.shirt,
-    a: mix(palette.shirt, '#ffffff', 0.18),
+    c: active ? shirt : dim(shirt),
+    a: active ? accent : dim(accent),
     t: '#10161c',
     g: palette.glow,
     p: palette.pants,
     o: '#161c23',
     u: '#2c3947',
     U: '#344453',
-  })
+  }
+  if (outfitDef) {
+    colors.L = active ? outfitDef.logoMain : dim(outfitDef.logoMain)
+    colors.M = active ? outfitDef.logoAccent : dim(outfitDef.logoAccent)
+  }
+  const rows = pose === 'sit' ? sitRows(style, frame, outfitDef?.logo ?? null) : standRows(style, frame, blink, outfitDef?.logo ?? null)
+  const sprite = paint(rows, colors)
   charCache.set(key, sprite)
   return sprite
 }

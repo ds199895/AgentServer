@@ -32,6 +32,10 @@ import { cn } from '@/lib/utils'
 type Props = {
   session: TerminalSession
   onClose: () => void
+  /** 相对工作区根的路径;传入后文件树会展开祖先目录并选中该路径。 */
+  focusPath?: string | null
+  /** focusPath 应用完毕后回调,外部应据此清空 focusPath。 */
+  onFocusPathConsumed?: () => void
 }
 
 type PaneTab = 'files' | 'artifacts'
@@ -159,7 +163,7 @@ function artifactTime(event: ArtifactEvent): string {
   }
 }
 
-export function WorkspacePane({ session, onClose }: Props) {
+export function WorkspacePane({ session, onClose, focusPath = null, onFocusPathConsumed }: Props) {
   const [collapsed, setCollapsed] = useState(false)
   const [tab, setTab] = useState<PaneTab>('files')
   const [treeFilter, setTreeFilter] = useState('')
@@ -179,7 +183,7 @@ export function WorkspacePane({ session, onClose }: Props) {
   const workspaceSocketRef = useRef<WebSocket | null>(null)
   const workspaceWatchPathsRef = useRef<string[]>([''])
   const selectedPathRef = useRef<string | null>(null)
-  const tree = useWorkspaceTree(session.id)
+  const tree = useWorkspaceTree(session.id, focusPath, onFocusPathConsumed)
   selectedPathRef.current = tree.selectedPath
 
   const loadArtifacts = useCallback(async (quiet = false) => {

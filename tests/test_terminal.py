@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,10 +19,17 @@ from app.terminal import (
     STREAM_GAP,
     DetectedService,
     ListeningProcess,
+    RemoteAgent,
     TerminalManager,
     TerminalSession,
     TerminalStore,
+    _inject_ssh_managed_environment,
+    agent_kind_from_process,
+    agent_signature,
+    parse_agent_scan,
+    parse_agent_scan_snapshot,
     parse_listener_scan,
+    parse_listener_scan_snapshot,
     remote_shell_command,
 )
 
@@ -36,6 +44,75 @@ class RemoteShellCommandTests(unittest.TestCase):
             remote_shell_command("powershell"),
         )
         self.assertEqual(["cmd.exe", "/Q"], remote_shell_command("cmd"))
+
+
+class ManagedRemoteEnvironmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.environment = {
+            "AGENTSERVER_MANAGED": "1",
+            "AGENTSERVER_PROTOCOL_VERSION": "1",
+            "AGENTSERVER_TERMINAL_ID": "terminal-1",
+            "AGENTSERVER_LAUNCH_ID": "launch-1",
+            "AGENTSERVER_BASE_URL": "https://control.example/a b?quote='yes'&n=$HOME",
+        }
+
+    def test_posix_ssh_quotes_each_environment_value(self) -> None:
+        argv = _inject_ssh_managed_environment(
+            ["/usr/bin/ssh", "-tt", "operator@example"],
+            self.environment,
+            "posix",
+        )
+
+        self.assertEqual(["/usr/bin/ssh", "-tt", "operator@example"], argv[:-1])
+        self.assertEqual(
+            [
+                "exec",
+                "env",
+                *[
+                    f"{key}={value}"
+                    for key, value in sorted(self.environment.items())
+                ],
+                "${SHELL:-/bin/sh}",
+                "-l",
+            ],
+            shlex.split(argv[-1]),
+        )
+
+    def test_powershell_uses_encoded_assignments_and_escapes_quotes(self) -> None:
+        argv = _inject_ssh_managed_environment(
+            [
+                "ssh",
+                "operator@example",
+                "powershell.exe",
+                "-NoLogo",
+                "-NoExit",
+            ],
+            self.environment,
+            "windows",
+        )
+
+        self.assertEqual(["ssh", "operator@example", "powershell.exe"], argv[:3])
+        self.assertIn("-NoExit", argv)
+        self.assertEqual("-EncodedCommand", argv[-2])
+        script = base64.b64decode(argv[-1]).decode("utf-16-le")
+        self.assertIn(
+            "$env:AGENTSERVER_BASE_URL='https://control.example/a b?quote=''yes''&n=$HOME'",
+            script,
+        )
+        self.assertNotIn("AGENTSERVER_REPORT_TOKEN", script)
+
+    def test_cmd_uses_encoded_bootstrap_instead_of_cmd_quoting(self) -> None:
+        argv = _inject_ssh_managed_environment(
+            ["ssh", "operator@example", "cmd.exe", "/Q"],
+            self.environment,
+            "windows",
+        )
+
+        self.assertEqual(["ssh", "operator@example", "powershell.exe"], argv[:3])
+        self.assertIn("-NonInteractive", argv)
+        script = base64.b64decode(argv[-1]).decode("utf-16-le")
+        self.assertIn("$env:AGENTSERVER_TERMINAL_ID='terminal-1'", script)
+        self.assertTrue(script.endswith("; & cmd.exe /Q; exit $LASTEXITCODE"))
 
 
 class ListenerScanParserTests(unittest.TestCase):
@@ -68,6 +145,83 @@ class ListenerScanParserTests(unittest.TestCase):
             "__AGENTSERVER_LISTENER__|8080|321|dotnet\n"
         )
         self.assertEqual([ListeningProcess(8080, 321, "dotnet")], records)
+
+
+class AgentSignatureTests(unittest.TestCase):
+    def test_matches_known_agent_banners(self) -> None:
+        self.assertEqual("codex", agent_signature(">_ OpenAI Codex (v0.42.0)"))
+        self.assertEqual("codex", agent_signature("codex-cli resume abc123"))
+        self.assertEqual("claude", agent_signature("╭─── Claude Code v1.0.83 ───╮"))
+        self.assertEqual("kimi", agent_signature("Kimi CLI v0.58 — Moonshot AI"))
+
+    def test_ignores_ordinary_shell_output(self) -> None:
+        self.assertIsNone(agent_signature("user@host:~$ ls -la"))
+        self.assertIsNone(agent_signature("total 32 drwxr-xr-x 5 user user 4096 ."))
+        self.assertIsNone(agent_signature(""))
+        # A bare process name is not a banner; only distinctive TUI text is.
+        self.assertIsNone(agent_signature("codex"))
+
+
+class AgentProcessMatchTests(unittest.TestCase):
+    def test_maps_process_identities_to_known_kinds(self) -> None:
+        self.assertEqual("codex", agent_kind_from_process("codex", "codex"))
+        self.assertEqual(
+            "claude", agent_kind_from_process("node", "node /opt/claude/bin/claude")
+        )
+        self.assertEqual("kimi", agent_kind_from_process("kimi-cli", "kimi-cli"))
+
+    def test_ignores_unrelated_processes(self) -> None:
+        self.assertIsNone(agent_kind_from_process("vim", "vim codex.py"))
+        self.assertIsNone(agent_kind_from_process("bash", "-bash"))
+        self.assertIsNone(agent_kind_from_process("ssh", "ssh host"))
+
+
+class AgentScanParserTests(unittest.TestCase):
+    def test_parses_agent_records_and_ignores_noise(self) -> None:
+        agents = parse_agent_scan(
+            "__AGENTSERVER_AGENTS__:records\n"
+            "__AGENTSERVER_AGENT__|4321|4300|codex|codex --full-auto\n"
+            "__AGENTSERVER_AGENT__|5555|10|node|node /usr/local/bin/claude\n"
+            "__AGENTSERVER_AGENT__|7777|1|vim|vim codex.py\n"
+            "__AGENTSERVER_AGENT__|not-a-pid|1|kimi|kimi\n"
+            "ordinary ps noise line\n"
+        )
+        self.assertEqual(
+            [
+                RemoteAgent("codex", 4321, 4300, "codex --full-auto"),
+                RemoteAgent("claude", 5555, 10, "node /usr/local/bin/claude"),
+            ],
+            agents,
+        )
+
+    def test_deduplicates_repeated_pids(self) -> None:
+        agents = parse_agent_scan(
+            "__AGENTSERVER_AGENT__|42|1|kimi|kimi\n"
+            "__AGENTSERVER_AGENT__|42|1|kimi|kimi\n"
+        )
+        self.assertEqual([RemoteAgent("kimi", 42, 1, "kimi")], agents)
+
+    def test_snapshot_distinguishes_empty_from_unsupported(self) -> None:
+        self.assertEqual(
+            [],
+            parse_agent_scan_snapshot("__AGENTSERVER_AGENTS__:records\n"),
+        )
+        self.assertIsNone(
+            parse_agent_scan_snapshot("__AGENTSERVER_AGENTS__:unsupported\n")
+        )
+        self.assertIsNone(parse_agent_scan_snapshot("ordinary terminal output\n"))
+
+    def test_agent_snapshot_survives_unsupported_listener_probe(self) -> None:
+        output = (
+            "__AGENTSERVER_LISTENERS__:unsupported\n"
+            "__AGENTSERVER_AGENTS__:records\n"
+            "__AGENTSERVER_AGENT__|42|1|kimi|kimi\n"
+        )
+        self.assertIsNone(parse_listener_scan_snapshot(output))
+        self.assertEqual(
+            [RemoteAgent("kimi", 42, 1, "kimi")],
+            parse_agent_scan_snapshot(output),
+        )
 
 
 class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -119,6 +273,139 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.id, second.id)
         self.assertRegex(first.id, re.compile(r"^[a-f0-9]{32}$"))
         self.assertRegex(second.id, re.compile(r"^[a-f0-9]{32}$"))
+        self.assertRegex(first.launch_id, re.compile(r"^[a-f0-9]{32}$"))
+        self.assertRegex(second.launch_id, re.compile(r"^[a-f0-9]{32}$"))
+        self.assertNotEqual(first.launch_id, second.launch_id)
+
+    async def test_preallocated_identity_and_context_reach_local_shell(self) -> None:
+        await self.manager.close()
+        self.manager = TerminalManager(
+            command=(
+                "printf 'managed-context:%s:%s:%s:%s:%s\\n' "
+                '"$AGENTSERVER_MANAGED" "$AGENTSERVER_TERMINAL_ID" '
+                '"$AGENTSERVER_LAUNCH_ID" "$AGENTSERVER_OWNER_ID" '
+                '"$AGENTSERVER_CONTROL_SOCKET"'
+            ),
+            cwd=self.directory.name,
+            shell="/bin/sh",
+            scrollback_bytes=64 * 1024,
+        )
+        session = self.manager.create(
+            "Managed",
+            owner="alice",
+            session_id="terminal-preallocated",
+            launch_id="launch-preallocated",
+            managed_env={"AGENTSERVER_CONTROL_SOCKET": "/tmp/control socket.sock"},
+        )
+        expected = (
+            b"managed-context:1:terminal-preallocated:launch-preallocated:"
+            b"alice:/tmp/control socket.sock"
+        )
+        snapshot = await self.wait_for_output(session.id, expected)
+
+        self.assertIn(expected, snapshot)
+        self.assertEqual("terminal-preallocated", session.id)
+        self.assertEqual("launch-preallocated", session.launch_id)
+        self.assertTrue(session.managed)
+        self.assertEqual("agentserver", session.origin)
+        self.assertEqual("launch-preallocated", session.as_dict()["launch_id"])
+
+    async def test_local_control_binding_uses_private_pty_process_root(self) -> None:
+        await self.manager.close()
+        bound: list[TerminalSession] = []
+        self.manager = TerminalManager(
+            command="",
+            cwd=self.directory.name,
+            shell="/bin/sh",
+            scrollback_bytes=64 * 1024,
+            control_binding_callback=bound.append,
+        )
+        session = self.manager.create(
+            "Bound",
+            owner="alice",
+            session_id="bound-terminal",
+            launch_id="bound-launch",
+        )
+
+        self.assertEqual([session], bound)
+        self.assertEqual(session.pid, session.control_pid)
+        self.assertGreater(session.control_pid or 0, 0)
+        self.assertNotIn("control_pid", session.as_dict())
+
+    async def test_failed_control_binding_aborts_process_launch(self) -> None:
+        await self.manager.close()
+
+        def reject(_session: TerminalSession) -> None:
+            raise RuntimeError("binding rejected")
+
+        self.manager = TerminalManager(
+            command="",
+            cwd=self.directory.name,
+            shell="/bin/sh",
+            scrollback_bytes=64 * 1024,
+            control_binding_callback=reject,
+        )
+        with self.assertRaisesRegex(RuntimeError, "binding rejected"):
+            self.manager.create(
+                "Rejected",
+                owner="alice",
+                session_id="rejected-terminal",
+                launch_id="rejected-launch",
+            )
+        self.assertNotIn("rejected-terminal", self.manager.sessions)
+
+    async def test_preallocated_identity_rejects_duplicates_and_invalid_values(self) -> None:
+        first = self.manager.create(
+            "First", session_id="known-terminal", launch_id="known-launch"
+        )
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.manager.create("Duplicate", session_id=first.id)
+        with self.assertRaisesRegex(ValueError, "launch already exists"):
+            self.manager.create("Duplicate launch", launch_id="known-launch")
+        with self.assertRaisesRegex(ValueError, "session_id must be"):
+            self.manager.create("Invalid", session_id="../../terminal")
+        with self.assertRaisesRegex(ValueError, "launch_id must be"):
+            self.manager.create("Invalid launch", launch_id="")
+
+    async def test_managed_env_is_allowlisted_before_process_creation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "AGENTSERVER_REPORT_TOKEN"):
+            self.manager.create(
+                "Unsafe",
+                session_id="unsafe-terminal",
+                managed_env={"AGENTSERVER_REPORT_TOKEN": "must-not-leak"},
+            )
+        self.assertNotIn("unsafe-terminal", self.manager.sessions)
+
+    async def test_create_reports_an_immediate_shell_exec_failure(self) -> None:
+        await self.manager.close()
+        invalid_shell = Path(self.directory.name) / "invalid-shell"
+        invalid_shell.write_text("this file has no executable format\n")
+        invalid_shell.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        self.manager = TerminalManager(
+            command="",
+            cwd=self.directory.name,
+            shell=str(invalid_shell),
+            scrollback_bytes=64 * 1024,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Unable to start terminal"):
+            self.manager.create("Broken", session_id="broken-shell")
+
+        self.assertNotIn("broken-shell", self.manager.sessions)
+
+    async def test_create_process_reports_an_immediate_exec_failure(self) -> None:
+        invalid_process = Path(self.directory.name) / "invalid-process"
+        invalid_process.write_text("this file has no executable format\n")
+        invalid_process.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+        with self.assertRaisesRegex(RuntimeError, "Unable to start process"):
+            self.manager.create_process(
+                name="Broken process",
+                argv=[str(invalid_process)],
+                session_id="broken-process",
+            )
+
+        self.assertNotIn("broken-process", self.manager.sessions)
 
     async def test_sessions_are_filtered_by_owner(self) -> None:
         alice = self.manager.create("Alice", owner="alice")
@@ -272,6 +559,42 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.active)
         self.assertIsNone(self.manager.get(session.id))
 
+    async def test_delete_preserves_status_reaped_during_signal_check(self) -> None:
+        terminal_events: list[dict[str, object]] = []
+        self.manager.terminal_lifecycle_callback = (
+            lambda _session, event: terminal_events.append(event)
+        )
+        session = TerminalSession(
+            id="already-exited",
+            name="Already exited",
+            pid=12345,
+            fd=-1,
+            command="process",
+            cwd=self.directory.name,
+            created_at=0,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._owned_pids.add(session.pid)
+
+        with patch.object(
+            self.manager, "_signal_session", return_value=9
+        ) as signal_session, patch("app.terminal.os.waitpid") as waitpid:
+            self.assertTrue(await self.manager.delete(session.id))
+
+        signal_session.assert_called_once_with(session.pid, signal.SIGTERM)
+        waitpid.assert_not_called()
+        self.assertEqual(9, session.return_code)
+        self.assertEqual(
+            [
+                {
+                    "type": "terminal.exited",
+                    "return_code": 9,
+                    "exited_at": session.exited_at,
+                }
+            ],
+            terminal_events,
+        )
+
     async def test_direct_process_session_keeps_device_metadata(self) -> None:
         session = self.manager.create_process(
             name="Remote device",
@@ -285,6 +608,192 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ssh", session.kind)
         self.assertEqual("device-001", session.device_id)
         self.assertEqual(20001, session.remote_port)
+
+    async def test_first_pty_data_reports_ready_once(self) -> None:
+        terminal_events: list[tuple[str, dict[str, object]]] = []
+        self.manager.terminal_lifecycle_callback = lambda session, event: (
+            terminal_events.append((session.id, event))
+        )
+        session = self.manager.create_process(
+            name="Ready process",
+            argv=[
+                "/bin/sh",
+                "-c",
+                (
+                    "printf 'first-pty-data\\n'; sleep 0.1; "
+                    "printf 'second-pty-data\\n'; sleep 30"
+                ),
+            ],
+        )
+
+        await self.wait_for_output(session.id, b"first-pty-data")
+        await self.wait_for_output(session.id, b"second-pty-data")
+
+        self.assertEqual(
+            [(session.id, {"type": "terminal.ready", "source": "pty"})],
+            terminal_events,
+        )
+
+    async def test_ready_callback_is_marshaled_to_loop_and_guarded_once(self) -> None:
+        callback_arrived = asyncio.Event()
+        callback_threads: list[int] = []
+        terminal_events: list[dict[str, object]] = []
+        loop_thread = threading.get_ident()
+
+        def terminal_lifecycle(
+            _session: TerminalSession, event: dict[str, object]
+        ) -> None:
+            callback_threads.append(threading.get_ident())
+            terminal_events.append(event)
+            callback_arrived.set()
+
+        self.manager.terminal_lifecycle_callback = terminal_lifecycle
+        session = TerminalSession(
+            id="worker-ready",
+            name="Worker ready",
+            pid=-1,
+            fd=-1,
+            command="process",
+            cwd=self.directory.name,
+        )
+
+        await asyncio.to_thread(self.manager._report_terminal_ready, session)
+        await asyncio.wait_for(callback_arrived.wait(), timeout=1)
+        await asyncio.to_thread(self.manager._report_terminal_ready, session)
+        await asyncio.sleep(0)
+
+        self.assertEqual([loop_thread], callback_threads)
+        self.assertEqual(
+            [{"type": "terminal.ready", "source": "pty"}], terminal_events
+        )
+
+    async def test_direct_exit_reports_once_and_clears_pid_agent(self) -> None:
+        terminal_events: list[tuple[str, dict[str, object]]] = []
+        agent_events: list[dict[str, object]] = []
+        self.manager.terminal_lifecycle_callback = lambda session, event: (
+            terminal_events.append((session.id, event))
+        )
+        self.manager.agent_observation_callback = (
+            lambda _session, event: agent_events.append(event)
+        )
+        session = self.manager.create_process(
+            name="Short process",
+            argv=["/bin/sh", "-c", "sleep 0.15; exit 7"],
+        )
+        self.manager._set_agent(
+            session, "codex", source="process", pid=session.pid
+        )
+        agent_events.clear()
+
+        deadline = asyncio.get_running_loop().time() + 3
+        while asyncio.get_running_loop().time() < deadline:
+            if terminal_events:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            self.fail("direct process exit was not reported")
+
+        self.assertFalse(session.active)
+        self.assertEqual(7, session.return_code)
+        self.assertIsNone(session.agent_kind)
+        self.assertEqual(
+            [
+                (
+                    session.id,
+                    {
+                        "type": "terminal.exited",
+                        "return_code": 7,
+                        "exited_at": session.exited_at,
+                    },
+                )
+            ],
+            terminal_events,
+        )
+        self.assertEqual(
+            ["observation.process.exited"],
+            [event["type"] for event in agent_events],
+        )
+        self.assertEqual(session.pid, agent_events[0]["pid"])
+        self.assertEqual(7, agent_events[0]["return_code"])
+
+        self.assertTrue(await self.manager.delete(session.id))
+        await asyncio.sleep(0)
+        self.assertEqual(1, len(terminal_events))
+        self.assertEqual(1, len(agent_events))
+
+    async def test_exit_callback_is_marshaled_to_loop_and_guarded_once(self) -> None:
+        callback_arrived = asyncio.Event()
+        callback_threads: list[int] = []
+        terminal_events: list[dict[str, object]] = []
+        loop_thread = threading.get_ident()
+
+        def terminal_lifecycle(
+            _session: TerminalSession, event: dict[str, object]
+        ) -> None:
+            callback_threads.append(threading.get_ident())
+            terminal_events.append(event)
+            callback_arrived.set()
+
+        self.manager.terminal_lifecycle_callback = terminal_lifecycle
+        session = TerminalSession(
+            id="worker-finalized",
+            name="Worker finalized",
+            pid=-1,
+            fd=-1,
+            command="process",
+            cwd=self.directory.name,
+            exited_at=1.0,
+            return_code=3,
+        )
+
+        await asyncio.to_thread(self.manager._finalize_session_exit, session)
+        await asyncio.wait_for(callback_arrived.wait(), timeout=1)
+        await asyncio.to_thread(self.manager._finalize_session_exit, session)
+        await asyncio.sleep(0)
+
+        self.assertEqual([loop_thread], callback_threads)
+        self.assertEqual(
+            [
+                {
+                    "type": "terminal.exited",
+                    "return_code": 3,
+                    "exited_at": 1.0,
+                }
+            ],
+            terminal_events,
+        )
+
+    async def test_direct_process_gets_static_context_and_scrubs_dynamic_context(self) -> None:
+        command = (
+            "printf 'process-context:%s:%s:%s:%s:%s:%s\\n' "
+            '"$AGENTSERVER_TERMINAL_ID" "$AGENTSERVER_LAUNCH_ID" '
+            '"$AGENTSERVER_DEVICE_ID" "$AGENTSERVER_BASE_URL" '
+            '"${AGENTSERVER_REPORT_TOKEN-unset}" '
+            '"${AGENTSERVER_TASK_PAYLOAD-unset}"; sleep 30'
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "AGENTSERVER_REPORT_TOKEN": "inherited-secret",
+                "AGENTSERVER_TASK_PAYLOAD": "inherited-task",
+            },
+        ):
+            session = self.manager.create_process(
+                name="Managed process",
+                argv=["/bin/sh", "-c", command],
+                device_id="device-001",
+                owner="alice",
+                session_id="process-terminal",
+                launch_id="process-launch",
+                managed_env={"AGENTSERVER_BASE_URL": "https://control.example/base"},
+            )
+            snapshot = await self.wait_for_output(session.id, b"process-context:")
+
+        self.assertIn(
+            b"process-context:process-terminal:process-launch:device-001:https://control.example/base:unset:unset",
+            snapshot,
+        )
+        self.assertEqual("process-launch", session.launch_id)
 
     async def test_detects_local_web_services_from_terminal_output(self) -> None:
         session = self.manager.create_process(
@@ -446,6 +955,459 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(8, len(session.services))
         self.assertEqual([], session.as_dict()["services"])
+
+    async def test_detects_agent_banner_from_output(self) -> None:
+        session = TerminalSession(
+            id="agent-output",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        waiter = self.manager.subscribe_state()
+        try:
+            self.manager._append(session, "\x1b[1mOpenAI Codex\x1b[0m (v0.42.0)\n".encode())
+
+            self.assertEqual("codex", session.agent_kind)
+            self.assertEqual("output", session.agent_source)
+            self.assertGreater(session.agent_since, 0)
+            self.assertTrue(waiter.is_set())
+            self.assertEqual(
+                {
+                    "kind": "codex",
+                    "cwd": "",
+                    "source": "output",
+                    "since": session.agent_since,
+                },
+                session.as_dict()["agent"],
+            )
+        finally:
+            self.manager.unsubscribe_state(waiter)
+
+    async def test_agent_banner_split_across_chunks(self) -> None:
+        session = TerminalSession(
+            id="agent-split",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+
+        self.manager._append(session, b"starting OpenAI Co")
+        self.assertIsNone(session.agent_kind)
+        self.manager._append(session, b"dex (v0.42.0)\r\n")
+        self.assertEqual("codex", session.agent_kind)
+
+    async def test_agent_start_quit_and_switch_transitions(self) -> None:
+        session = TerminalSession(
+            id="agent-transitions",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        self.assertIsNone(session.as_dict()["agent"])
+
+        self.manager._append(session, b"OpenAI Codex (v0.42.0)\n")
+        self.assertEqual("codex", session.agent_kind)
+        codex_since = session.agent_since
+
+        self.manager._append(session, b"Welcome to Claude Code\n")
+        self.assertEqual("claude", session.agent_kind)
+        self.assertGreaterEqual(session.agent_since, codex_since)
+
+        # Only process-level evidence confirms an exit; banners never do.
+        self.manager._set_agent(session, None, source="process")
+        self.assertIsNone(session.agent_kind)
+        self.assertEqual("", session.agent_cwd)
+        self.assertIsNone(session.as_dict()["agent"])
+
+    async def test_agent_transitions_notify_state_subscribers(self) -> None:
+        session = TerminalSession(
+            id="agent-notify",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        waiter = self.manager.subscribe_state()
+        try:
+            self.manager._set_agent(session, "kimi", source="output")
+            self.assertTrue(waiter.is_set())
+
+            waiter.clear()
+            self.manager._set_agent(session, "kimi", source="output")
+            self.assertFalse(waiter.is_set())
+        finally:
+            self.manager.unsubscribe_state(waiter)
+
+    async def test_stable_process_refreshes_observation_without_session_push(self) -> None:
+        events: list[dict[str, object]] = []
+        self.manager.agent_observation_callback = (
+            lambda _session, event: events.append(event)
+        )
+        session = TerminalSession(
+            id="agent-observation-refresh",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        waiter = self.manager.subscribe_state()
+        try:
+            self.manager._set_agent(
+                session,
+                "codex",
+                "/repo",
+                source="process",
+                pid=123,
+                observation_confidence=0.99,
+            )
+            self.assertTrue(waiter.is_set())
+            waiter.clear()
+
+            self.manager._set_agent(
+                session,
+                "codex",
+                "/repo",
+                source="process",
+                pid=123,
+                observation_confidence=0.99,
+            )
+
+            self.assertFalse(waiter.is_set())
+            self.assertEqual(2, len(events))
+            self.assertEqual(
+                ["observation.process.started", "observation.process.started"],
+                [event["type"] for event in events],
+            )
+            self.assertEqual(0.99, events[-1]["confidence"])
+        finally:
+            self.manager.unsubscribe_state(waiter)
+
+    async def test_same_kind_new_pid_emits_old_exit_before_new_start(self) -> None:
+        events: list[dict[str, object]] = []
+        self.manager.agent_observation_callback = (
+            lambda _session, event: events.append(event)
+        )
+        session = TerminalSession(
+            id="agent-pid-reuse",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._set_agent(
+            session, "kimi", source="process", pid=101
+        )
+        events.clear()
+
+        self.manager._set_agent(
+            session, "kimi", source="process", pid=202
+        )
+
+        self.assertEqual(
+            ["observation.process.exited", "observation.process.started"],
+            [event["type"] for event in events],
+        )
+        self.assertEqual(101, events[0]["pid"])
+        self.assertEqual(202, events[1]["pid"])
+
+    async def test_process_evidence_overrides_output_banner(self) -> None:
+        session = TerminalSession(
+            id="agent-precedence",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._set_agent(session, "codex", "/repo", source="process", pid=123)
+
+        self.manager._append(session, b"Welcome to Claude Code\n")
+        self.assertEqual("codex", session.agent_kind)
+        self.assertEqual("/repo", session.agent_cwd)
+
+    async def test_create_keeps_declared_agent_as_intent_only(self) -> None:
+        session = self.manager.create("Codex", agent_hint="codex")
+        self.assertEqual("codex", session.agent_hint)
+        self.assertIsNone(session.agent_kind)
+        self.assertIsNone(session.as_dict()["agent"])
+
+        plain = self.manager.create("Plain", agent_hint="not-an-agent")
+        self.assertEqual("not-an-agent", plain.agent_hint)
+        self.assertIsNone(plain.agent_kind)
+
+    async def test_cross_thread_state_notification_uses_owner_loop(self) -> None:
+        session = TerminalSession(
+            id="agent-thread-notify",
+            name="Local",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        waiter = self.manager.subscribe_state()
+        loop = asyncio.get_running_loop()
+        previous_debug = loop.get_debug()
+        loop.set_debug(True)
+        try:
+            await asyncio.to_thread(
+                self.manager._set_agent,
+                session,
+                "kimi",
+                "",
+                "process",
+                123,
+            )
+            await asyncio.wait_for(waiter.wait(), timeout=1)
+            self.assertEqual("kimi", session.agent_kind)
+        finally:
+            loop.set_debug(previous_debug)
+            self.manager.unsubscribe_state(waiter)
+
+    async def test_worker_scan_does_not_apply_state_until_reconciled(self) -> None:
+        session = TerminalSession(
+            id="agent-worker-scan",
+            name="Local",
+            pid=123,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        with patch.object(
+            self.manager,
+            "_probe_session_agent",
+            return_value=("codex", 456, "/repo"),
+        ):
+            targets = self.manager.local_agent_probe_targets()
+            observations = await asyncio.to_thread(
+                self.manager.scan_local_agents, targets
+            )
+        self.assertIsNone(session.agent_kind)
+
+        self.manager.apply_local_agent_probes(observations)
+        self.assertEqual("codex", session.agent_kind)
+        self.assertEqual("process", session.agent_source)
+        self.assertEqual(456, session.agent_pid)
+        self.assertEqual("/repo", session.agent_cwd)
+
+    async def test_local_probe_distinguishes_unknown_from_empty_snapshot(self) -> None:
+        session = TerminalSession(
+            id="agent-local-empty",
+            name="Local",
+            pid=123,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+        )
+        self.manager.sessions[session.id] = session
+        self.manager._set_agent(session, "kimi", source="output")
+
+        self.manager.apply_local_agent_probes([(session.id, None)])
+        self.assertEqual("kimi", session.agent_kind)
+
+        self.manager.apply_local_agent_probes([(session.id, ("", 0, ""))])
+        self.assertIsNone(session.agent_kind)
+
+    async def test_local_probe_detects_agent_process_and_exit(self) -> None:
+        session = self.manager.create("Probe")
+        await self.wait_for_output(session.id, b"ready-marker")
+        # Without this, the echoed input line would contain each marker long
+        # before the command actually runs, making the waits meaningless.
+        self.manager.write(session.id, b"stty -echo\r")
+        await asyncio.sleep(0.1)
+
+        self.manager.write(
+            session.id,
+            b"bash -c 'exec -a codex sleep 30' & probe_pid=$!; echo probe-ready\r",
+        )
+        await self.wait_for_output(session.id, b"probe-ready")
+        self.manager.probe_local_agents()
+        self.assertEqual("codex", session.agent_kind)
+        self.assertEqual("process", session.agent_source)
+        self.assertEqual(session.cwd, session.agent_cwd)
+        self.assertGreater(session.agent_pid or 0, 1)
+
+        self.manager.write(
+            session.id,
+            b"kill $probe_pid; wait $probe_pid 2>/dev/null; echo probe-done\r",
+        )
+        await self.wait_for_output(session.id, b"probe-done")
+        self.manager.probe_local_agents()
+        self.assertIsNone(session.agent_kind)
+
+    async def test_device_agent_scan_does_not_guess_between_terminals(self) -> None:
+        older = TerminalSession(
+            id="agent-older",
+            name="Older",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=10,
+        )
+        newer = TerminalSession(
+            id="agent-newer",
+            name="Newer",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+            last_activity_at=20,
+        )
+        self.manager.sessions = {older.id: older, newer.id: newer}
+        try:
+            self.manager.sync_device_agents(
+                "device-001", [RemoteAgent("kimi", 4321, 4300, "kimi")]
+            )
+            self.assertIsNone(newer.agent_kind)
+            self.assertIsNone(older.agent_kind)
+        finally:
+            self.manager.sessions = {}
+
+    async def test_device_agent_scan_maps_unique_terminal_and_clears_empty_snapshot(self) -> None:
+        session = TerminalSession(
+            id="agent-only",
+            name="Only",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+        )
+        self.manager.sessions = {session.id: session}
+        try:
+            self.manager.sync_device_agents(
+                "device-001", [RemoteAgent("kimi", 4321, 4300, "kimi")]
+            )
+            self.assertEqual("kimi", session.agent_kind)
+            self.assertEqual("process", session.agent_source)
+            self.assertEqual(4321, session.agent_pid)
+
+            self.manager.sync_device_agents("device-001", [])
+            self.assertIsNone(session.agent_kind)
+        finally:
+            self.manager.sessions = {}
+
+    async def test_device_agent_scan_migrates_confirmed_owner_and_clears_old(self) -> None:
+        older = TerminalSession(
+            id="agent-old-owner",
+            name="Old owner",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+        )
+        newer = TerminalSession(
+            id="agent-new-owner",
+            name="New owner",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+        )
+        self.manager.sessions = {older.id: older, newer.id: newer}
+        try:
+            self.manager._set_agent(
+                older, "kimi", source="process", pid=111
+            )
+            self.manager._set_agent(newer, "kimi", source="output")
+
+            self.manager.sync_device_agents(
+                "device-001", [RemoteAgent("kimi", 222, 1, "kimi")]
+            )
+            self.assertIsNone(older.agent_kind)
+            self.assertEqual("kimi", newer.agent_kind)
+            self.assertEqual("process", newer.agent_source)
+            self.assertEqual(222, newer.agent_pid)
+        finally:
+            self.manager.sessions = {}
+
+    async def test_device_agent_scan_uses_unique_banner_matches_for_multiple_agents(self) -> None:
+        codex = TerminalSession(
+            id="agent-codex-owner",
+            name="Codex",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+        )
+        kimi = TerminalSession(
+            id="agent-kimi-owner",
+            name="Kimi",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+        )
+        self.manager.sessions = {codex.id: codex, kimi.id: kimi}
+        try:
+            self.manager._set_agent(codex, "codex", source="output")
+            self.manager._set_agent(kimi, "kimi", source="output")
+            self.manager.sync_device_agents(
+                "device-001",
+                [
+                    RemoteAgent("kimi", 222, 1, "kimi"),
+                    RemoteAgent("codex", 111, 1, "codex"),
+                ],
+            )
+            self.assertEqual(111, codex.agent_pid)
+            self.assertEqual("process", codex.agent_source)
+            self.assertEqual(222, kimi.agent_pid)
+            self.assertEqual("process", kimi.agent_source)
+        finally:
+            self.manager.sessions = {}
+
+    async def test_empty_device_scan_clears_output_only_observation(self) -> None:
+        session = TerminalSession(
+            id="agent-output-exit",
+            name="Output",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+        )
+        self.manager.sessions = {session.id: session}
+        try:
+            self.manager._set_agent(session, "claude", source="output")
+            self.manager.sync_device_agents("device-001", [])
+            self.assertIsNone(session.agent_kind)
+        finally:
+            self.manager.sessions = {}
 
     async def test_process_scan_discovers_assigns_and_removes_service(self) -> None:
         older = TerminalSession(
@@ -672,6 +1634,9 @@ class TerminalStoreTests(unittest.TestCase):
                 workspace_root="/srv/project",
                 workspace_platform="posix",
                 tmux_name="agentserver-session-id",
+                launch_id="launch-session-id",
+                managed=True,
+                origin="agentserver",
                 created_at=1234.5,
             )
             store.save(session)
@@ -685,6 +1650,9 @@ class TerminalStoreTests(unittest.TestCase):
             self.assertEqual("alice", rows[0]["owner"])
             self.assertEqual("sftp", rows[0]["workspace_kind"])
             self.assertEqual("/srv/project", rows[0]["workspace_root"])
+            self.assertEqual("launch-session-id", rows[0]["launch_id"])
+            self.assertEqual(1, rows[0]["managed"])
+            self.assertEqual("agentserver", rows[0]["origin"])
 
             store.delete(session.id)
             self.assertEqual([], store.list())
@@ -722,9 +1690,154 @@ class TerminalStoreTests(unittest.TestCase):
             self.assertEqual("local", row["workspace_kind"])
             self.assertEqual("", row["workspace_root"])
             self.assertEqual("posix", row["workspace_platform"])
+            self.assertIsNone(row["agent_hint"])
+            self.assertEqual("", row["launch_id"])
+            self.assertEqual(0, row["managed"])
+            self.assertEqual("legacy", row["origin"])
+
+    def test_existing_managed_columns_are_not_downgraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "managed.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE terminal_sessions (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        device_id TEXT,
+                        device_name TEXT,
+                        remote_port INTEGER,
+                        tmux_name TEXT NOT NULL UNIQUE,
+                        created_at REAL NOT NULL,
+                        launch_id TEXT NOT NULL DEFAULT '',
+                        managed INTEGER NOT NULL DEFAULT 0,
+                        origin TEXT NOT NULL DEFAULT 'legacy'
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO terminal_sessions(
+                        id, name, command, cwd, kind, tmux_name, created_at,
+                        launch_id, managed, origin
+                    ) VALUES (
+                        'managed', 'Managed', 'shell', '/tmp', 'local',
+                        'agentserver-managed', 2.0, 'launch-managed', 1,
+                        'agentserver'
+                    )
+                    """
+                )
+
+            row = TerminalStore(database).list()[0]
+            self.assertEqual("launch-managed", row["launch_id"])
+            self.assertEqual(1, row["managed"])
+            self.assertEqual("agentserver", row["origin"])
+
+    def test_agent_hint_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TerminalStore(Path(directory) / "terminals.db")
+            session = TerminalSession(
+                id="hint-session",
+                name="Hinted",
+                pid=-1,
+                fd=-1,
+                command="shell",
+                cwd=directory,
+                tmux_name="agentserver-hint-session",
+                agent_hint="kimi",
+            )
+            store.save(session)
+
+            rows = store.list()
+            self.assertEqual(1, len(rows))
+            self.assertEqual("kimi", rows[0]["agent_hint"])
 
 
 class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tmux_control_process_does_not_inherit_dynamic_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.terminal.shutil.which", return_value="/usr/bin/tmux"
+        ), patch.object(TerminalManager, "_restore_tmux_sessions"):
+            manager = TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+            )
+            completed = subprocess.CompletedProcess(
+                ["tmux"], 0, stdout="", stderr=""
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENTSERVER_REPORT_TOKEN": "server-secret",
+                    "AGENTSERVER_TASK_PAYLOAD": "server-task",
+                },
+            ), patch("app.terminal.subprocess.run", return_value=completed) as run:
+                manager._tmux_run("display-message", "-p", "ok")
+
+            environment = run.call_args.kwargs["env"]
+            self.assertNotIn("AGENTSERVER_REPORT_TOKEN", environment)
+            self.assertNotIn("AGENTSERVER_TASK_PAYLOAD", environment)
+            await manager.close()
+
+    async def test_tmux_launch_uses_preallocated_identity_and_static_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.terminal.shutil.which", return_value="/usr/bin/tmux"
+        ), patch.object(TerminalManager, "_restore_tmux_sessions"):
+            bound: list[TerminalSession] = []
+            manager = TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+                control_binding_callback=bound.append,
+            )
+            with patch.object(manager, "_tmux_run") as tmux_run, patch.object(
+                manager, "_spawn_tmux_client"
+            ):
+                tmux_run.return_value.returncode = 0
+                tmux_run.return_value.stdout = "4321\n"
+                session = manager.create(
+                    "Managed tmux",
+                    owner="alice",
+                    session_id="tmux-terminal",
+                    launch_id="tmux-launch",
+                    managed_env={
+                        "AGENTSERVER_CONTROL_SOCKET": "/tmp/control socket.sock"
+                    },
+                )
+
+            new_session = next(
+                call for call in tmux_run.call_args_list if call.args[0] == "new-session"
+            )
+            launch_command = new_session.args[-1]
+            self.assertIn("unset ", launch_command)
+            self.assertIn("AGENTSERVER_REPORT_TOKEN", launch_command)
+            self.assertIn("export AGENTSERVER_TERMINAL_ID=tmux-terminal", launch_command)
+            self.assertIn("export AGENTSERVER_LAUNCH_ID=tmux-launch", launch_command)
+            self.assertIn(
+                "export AGENTSERVER_CONTROL_SOCKET='/tmp/control socket.sock'",
+                launch_command,
+            )
+            self.assertTrue(launch_command.endswith("exec /bin/sh -l"))
+            self.assertEqual("agentserver-tmux-terminal", session.tmux_name)
+            self.assertEqual("tmux-launch", session.launch_id)
+            self.assertEqual(4321, session.control_pid)
+            self.assertEqual([session], bound)
+            stored = manager.store.list()[0]
+            self.assertEqual("tmux-launch", stored["launch_id"])
+            self.assertEqual(1, stored["managed"])
+            self.assertEqual("agentserver", stored["origin"])
+            await manager.close()
+
     async def test_tmux_artifact_fifo_is_machine_only_and_cleaned_up(self) -> None:
         events: list[dict[str, object]] = []
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -1204,13 +2317,59 @@ class TmuxPaneStateSnapshotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["list-panes"], [call[0] for call in calls])
             await manager.close()
 
+    async def test_tmux_exit_reports_once_and_clears_pid_agent(self) -> None:
+        stdout = "agentserver-dead\t1\t137\t0\n"
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            dead = self._session("dead")
+            manager.sessions[dead.id] = dead
+            terminal_events: list[tuple[str, dict[str, object]]] = []
+            agent_events: list[dict[str, object]] = []
+            manager.terminal_lifecycle_callback = lambda session, event: (
+                terminal_events.append((session.id, event))
+            )
+            manager.agent_observation_callback = (
+                lambda _session, event: agent_events.append(event)
+            )
+            manager._set_agent(dead, "kimi", source="process", pid=4242)
+            agent_events.clear()
+            calls: list[tuple[str, ...]] = []
+
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                manager.list()
+                manager.list()
+                self.assertTrue(await manager.delete(dead.id))
+
+            self.assertFalse(dead.active)
+            self.assertIsNone(dead.agent_kind)
+            self.assertEqual(
+                [
+                    (
+                        dead.id,
+                        {
+                            "type": "terminal.exited",
+                            "return_code": 137,
+                            "exited_at": dead.exited_at,
+                        },
+                    )
+                ],
+                terminal_events,
+            )
+            self.assertEqual(
+                ["observation.process.exited"],
+                [event["type"] for event in agent_events],
+            )
+            self.assertEqual(4242, agent_events[0]["pid"])
+            self.assertEqual(137, agent_events[0]["return_code"])
+            await manager.close()
+
     async def test_session_mutating_commands_invalidate_the_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = self._manager(directory)
             calls: list[tuple[str, ...]] = []
 
             def run(
-                command: list[str], *, capture_output: bool, text: bool
+                command: list[str], *, capture_output: bool, text: bool, env: dict[str, str]
             ) -> subprocess.CompletedProcess[str]:
                 arguments = tuple(command[3:])
                 calls.append(arguments)
