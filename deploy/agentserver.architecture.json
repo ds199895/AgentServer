@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AgentServer 系统架构",
+    "output": "agentserver-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/ds199895/AgentServer",
+      "revision": "1222baffdc082b39c1dc428a71ff9ba7a8e14ff2"
+    },
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "external": { "label": "受管设备" },
+        "cloud": { "label": "网络入口" },
+        "backend": { "label": "后端服务" },
+        "frontend": { "label": "浏览器界面" },
+        "database": { "label": "持久存储" },
+        "messagebus": { "label": "事件处理" }
+      }
+    }
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [48, 78],
+    "cols": 5,
+    "gapX": 76,
+    "gapY": 70,
+    "cellW": 158,
+    "cellH": 68
+  },
+  "components": [
+    {
+      "id": "devices",
+      "type": "external",
+      "label": "受管设备",
+      "sublabel": "OpenSSH Server + frpc",
+      "row": 1,
+      "col": 0,
+      "sources": [
+        { "path": "scripts/install_frpc_ssh.sh", "label": "Linux/macOS 安装器" },
+        { "path": "scripts/install_frpc_ssh.ps1", "label": "Windows 安装器" }
+      ]
+    },
+    {
+      "id": "frps",
+      "type": "cloud",
+      "label": "frps",
+      "sublabel": "TLS 隧道 + Dashboard",
+      "tag": "TCP 代理入口",
+      "row": 1,
+      "col": 1,
+      "sources": [
+        { "path": "frps.example.toml", "label": "服务端配置" }
+      ]
+    },
+    {
+      "id": "agentserver",
+      "type": "backend",
+      "label": "AgentServer",
+      "sublabel": "FastAPI + WebSocket",
+      "tag": "控制面",
+      "row": 1,
+      "col": 2,
+      "sources": [
+        { "path": "app/main.py", "label": "API 与生命周期" },
+        { "path": "deploy/agentserver.service", "label": "生产 Web 服务" }
+      ]
+    },
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "浏览器控制台",
+      "sublabel": "React + xterm.js",
+      "row": 1,
+      "col": 4,
+      "sources": [
+        { "path": "frontend/src/App.tsx", "label": "应用入口" },
+        { "path": "frontend/src/TerminalPane.tsx", "label": "终端界面" }
+      ]
+    },
+    {
+      "id": "terminal",
+      "type": "backend",
+      "label": "TerminalManager",
+      "sublabel": "PTY / tmux / SSH",
+      "row": 0,
+      "col": 2,
+      "sources": [
+        { "path": "app/terminal.py", "label": "终端生命周期" }
+      ]
+    },
+    {
+      "id": "tmux",
+      "type": "backend",
+      "label": "tmux 服务",
+      "sublabel": "持久终端进程",
+      "row": 0,
+      "col": 3,
+      "sources": [
+        { "path": "deploy/agentserver-tmux.service", "label": "独立 systemd 服务" }
+      ]
+    },
+    {
+      "id": "workspace",
+      "type": "backend",
+      "label": "WorkspaceService",
+      "sublabel": "Local / SFTP，只读",
+      "row": 2,
+      "col": 1,
+      "sources": [
+        { "path": "app/workspace.py", "label": "工作区提供器" }
+      ]
+    },
+    {
+      "id": "artifacts",
+      "type": "messagebus",
+      "label": "Artifact 服务",
+      "sublabel": "事件 + read-image",
+      "row": 2,
+      "col": 2,
+      "sources": [
+        { "path": "app/artifacts.py", "label": "事件与附件" }
+      ]
+    },
+    {
+      "id": "preview",
+      "type": "backend",
+      "label": "PreviewManager",
+      "sublabel": "SSH tunnel / HTTP / WS",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        { "path": "app/preview.py", "label": "预览网关" }
+      ]
+    },
+    {
+      "id": "storage",
+      "type": "database",
+      "label": "数据层",
+      "sublabel": "SQLite + SHA-256 附件",
+      "row": 3,
+      "col": 2,
+      "sources": [
+        { "path": "app/auth.py", "label": "用户数据" },
+        { "path": "app/artifacts.py", "label": "事件与附件存储" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "集中服务器",
+      "wraps": ["frps", "agentserver", "terminal", "tmux", "workspace", "artifacts", "preview", "storage"],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "device-tunnel",
+      "from": "devices",
+      "to": "frps",
+      "label": "FRP TLS 隧道",
+      "variant": "security"
+    },
+    {
+      "id": "frps-control",
+      "from": "frps",
+      "to": "agentserver",
+      "label": "Dashboard + SSH 代理",
+      "variant": "emphasis"
+    },
+    {
+      "id": "web-console",
+      "from": "agentserver",
+      "to": "browser",
+      "label": "HTTPS + WebSocket",
+      "variant": "emphasis"
+    },
+    {
+      "id": "terminal-control",
+      "from": "agentserver",
+      "to": "terminal",
+      "label": "创建 / 恢复终端"
+    },
+    {
+      "id": "tmux-attach",
+      "from": "terminal",
+      "to": "tmux",
+      "label": "attach / PTY"
+    },
+    {
+      "id": "workspace-access",
+      "from": "agentserver",
+      "to": "workspace",
+      "label": "文件授权 / SFTP"
+    },
+    {
+      "id": "artifact-events",
+      "from": "agentserver",
+      "to": "artifacts",
+      "label": "事件与图片",
+      "labelAt": [576, 290]
+    },
+    {
+      "id": "preview-tunnel",
+      "from": "agentserver",
+      "to": "preview",
+      "label": "服务发现 / 隧道"
+    },
+    {
+      "id": "artifact-storage",
+      "from": "artifacts",
+      "to": "storage",
+      "label": "元数据 / 附件",
+      "labelAt": [576, 428]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "终端持续运行",
+      "items": [
+        "Web 服务部署只会短暂断开浏览器连接",
+        "tmux 独立服务继续托管 Shell、SSH 和 Codex 进程"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "集中控制与隔离",
+      "items": [
+        "frps Dashboard 仅供服务器本机访问",
+        "工作区只读，预览使用隔离子域名和短时票据"
+      ]
+    }
+  ]
+}
