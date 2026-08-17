@@ -30,7 +30,7 @@ jobs:
           # Match the production host so bundled binary wheels are compatible.
           python-version: '3.10'
           cache: pip
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -92,7 +92,7 @@ jobs:
         with:
           # Download wheels for the same interpreter used in production.
           python-version: '3.10'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
