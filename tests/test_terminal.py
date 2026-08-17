@@ -1,13 +1,21 @@
 import asyncio
+import base64
+import json
 import os
 import re
+import shlex
+import shutil
 import signal
+import sqlite3
+import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from app.terminal import (
+    STREAM_GAP,
     DetectedService,
     ListeningProcess,
     TerminalManager,
@@ -93,12 +101,121 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"ready-marker", snapshot)
         self.assertTrue(session.active)
 
+    async def test_local_workspace_root_is_the_shell_working_directory(self) -> None:
+        workspace = Path(self.directory.name) / "project"
+        workspace.mkdir()
+        session = self.manager.create("Project", workspace_root=str(workspace))
+        await self.wait_for_output(session.id, b"ready-marker")
+        self.manager.write(session.id, b"pwd\r")
+        snapshot = await self.wait_for_output(session.id, str(workspace).encode())
+
+        self.assertEqual(str(workspace), session.cwd)
+        self.assertEqual(str(workspace), session.workspace_current_path)
+        self.assertIn(str(workspace).encode(), snapshot)
+
     async def test_sessions_have_unique_random_ids(self) -> None:
         first = self.manager.create("First")
         second = self.manager.create("Second")
         self.assertNotEqual(first.id, second.id)
         self.assertRegex(first.id, re.compile(r"^[a-f0-9]{32}$"))
         self.assertRegex(second.id, re.compile(r"^[a-f0-9]{32}$"))
+
+    async def test_sessions_are_filtered_by_owner(self) -> None:
+        alice = self.manager.create("Alice", owner="alice")
+        bob = self.manager.create("Bob", owner="bob")
+
+        self.assertEqual([alice.id], [item["id"] for item in self.manager.list("alice")])
+        self.assertIs(alice, self.manager.get_for_owner(alice.id, "alice"))
+        self.assertIsNone(self.manager.get_for_owner(bob.id, "alice"))
+
+    async def test_decodes_split_artifact_osc_payload(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        self.manager.artifact_callback = lambda session, event: events.append(
+            (session.id, event)
+        )
+        session = TerminalSession(
+            id="artifact-session",
+            name="Artifact",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+            owner="alice",
+        )
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"type": "created", "path": "charts/result.png"}).encode()
+        ).decode().rstrip("=")
+        marker = f"\x1b]633;artifact;{payload}\x07".encode()
+
+        self.manager._discover_artifacts(session, marker[:13])
+        self.manager._discover_artifacts(session, marker[13:])
+
+        self.assertEqual(1, len(events))
+        self.assertEqual(session.id, events[0][0])
+        self.assertEqual("charts/result.png", events[0][1]["path"])
+        self.assertEqual("terminal-osc", events[0][1]["source"])
+
+    async def test_decodes_tmux_safe_artifact_line_marker(self) -> None:
+        events: list[dict[str, object]] = []
+        self.manager.artifact_callback = lambda _session, event: events.append(event)
+        session = TerminalSession(
+            id="line-artifact-session",
+            name="Artifact",
+            pid=-1,
+            fd=-1,
+            command="shell",
+            cwd=self.directory.name,
+            owner="alice",
+        )
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"type": "modified", "path": "output/report.pdf"}).encode()
+        ).decode().rstrip("=")
+        marker = (
+            f"__AGENTSERVER_ARTIFACT__:{payload}:AGENTSERVER_END__\r\x1b[2K"
+        ).encode()
+
+        self.manager._discover_artifacts(session, marker[:21])
+        self.manager._discover_artifacts(session, marker[21:])
+        self.manager._discover_artifacts(session, b"ordinary output")
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("output/report.pdf", events[0]["path"])
+        self.assertEqual("terminal-marker", events[0]["source"])
+
+    async def test_overloaded_subscriber_gets_a_gap_marker_not_a_hole(self) -> None:
+        """A backed-up client must not silently receive a spliced VT stream."""
+        session = self.manager.create("Backpressure")
+        _snapshot, queue = self.manager.attach(session.id)
+        healthy_snapshot, healthy = self.manager.attach(session.id)
+        del _snapshot, healthy_snapshot
+        try:
+            while not queue.full():
+                queue.put_nowait(b"queued")
+            queued_before = queue.qsize()
+
+            self.manager._broadcast(session, b"\x1b[31mlate\x1b[0m")
+
+            # Everything pending is discarded in favour of one explicit marker,
+            # so nothing can mistake a hole for continuous output.
+            self.assertEqual(1, queue.qsize())
+            self.assertIs(STREAM_GAP, queue.get_nowait())
+            self.assertGreater(queued_before, 1)
+
+            # The slow client's overflow must not cost a healthy subscriber
+            # either chunk. Live PTY output may be interleaved, so assert on
+            # order rather than on exact queue contents.
+            self.manager._broadcast(session, b"still fine")
+            delivered: list[bytes] = []
+            while not healthy.empty():
+                delivered.append(healthy.get_nowait())
+            self.assertNotIn(STREAM_GAP, delivered)
+            self.assertLess(
+                delivered.index(b"\x1b[31mlate\x1b[0m"),
+                delivered.index(b"still fine"),
+            )
+        finally:
+            self.manager.detach(session.id, queue)
+            self.manager.detach(session.id, healthy)
 
     async def test_session_cleanup_never_signals_special_pids(self) -> None:
         with patch("app.terminal.subprocess.run") as process_scan, patch(
@@ -550,6 +667,10 @@ class TerminalStoreTests(unittest.TestCase):
                 device_id="device-001",
                 device_name="Device 001",
                 remote_port=20001,
+                owner="alice",
+                workspace_kind="sftp",
+                workspace_root="/srv/project",
+                workspace_platform="posix",
                 tmux_name="agentserver-session-id",
                 created_at=1234.5,
             )
@@ -561,12 +682,107 @@ class TerminalStoreTests(unittest.TestCase):
             self.assertEqual("agentserver-session-id", rows[0]["tmux_name"])
             self.assertEqual("device-001", rows[0]["device_id"])
             self.assertEqual(20001, rows[0]["remote_port"])
+            self.assertEqual("alice", rows[0]["owner"])
+            self.assertEqual("sftp", rows[0]["workspace_kind"])
+            self.assertEqual("/srv/project", rows[0]["workspace_root"])
 
             store.delete(session.id)
             self.assertEqual([], store.list())
 
+    def test_existing_schema_adds_owner_and_workspace_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE terminal_sessions (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        device_id TEXT,
+                        device_name TEXT,
+                        remote_port INTEGER,
+                        tmux_name TEXT NOT NULL UNIQUE,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO terminal_sessions
+                    VALUES ('legacy', 'Legacy', 'ssh host', '/tmp', 'ssh',
+                            'device-1', 'Device', 22001, 'agentserver-legacy', 1.0)
+                    """
+                )
+
+            row = TerminalStore(database).list()[0]
+            self.assertEqual("", row["owner"])
+            self.assertEqual("local", row["workspace_kind"])
+            self.assertEqual("", row["workspace_root"])
+            self.assertEqual("posix", row["workspace_platform"])
+
 
 class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tmux_artifact_fifo_is_machine_only_and_cleaned_up(self) -> None:
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.terminal.shutil.which", return_value="/usr/bin/tmux"
+        ), patch.object(TerminalManager, "_restore_tmux_sessions"):
+            manager = TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+                artifact_callback=lambda _session, event: events.append(event),
+            )
+            session = TerminalSession(
+                id="artifact-pipe-session",
+                name="Artifact pipe",
+                pid=-1,
+                fd=-1,
+                command="/bin/sh -l",
+                cwd=directory,
+                tmux_name="agentserver-artifact-pipe-session",
+            )
+            manager.sessions[session.id] = session
+            payload = base64.urlsafe_b64encode(
+                json.dumps({"type": "created", "path": "build/chart.png"}).encode()
+            ).decode().rstrip("=")
+            marker = (
+                f"__AGENTSERVER_ARTIFACT__:{payload}:AGENTSERVER_END__\r\x1b[2K"
+            ).encode()
+
+            with patch.object(manager, "_tmux_run") as tmux_run, patch.object(
+                manager, "_broadcast"
+            ) as broadcast:
+                manager._start_tmux_artifact_capture(session)
+                pipe_path = Path(session.artifact_pipe_path)
+                self.assertTrue(stat.S_ISFIFO(pipe_path.stat().st_mode))
+                os.write(session.artifact_fd, b"ordinary shell output\r\n" + marker)
+
+                deadline = asyncio.get_running_loop().time() + 2
+                while not events and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.01)
+
+                self.assertTrue(events, "artifact FIFO did not deliver the marker")
+                self.assertEqual("build/chart.png", events[0]["path"])
+                self.assertEqual("terminal-marker", events[0]["source"])
+                self.assertEqual([], list(session.chunks))
+                broadcast.assert_not_called()
+
+                manager._stop_tmux_artifact_capture(session)
+                self.assertEqual(-1, session.artifact_fd)
+                self.assertFalse(pipe_path.exists())
+
+            start_call = tmux_run.call_args_list[0]
+            self.assertEqual(("pipe-pane", "-t", session.tmux_name), start_call.args[:3])
+            self.assertIn("exec cat >", start_call.args[3])
+            await manager.close()
+
     async def test_tmux_server_uses_configured_shell_for_nologin_service_user(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "app.terminal.shutil.which", return_value="/usr/bin/tmux"
@@ -630,12 +846,16 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     backend="tmux",
                     database_path=database_path,
                     tmux_socket=Path(directory) / "tmux.sock",
+                    default_owner="admin",
                 )
 
             restored = manager.sessions[stored.id]
             self.assertEqual("agentserver-restored-id", restored.tmux_name)
             self.assertEqual("device-001", restored.device_id)
             self.assertEqual(20001, restored.remote_port)
+            self.assertEqual("admin", restored.owner)
+            self.assertEqual("sftp", restored.workspace_kind)
+            self.assertEqual(".", restored.workspace_root)
             self.assertIn(b"restored output", b"".join(restored.chunks))
 
     async def test_close_detaches_without_deleting_persistent_session(self) -> None:
@@ -703,6 +923,322 @@ class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(manager.sessions.get(session.id))
             self.assertEqual([], manager.store.list())
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+    async def test_real_tmux_pipe_captures_immediately_erased_burst(self) -> None:
+        tmux_binary = shutil.which("tmux")
+        assert tmux_binary is not None
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "integration.sock"
+            await asyncio.to_thread(
+                subprocess.run,
+                [
+                    tmux_binary,
+                    "-S",
+                    str(socket_path),
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "bootstrap",
+                    "sleep 30",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            manager: TerminalManager | None = None
+            session: TerminalSession | None = None
+            events: list[dict[str, object]] = []
+            try:
+                manager = TerminalManager(
+                    command="",
+                    cwd=directory,
+                    shell="/bin/sh",
+                    backend="tmux",
+                    database_path=Path(directory) / "terminals.db",
+                    tmux_binary=tmux_binary,
+                    tmux_socket=socket_path,
+                    artifact_callback=lambda _session, event: events.append(event),
+                )
+                session = manager.create("Artifact integration")
+                self.assertGreaterEqual(session.artifact_fd, 0)
+
+                # Establish a real rendered-channel barrier before the burst.
+                # tmux attach starts asynchronously; a fixed sleep can let the raw
+                # pipe win before the attach PTY has delivered its initial redraw.
+                # The octal command form keeps the sentinel out of any input echo,
+                # so observing it proves the command ran and the client read it.
+                ready_marker = b"attach-client-ready"
+                ready_escape = "".join(f"\\{byte:03o}" for byte in ready_marker) + "\\n"
+                manager._tmux_run(
+                    "send-keys",
+                    "-t",
+                    session.tmux_name or "",
+                    "-l",
+                    f"stty -echo; printf {shlex.quote(ready_escape)}",
+                )
+                manager._tmux_run("send-keys", "-t", session.tmux_name or "", "Enter")
+                ready_deadline = asyncio.get_running_loop().time() + 5
+                rendered = b""
+                while asyncio.get_running_loop().time() < ready_deadline:
+                    rendered = b"".join(session.chunks)
+                    if ready_marker in rendered:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertIn(ready_marker, rendered)
+                session.chunks.clear()
+                session.buffer_size = 0
+
+                payload = base64.urlsafe_b64encode(
+                    json.dumps(
+                        {"type": "created", "path": "artifacts/erased.png"}
+                    ).encode()
+                ).decode().rstrip("=")
+                marker = (
+                    f"__AGENTSERVER_ARTIFACT__:{payload}:AGENTSERVER_END__"
+                )
+                burst = 80
+                # Keep the exact-once normal-output probe after the long burst.
+                # Before it, tmux may coalesce redraws or scroll the earlier line;
+                # the separate FIFO unit test already proves raw bytes are not
+                # broadcast, while this probe exercises the real attach path.
+                script = (
+                    "i=0; while [ \"$i\" -lt "
+                    f"{burst} ]; do printf '%s\\r\\033[2K' {shlex.quote(marker)}; "
+                    "i=$((i+1)); done; "
+                    "printf '%s\\n' artifact-burst-complete; "
+                    "printf '%s\\n' ordinary-output-once"
+                )
+                manager._tmux_run(
+                    "send-keys", "-t", session.tmux_name or "", "-l", script
+                )
+                manager._tmux_run("send-keys", "-t", session.tmux_name or "", "Enter")
+
+                deadline = asyncio.get_running_loop().time() + 5
+                rendered = b""
+                while asyncio.get_running_loop().time() < deadline:
+                    rendered = b"".join(session.chunks)
+                    # The raw pipe and the rendered attach client are independent;
+                    # wait for the complete success condition on both channels.
+                    if (
+                        len(events) >= burst
+                        and b"artifact-burst-complete" in rendered
+                        and b"ordinary-output-once" in rendered
+                    ):
+                        break
+                    await asyncio.sleep(0.02)
+
+                self.assertEqual(burst, len(events))
+                self.assertTrue(
+                    all(event["path"] == "artifacts/erased.png" for event in events)
+                )
+                self.assertTrue(
+                    all(event["source"] == "terminal-marker" for event in events)
+                )
+                self.assertIn(b"artifact-burst-complete", rendered)
+                self.assertEqual(
+                    1,
+                    rendered.count(b"ordinary-output-once"),
+                    rendered[-4096:],
+                )
+            finally:
+                try:
+                    if manager is not None and session is not None:
+                        await manager.delete(session.id)
+                finally:
+                    try:
+                        if manager is not None:
+                            await manager.close()
+                    finally:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            [tmux_binary, "-S", str(socket_path), "kill-server"],
+                            check=False,
+                            capture_output=True,
+                        )
+
+
+class TmuxPaneStateSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """The batched `list-panes -a` snapshot replaces 2N per-session tmux execs.
+
+    tmux is not required: `_tmux_run` is replaced by a recorder that returns real
+    CompletedProcess values, so the snapshot parsing and the fallback contract are
+    both exercised without a tmux server.
+    """
+
+    def _manager(self, directory: str) -> TerminalManager:
+        with patch("app.terminal.shutil.which", return_value="/usr/bin/tmux"), patch.object(
+            TerminalManager, "_restore_tmux_sessions"
+        ):
+            # No artifact_callback: _start_tmux_artifact_capture then early-returns,
+            # keeping these tests to the liveness logic under test.
+            return TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+            )
+
+    @staticmethod
+    def _recorder(
+        calls: list[tuple[str, ...]], stdout: str = "", returncode: int = 0
+    ):
+        def run(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            calls.append(arguments)
+            return subprocess.CompletedProcess(
+                list(arguments), returncode, stdout=stdout, stderr=""
+            )
+
+        return run
+
+    @staticmethod
+    def _session(session_id: str) -> TerminalSession:
+        return TerminalSession(
+            id=session_id,
+            name=session_id,
+            pid=-1,
+            fd=-1,
+            command="/bin/sh -l",
+            cwd="/tmp",
+            tmux_name=f"agentserver-{session_id}",
+        )
+
+    async def test_snapshot_parses_every_pane_and_caches_within_ttl(self) -> None:
+        stdout = (
+            "agentserver-alive\t0\t\t1\n"
+            "agentserver-dead\t1\t137\t0\n"
+            "malformed-line-without-fields\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                states = manager._tmux_pane_states()
+                self.assertEqual(
+                    {
+                        "agentserver-alive": (False, "", True),
+                        "agentserver-dead": (True, "137", False),
+                    },
+                    states,
+                )
+                self.assertEqual(1, len(calls))
+                self.assertEqual("list-panes", calls[0][0])
+                self.assertEqual("-a", calls[0][1])
+
+                # Inside the TTL the snapshot is reused without a second exec.
+                self.assertEqual(states, manager._tmux_pane_states(max_age=60.0))
+                self.assertEqual(1, len(calls))
+                # max_age=0 always re-queries.
+                manager._tmux_pane_states()
+                self.assertEqual(2, len(calls))
+            await manager.close()
+
+    async def test_failed_snapshot_falls_back_instead_of_killing_every_session(self) -> None:
+        """A transient tmux failure must not look like "all sessions died"."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            session = self._session("alive")
+            manager.sessions[session.id] = session
+            calls: list[tuple[str, ...]] = []
+
+            def run(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(arguments)
+                if arguments[0] == "list-panes":
+                    return subprocess.CompletedProcess(
+                        list(arguments), 1, stdout="", stderr="tmux unavailable"
+                    )
+                if arguments[0] == "display-message":
+                    return subprocess.CompletedProcess(
+                        list(arguments), 0, stdout="0::0\n", stderr=""
+                    )
+                return subprocess.CompletedProcess(
+                    list(arguments), 0, stdout="", stderr=""
+                )
+
+            with patch.object(manager, "_tmux_run", run):
+                self.assertIsNone(manager._tmux_pane_states())
+                manager.list()
+            self.assertTrue(session.active, "a failed snapshot must not mark sessions dead")
+            # Fallback path: has-session + display-message per session.
+            self.assertIn("has-session", [call[0] for call in calls])
+            await manager.close()
+
+    async def test_list_refreshes_many_sessions_with_one_tmux_exec(self) -> None:
+        names = [f"session-{index}" for index in range(5)]
+        stdout = "".join(f"agentserver-{name}\t0\t\t0\n" for name in names)
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            for name in names:
+                manager.sessions[name] = self._session(name)
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                listed = manager.list()
+            self.assertEqual(5, len(listed))
+            self.assertTrue(all(item["active"] for item in listed))
+            self.assertEqual(
+                ["list-panes"],
+                [call[0] for call in calls],
+                "refreshing 5 sessions must cost exactly one tmux exec",
+            )
+            await manager.close()
+
+    async def test_snapshot_marks_dead_and_missing_sessions_exited(self) -> None:
+        stdout = "agentserver-dead\t1\t137\t0\n"
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            dead = self._session("dead")
+            vanished = self._session("vanished")
+            manager.sessions[dead.id] = dead
+            manager.sessions[vanished.id] = vanished
+            calls: list[tuple[str, ...]] = []
+            with patch.object(manager, "_tmux_run", self._recorder(calls, stdout)):
+                manager.list()
+            self.assertFalse(dead.active)
+            self.assertEqual(137, dead.return_code)
+            self.assertFalse(vanished.active, "a pane absent from the snapshot has died")
+            self.assertEqual(-1, vanished.return_code)
+            self.assertEqual(["list-panes"], [call[0] for call in calls])
+            await manager.close()
+
+    async def test_session_mutating_commands_invalidate_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            calls: list[tuple[str, ...]] = []
+
+            def run(
+                command: list[str], *, capture_output: bool, text: bool
+            ) -> subprocess.CompletedProcess[str]:
+                arguments = tuple(command[3:])
+                calls.append(arguments)
+                stdout = (
+                    "agentserver-a\t0\t\t0\n"
+                    if arguments and arguments[0] == "list-panes"
+                    else ""
+                )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=stdout, stderr=""
+                )
+
+            with patch("app.terminal.subprocess.run", side_effect=run):
+                manager._tmux_pane_states()
+                self.assertIsNotNone(manager._tmux_states_cache)
+                manager._tmux_run("kill-session", "-t", "agentserver-a", check=False)
+                self.assertIsNone(
+                    manager._tmux_states_cache,
+                    "kill-session changes which sessions exist",
+                )
+                manager._tmux_pane_states()
+                manager._tmux_run("new-session", "-d", "-s", "agentserver-b")
+                self.assertIsNone(manager._tmux_states_cache)
+                # Read-only commands keep the snapshot.
+                manager._tmux_pane_states()
+                manager._tmux_run("display-message", "-p", "x", check=False)
+                self.assertIsNotNone(manager._tmux_states_cache)
+            await manager.close()
 
 
 if __name__ == "__main__":

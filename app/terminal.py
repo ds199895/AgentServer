@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import errno
 import fcntl
+import json
 import os
 import pty
 import re
@@ -19,10 +22,25 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 RESIZE_MESSAGE = re.compile(r"^\x01\[(\d+),(\d+)\]$")
 SNAPSHOT_COMPLETE_MESSAGE = "\x01[snapshot-complete]"
+
+
+class StreamGap:
+    """Queued when a subscriber falls so far behind that its stream is lost.
+
+    A terminal stream is raw VT bytes, so it cannot be repaired by discarding
+    part of it. The only correct recovery is for that client to reconnect and
+    replay a fresh snapshot.
+    """
+
+    __slots__ = ()
+
+
+STREAM_GAP = StreamGap()
 ANSI_ESCAPE = re.compile(
     r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[@-_][0-?]*[ -/]*[@-~])"
 )
@@ -54,6 +72,14 @@ MAX_PROCESS_SERVICE_CANDIDATES = 20
 SERVICE_REDISCOVERY_COOLDOWN = 5 * 60
 LISTENER_SCAN_MARKER = "__AGENTSERVER_LISTENERS__"
 LISTENER_RECORD_MARKER = "__AGENTSERVER_LISTENER__"
+ARTIFACT_OSC = re.compile(
+    r"\x1b\]633;artifact;(?P<payload>[A-Za-z0-9_-]{1,8192})(?:\x07|\x1b\\)"
+)
+ARTIFACT_LINE_PREFIX = "__AGENTSERVER_ARTIFACT__:"
+ARTIFACT_LINE = re.compile(
+    rf"{re.escape(ARTIFACT_LINE_PREFIX)}"
+    r"(?P<payload>[A-Za-z0-9_-]{1,8192}):AGENTSERVER_END__"
+)
 REMOTE_SHELL_COMMANDS = {
     "system": [],
     "powershell": ["powershell.exe", "-NoLogo", "-NoExit"],
@@ -256,6 +282,11 @@ class TerminalSession:
     fd: int
     command: str
     cwd: str
+    owner: str = ""
+    workspace_kind: str = "local"
+    workspace_root: str = ""
+    workspace_platform: str = "posix"
+    workspace_current_path: str | None = None
     kind: str = "local"
     device_id: str | None = None
     device_name: str | None = None
@@ -266,12 +297,15 @@ class TerminalSession:
     return_code: int | None = None
     chunks: deque[bytes] = field(default_factory=deque)
     buffer_size: int = 0
-    subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
+    subscribers: set[asyncio.Queue[bytes | StreamGap]] = field(default_factory=set)
     pending_input: bytearray = field(default_factory=bytearray)
     services: dict[int, DetectedService] = field(default_factory=dict)
     discovery_tail: str = ""
     discovery_label_hint: str = ""
     discovery_label_lines_left: int = 0
+    artifact_tail: str = ""
+    artifact_fd: int = -1
+    artifact_pipe_path: str = ""
     last_activity_at: float = field(default_factory=time.time)
 
     @property
@@ -284,6 +318,12 @@ class TerminalSession:
             "name": self.name,
             "command": self.command,
             "cwd": self.cwd,
+            "workspace": {
+                "kind": self.workspace_kind,
+                "root": self.workspace_root,
+                "platform": self.workspace_platform,
+                "current_path": self.workspace_current_path,
+            },
             "kind": self.kind,
             "device_id": self.device_id,
             "device_name": self.device_name,
@@ -322,6 +362,21 @@ class TerminalStore:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(terminal_sessions)")
+            }
+            migrations = {
+                "owner": "TEXT NOT NULL DEFAULT ''",
+                "workspace_kind": "TEXT NOT NULL DEFAULT 'local'",
+                "workspace_root": "TEXT NOT NULL DEFAULT ''",
+                "workspace_platform": "TEXT NOT NULL DEFAULT 'posix'",
+            }
+            for column, declaration in migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE terminal_sessions ADD COLUMN {column} {declaration}"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10)
@@ -343,8 +398,9 @@ class TerminalStore:
                 """
                 INSERT OR REPLACE INTO terminal_sessions(
                     id, name, command, cwd, kind, device_id, device_name,
-                    remote_port, tmux_name, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    remote_port, tmux_name, created_at, owner, workspace_kind,
+                    workspace_root, workspace_platform
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
@@ -357,6 +413,10 @@ class TerminalStore:
                     session.remote_port,
                     session.tmux_name,
                     session.created_at,
+                    session.owner,
+                    session.workspace_kind,
+                    session.workspace_root,
+                    session.workspace_platform,
                 ),
             )
 
@@ -377,6 +437,8 @@ class TerminalManager:
         database_path: Path | None = None,
         tmux_binary: str = "tmux",
         tmux_socket: Path | None = None,
+        default_owner: str = "",
+        artifact_callback: Callable[[TerminalSession, dict[str, object]], None] | None = None,
     ) -> None:
         self.command = command
         self.cwd = str(Path(cwd).expanduser().resolve())
@@ -388,46 +450,114 @@ class TerminalManager:
         self.backend = backend
         self.tmux_binary = tmux_binary
         self.tmux_socket = tmux_socket
+        self.default_owner = default_owner
+        self.artifact_callback = artifact_callback
         self.store: TerminalStore | None = None
+        self._artifact_pipe_directory: Path | None = None
         self.sessions: dict[str, TerminalSession] = {}
         self._owned_pids: set[int] = set()
         self.loop = asyncio.get_running_loop()
         self.service_discovery_event = asyncio.Event()
+        self._tmux_states_cache: tuple[float, dict[str, tuple[bool, str, bool]]] | None = None
+        # Each state subscriber owns its own Event. A single shared Event would
+        # let one client's clear() swallow a notification another had not read.
+        self._state_waiters: set[asyncio.Event] = set()
         if self.backend == "tmux":
             if not shutil.which(self.tmux_binary):
                 raise RuntimeError(f"tmux executable not found: {self.tmux_binary}")
             if database_path is None or tmux_socket is None:
                 raise ValueError("tmux backend requires database_path and tmux_socket")
             self.tmux_socket = Path(tmux_socket).expanduser().resolve()
+            self._artifact_pipe_directory = self.tmux_socket.parent / "artifact-pipes"
             self.store = TerminalStore(Path(database_path).expanduser().resolve())
-            self._restore_tmux_sessions()
+            try:
+                self._restore_tmux_sessions()
+            except BaseException:
+                for session in tuple(self.sessions.values()):
+                    with contextlib.suppress(Exception):
+                        self._stop_tmux_artifact_capture(session)
+                    with contextlib.suppress(Exception):
+                        self._close_client(session)
+                self.sessions.clear()
+                raise
 
-    def list(self) -> list[dict[str, object]]:
+    def subscribe_state(self) -> asyncio.Event:
+        """Register for session-lifecycle notifications.
+
+        Lets clients be pushed session/service changes instead of polling
+        /api/terminals, which in the tmux backend costs a tmux query per call.
+        """
+        waiter = asyncio.Event()
+        self._state_waiters.add(waiter)
+        return waiter
+
+    def unsubscribe_state(self, waiter: asyncio.Event) -> None:
+        self._state_waiters.discard(waiter)
+
+    def _notify_state_change(self) -> None:
+        """Signal a real transition only — never on an unchanged refresh.
+
+        `list()` is what subscribers call to build their payload, and it refreshes
+        tmux state on the way. Notifying unconditionally from there would make
+        every push cause the next one.
+        """
+        for waiter in tuple(self._state_waiters):
+            waiter.set()
+
+    def list(self, owner: str | None = None) -> list[dict[str, object]]:
         if self.backend == "tmux":
+            # One tmux exec describes every pane on the socket, so refreshing N
+            # sessions no longer costs 2N blocking subprocess calls on the loop.
+            states = self._tmux_pane_states(max_age=1.0)
             for session in tuple(self.sessions.values()):
                 if session.active:
-                    self._refresh_tmux_state(session)
-        sessions = sorted(self.sessions.values(), key=lambda item: item.created_at)
+                    self._refresh_tmux_state(session, states)
+        sessions = sorted(
+            (
+                session
+                for session in self.sessions.values()
+                if owner is None or session.owner == owner
+            ),
+            key=lambda item: item.created_at,
+        )
         return [session.as_dict() for session in sessions]
 
     def get(self, session_id: str) -> TerminalSession | None:
         session = self.sessions.get(session_id)
         if session and self.backend == "tmux":
+            states = self._tmux_pane_states(max_age=1.0)
             if session.active:
-                self._refresh_tmux_state(session)
-            if (
-                session.active
-                and session.fd < 0
-                and self._tmux_session_exists(session.tmux_name or "")
+                self._refresh_tmux_state(session, states)
+            if session.active and session.fd < 0 and self._tmux_session_alive(
+                session.tmux_name or "", states
             ):
                 self._spawn_tmux_client(session)
         return session
 
-    def create(self, name: str | None = None, cols: int = 120, rows: int = 32) -> TerminalSession:
+    def get_for_owner(self, session_id: str, owner: str) -> TerminalSession | None:
+        session = self.get(session_id)
+        if not session or session.owner != owner:
+            return None
+        return session
+
+    def create(
+        self,
+        name: str | None = None,
+        cols: int = 120,
+        rows: int = 32,
+        *,
+        owner: str | None = None,
+        workspace_root: str | None = None,
+    ) -> TerminalSession:
         if not Path(self.cwd).is_dir():
             raise ValueError(f"TERMINAL_CWD does not exist: {self.cwd}")
         if not Path(self.shell).is_file() or not os.access(self.shell, os.X_OK):
             raise ValueError(f"TERMINAL_SHELL is not executable: {self.shell}")
+        workspace_directory = str(
+            Path(workspace_root or self.cwd).expanduser().resolve()
+        )
+        if not Path(workspace_directory).is_dir():
+            raise ValueError(f"Workspace directory does not exist: {workspace_directory}")
 
         if self.backend == "tmux":
             return self._create_tmux_session(
@@ -436,6 +566,8 @@ class TerminalManager:
                 cols=cols,
                 rows=rows,
                 initial_input=self.command.strip() or None,
+                owner=owner,
+                workspace_root=workspace_directory,
             )
 
         session_id = uuid.uuid4().hex
@@ -443,7 +575,7 @@ class TerminalManager:
         pid, fd = pty.fork()
         if pid == 0:
             try:
-                os.chdir(self.cwd)
+                os.chdir(workspace_directory)
                 environment = os.environ.copy()
                 environment.setdefault("TERM", "xterm-256color")
                 environment.setdefault("COLORTERM", "truecolor")
@@ -466,7 +598,12 @@ class TerminalManager:
             pid=pid,
             fd=fd,
             command=self.command,
-            cwd=self.cwd,
+            cwd=workspace_directory,
+            owner=owner if owner is not None else self.default_owner,
+            workspace_kind="local",
+            workspace_root=workspace_directory,
+            workspace_platform="posix",
+            workspace_current_path=workspace_directory,
         )
         self.sessions[session_id] = session
         self.resize(session_id, cols, rows)
@@ -474,6 +611,7 @@ class TerminalManager:
         if self.command.strip():
             initial_input = f"{self.command}\r".encode("utf-8")
             self.loop.call_later(0.05, self.write, session_id, initial_input)
+        self._notify_state_change()
         return session
 
     def create_process(
@@ -486,6 +624,9 @@ class TerminalManager:
         device_id: str | None = None,
         device_name: str | None = None,
         remote_port: int | None = None,
+        owner: str | None = None,
+        workspace_root: str = ".",
+        workspace_platform: str = "posix",
     ) -> TerminalSession:
         if not argv:
             raise ValueError("Process command is empty")
@@ -505,6 +646,9 @@ class TerminalManager:
                 device_id=device_id,
                 device_name=device_name,
                 remote_port=remote_port,
+                owner=owner,
+                workspace_root=workspace_root,
+                workspace_platform=workspace_platform,
             )
 
         session_id = uuid.uuid4().hex
@@ -534,10 +678,16 @@ class TerminalManager:
             device_id=device_id,
             device_name=device_name,
             remote_port=remote_port,
+            owner=owner if owner is not None else self.default_owner,
+            workspace_kind="sftp",
+            workspace_root=workspace_root,
+            workspace_platform=workspace_platform,
+            workspace_current_path=(workspace_root if workspace_root == "." else None),
         )
         self.sessions[session_id] = session
         self.resize(session_id, cols, rows)
         self.loop.add_reader(fd, self._read_ready, session_id)
+        self._notify_state_change()
         return session
 
     def _tmux_command(self, *arguments: str) -> list[str]:
@@ -548,6 +698,10 @@ class TerminalManager:
     def _tmux_run(
         self, *arguments: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
+        if arguments and arguments[0] in {"new-session", "kill-session", "kill-server"}:
+            # The batched pane snapshot is only valid while the set of sessions
+            # is unchanged. Invalidating here means no caller can forget to.
+            self._tmux_states_cache = None
         result = subprocess.run(
             self._tmux_command(*arguments), capture_output=True, text=True
         )
@@ -561,6 +715,46 @@ class TerminalManager:
             return False
         result = self._tmux_run("has-session", "-t", tmux_name, check=False)
         return result.returncode == 0
+
+    def _tmux_pane_states(
+        self, *, max_age: float = 0.0
+    ) -> dict[str, tuple[bool, str, bool]] | None:
+        """Describe every pane on the socket with a single tmux exec.
+
+        Maps each tmux session name to (pane_dead, pane_dead_status, pane_pipe).
+        Returns None when the query itself failed; callers must then fall back to
+        the per-session path, because an unreachable tmux server would otherwise
+        be indistinguishable from "every session has died".
+        """
+        cached = self._tmux_states_cache
+        if max_age > 0 and cached and time.monotonic() - cached[0] <= max_age:
+            return cached[1]
+        result = self._tmux_run(
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pipe}",
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        states: dict[str, tuple[bool, str, bool]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 4 or not fields[0]:
+                continue
+            # Every agentserver session owns exactly one pane; if that ever
+            # changes, the first pane still decides the session's liveness.
+            states.setdefault(fields[0], (fields[1] == "1", fields[2], fields[3] == "1"))
+        self._tmux_states_cache = (time.monotonic(), states)
+        return states
+
+    def _tmux_session_alive(
+        self, tmux_name: str, states: dict[str, tuple[bool, str, bool]] | None
+    ) -> bool:
+        if states is None:
+            return self._tmux_session_exists(tmux_name)
+        return bool(tmux_name) and tmux_name in states
 
     def _configure_tmux_server(self) -> None:
         if self.tmux_socket is None:
@@ -609,11 +803,131 @@ class TerminalManager:
             return b""
         return result.stdout.replace("\r\n", "\n").replace("\n", "\r\n").encode()
 
+    def _artifact_pipe_path(self, session: TerminalSession) -> Path:
+        directory = self._artifact_pipe_directory
+        if directory is None:
+            raise RuntimeError("tmux artifact pipe directory is not configured")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        # Persisted IDs are data, not path components. A deterministic UUID keeps
+        # recovery able to replace a stale FIFO without trusting database text.
+        pipe_name = uuid.uuid5(uuid.NAMESPACE_OID, session.id).hex
+        return directory / f"{pipe_name}.fifo"
+
+    @staticmethod
+    def _unlink_artifact_pipe(path: Path) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISFIFO(info.st_mode):
+            path.unlink()
+
+    def _start_tmux_artifact_capture(self, session: TerminalSession) -> None:
+        """Route raw pane bytes to a private FIFO, separate from screen redraws."""
+        if (
+            self.backend != "tmux"
+            or self.artifact_callback is None
+            or not session.tmux_name
+            or session.artifact_fd >= 0
+        ):
+            return
+
+        path = self._artifact_pipe_path(session)
+        self._unlink_artifact_pipe(path)
+        try:
+            os.mkfifo(path, 0o600)
+            path.chmod(0o600)
+            flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(path, flags)
+        except BaseException:
+            self._unlink_artifact_pipe(path)
+            raise
+
+        try:
+            # pipe-pane receives pane output before tmux turns it into redraws.
+            # The FIFO is read internally only; bytes are never appended to the
+            # terminal scrollback or broadcast to browser subscribers a second time.
+            pipe_command = f"exec cat > {shlex.quote(str(path))}"
+            self._tmux_run("pipe-pane", "-t", session.tmux_name, pipe_command)
+            session.artifact_fd = descriptor
+            session.artifact_pipe_path = str(path)
+            self.loop.add_reader(
+                descriptor,
+                self._read_tmux_artifacts,
+                session.id,
+                descriptor,
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self._tmux_run("pipe-pane", "-t", session.tmux_name, check=False)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            self._unlink_artifact_pipe(path)
+            raise
+
+    def _stop_tmux_artifact_capture(
+        self, session: TerminalSession, *, stop_pipe: bool = True
+    ) -> None:
+        descriptor = session.artifact_fd
+        raw_path = session.artifact_pipe_path
+        if descriptor < 0 and not raw_path:
+            return
+        if stop_pipe and session.tmux_name:
+            with contextlib.suppress(Exception):
+                self._tmux_run("pipe-pane", "-t", session.tmux_name, check=False)
+        if descriptor >= 0:
+            self.loop.remove_reader(descriptor)
+            # pipe-pane has been stopped, so drain bytes already accepted by the
+            # kernel before closing the FIFO. This lets application shutdown hand
+            # the final events to the higher-level ingest queue before it joins.
+            for _ in range(256):
+                try:
+                    chunk = os.read(descriptor, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self._discover_artifacts(session, chunk)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        session.artifact_fd = -1
+        session.artifact_pipe_path = ""
+        if raw_path:
+            self._unlink_artifact_pipe(Path(raw_path))
+
+    def _read_tmux_artifacts(self, session_id: str, descriptor: int) -> None:
+        session = self.sessions.get(session_id)
+        if session is None or session.artifact_fd != descriptor:
+            self.loop.remove_reader(descriptor)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            return
+        try:
+            chunk = os.read(descriptor, 65_536)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            self._stop_tmux_artifact_capture(session)
+            return
+        if chunk:
+            self._discover_artifacts(session, chunk)
+
     def _restore_tmux_sessions(self) -> None:
         if self.store is None:
             return
         self._configure_tmux_server()
         for record in self.store.list():
+            legacy_workspace = not bool(record["workspace_root"])
+            workspace_root = str(
+                record["workspace_root"]
+                or ("." if str(record["kind"]) == "ssh" else record["cwd"])
+            )
+            workspace_kind = (
+                "sftp"
+                if legacy_workspace and str(record["kind"]) == "ssh"
+                else str(record["workspace_kind"] or "local")
+            )
             session = TerminalSession(
                 id=str(record["id"]),
                 name=str(record["name"]),
@@ -621,6 +935,15 @@ class TerminalManager:
                 fd=-1,
                 command=str(record["command"]),
                 cwd=str(record["cwd"]),
+                owner=str(record["owner"] or self.default_owner),
+                workspace_kind=workspace_kind,
+                workspace_root=workspace_root,
+                workspace_platform=str(record["workspace_platform"] or "posix"),
+                workspace_current_path=(
+                    workspace_root
+                    if workspace_kind == "local" or workspace_root == "."
+                    else None
+                ),
                 kind=str(record["kind"]),
                 device_id=record["device_id"] and str(record["device_id"]),
                 device_name=record["device_name"] and str(record["device_name"]),
@@ -639,6 +962,7 @@ class TerminalManager:
                 self.sessions[session.id] = session
                 self._refresh_tmux_state(session)
                 if session.active:
+                    self._start_tmux_artifact_capture(session)
                     self._spawn_tmux_client(session)
             else:
                 session.exited_at = time.time()
@@ -661,9 +985,19 @@ class TerminalManager:
         device_id: str | None = None,
         device_name: str | None = None,
         remote_port: int | None = None,
+        owner: str | None = None,
+        workspace_root: str | None = None,
+        workspace_platform: str = "posix",
     ) -> TerminalSession:
         if self.store is None:
             raise RuntimeError("Persistent terminal store is not configured")
+        working_directory = self.cwd
+        if kind == "local" and workspace_root:
+            working_directory = str(Path(workspace_root).expanduser().resolve())
+            if not Path(working_directory).is_dir():
+                raise ValueError(
+                    f"Workspace directory does not exist: {working_directory}"
+                )
         session_id = uuid.uuid4().hex
         tmux_name = f"agentserver-{session_id}"
         cols = min(max(cols, 2), 500)
@@ -678,7 +1012,7 @@ class TerminalManager:
             "-y",
             str(rows),
             "-c",
-            self.cwd,
+            working_directory,
             command,
         )
         try:
@@ -695,7 +1029,18 @@ class TerminalManager:
                 pid=-1,
                 fd=-1,
                 command=self.command if kind == "local" else command,
-                cwd=self.cwd,
+                cwd=working_directory,
+                owner=owner if owner is not None else self.default_owner,
+                workspace_kind="sftp" if kind == "ssh" else "local",
+                workspace_root=workspace_root or ("." if kind == "ssh" else self.cwd),
+                workspace_platform=workspace_platform,
+                workspace_current_path=(
+                    working_directory
+                    if kind == "local"
+                    else "."
+                    if (workspace_root or ".") == "."
+                    else None
+                ),
                 kind=kind,
                 device_id=device_id,
                 device_name=device_name,
@@ -707,10 +1052,20 @@ class TerminalManager:
             self._tmux_run("kill-session", "-t", tmux_name, check=False)
             raise
         self.sessions[session.id] = session
-        self._spawn_tmux_client(session)
-        if initial_input:
-            self._tmux_run("send-keys", "-t", tmux_name, "-l", initial_input)
-            self._tmux_run("send-keys", "-t", tmux_name, "Enter")
+        try:
+            self._start_tmux_artifact_capture(session)
+            self._spawn_tmux_client(session)
+            if initial_input:
+                self._tmux_run("send-keys", "-t", tmux_name, "-l", initial_input)
+                self._tmux_run("send-keys", "-t", tmux_name, "Enter")
+        except BaseException:
+            self._stop_tmux_artifact_capture(session)
+            self._close_client(session)
+            self.sessions.pop(session.id, None)
+            self.store.delete(session.id)
+            self._tmux_run("kill-session", "-t", tmux_name, check=False)
+            raise
+        self._notify_state_change()
         return session
 
     def _spawn_tmux_client(self, session: TerminalSession) -> None:
@@ -736,29 +1091,56 @@ class TerminalManager:
         session.fd = fd
         self.loop.add_reader(fd, self._read_ready, session.id)
 
-    def _refresh_tmux_state(self, session: TerminalSession) -> None:
-        if not session.tmux_name or not self._tmux_session_exists(session.tmux_name):
+    def _refresh_tmux_state(
+        self,
+        session: TerminalSession,
+        states: dict[str, tuple[bool, str, bool]] | None = None,
+    ) -> None:
+        tmux_name = session.tmux_name or ""
+        was_active = session.active
+        if not self._tmux_session_alive(tmux_name, states):
             session.exited_at = session.exited_at or time.time()
             session.return_code = session.return_code if session.return_code is not None else -1
+            self._stop_tmux_artifact_capture(session, stop_pipe=False)
+            if was_active:
+                self._notify_state_change()
             return
-        result = self._tmux_run(
-            "display-message",
-            "-p",
-            "-t",
-            session.tmux_name,
-            "#{pane_dead}:#{pane_dead_status}",
-            check=False,
-        )
-        fields = result.stdout.strip().split(":", 1)
-        if result.returncode == 0 and fields[0] == "1":
+        if states is not None:
+            queried = True
+            dead, dead_status, piped = states[tmux_name]
+        else:
+            result = self._tmux_run(
+                "display-message",
+                "-p",
+                "-t",
+                tmux_name,
+                "#{pane_dead}:#{pane_dead_status}:#{pane_pipe}",
+                check=False,
+            )
+            fields = result.stdout.strip().split(":", 2)
+            queried = result.returncode == 0
+            dead = fields[0] == "1"
+            dead_status = fields[1] if len(fields) > 1 else ""
+            piped = len(fields) > 2 and fields[2] == "1"
+        if queried and dead:
             session.exited_at = session.exited_at or time.time()
             try:
-                session.return_code = int(fields[1])
-            except (IndexError, ValueError):
+                session.return_code = int(dead_status)
+            except (TypeError, ValueError):
                 session.return_code = None
-        elif result.returncode == 0:
+            self._stop_tmux_artifact_capture(session)
+            if was_active:
+                self._notify_state_change()
+        elif queried:
             session.exited_at = None
             session.return_code = None
+            if not was_active:
+                self._notify_state_change()
+            if self.artifact_callback is not None and (
+                session.artifact_fd < 0 or not piped
+            ):
+                self._stop_tmux_artifact_capture(session, stop_pipe=False)
+            self._start_tmux_artifact_capture(session)
 
     def _close_client(self, session: TerminalSession) -> None:
         if session.fd >= 0:
@@ -788,6 +1170,8 @@ class TerminalManager:
         try:
             chunk = os.read(session.fd, 65_536)
             if chunk:
+                if self.backend != "tmux":
+                    self._discover_artifacts(session, chunk)
                 self._append(session, chunk)
                 self._broadcast(session, chunk)
                 return
@@ -806,6 +1190,68 @@ class TerminalManager:
             removed = session.chunks.popleft()
             session.buffer_size -= len(removed)
         self._discover_services(session, chunk)
+
+    def _discover_artifacts(self, session: TerminalSession, chunk: bytes) -> None:
+        """Decode bounded, terminal-originated artifact announcements.
+
+        Agents without HTTP credentials can emit OSC 633 with a URL-safe
+        base64 JSON payload. Announcements are only metadata; later file reads
+        still pass through the owner-bound workspace gateway.
+        """
+        if self.artifact_callback is None:
+            return
+        text = session.artifact_tail + chunk.decode("utf-8", errors="ignore")
+        matches = sorted(
+            [
+                *((match, "terminal-osc") for match in ARTIFACT_OSC.finditer(text)),
+                *((match, "terminal-marker") for match in ARTIFACT_LINE.finditer(text)),
+            ],
+            key=lambda item: item[0].start(),
+        )
+        last_complete_end = 0
+        for match, source in matches:
+            last_complete_end = match.end()
+            encoded = match.group("payload")
+            try:
+                padding = "=" * (-len(encoded) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
+                if not isinstance(payload, dict):
+                    continue
+                event = {
+                    str(key): value
+                    for key, value in payload.items()
+                    if key
+                    in {
+                        "type",
+                        "path",
+                        "name",
+                        "media_type",
+                        "size",
+                        "kind",
+                        "version",
+                        "message",
+                    }
+                }
+                if not isinstance(event.get("path"), str):
+                    continue
+                event["source"] = source
+                try:
+                    self.artifact_callback(session, event)
+                except Exception:
+                    # Event reporting must never terminate or stall a PTY.
+                    pass
+            except Exception:
+                continue
+        # Retain only enough text to complete one split OSC sequence. Ordinary
+        # terminal scrollback and secrets must never accumulate in this parser.
+        remainder = text[last_complete_end:]
+        prefixes = ("\x1b]633;artifact;", ARTIFACT_LINE_PREFIX)
+        start = max(remainder.rfind(prefix) for prefix in prefixes)
+        session.artifact_tail = (
+            remainder[start:][-9000:]
+            if start >= 0
+            else remainder[-(max(map(len, prefixes)) - 1) :]
+        )
 
     def _discover_services(self, session: TerminalSession, chunk: bytes) -> None:
         if session.kind != "ssh" or not session.device_id:
@@ -1009,6 +1455,8 @@ class TerminalManager:
                 service.process_missing_count = 0
                 if was_visible:
                     removed.append((session.id, service.port))
+        if removed:
+            self._notify_state_change()
         return removed
 
     def update_service_status(
@@ -1040,6 +1488,8 @@ class TerminalManager:
         became_offline = previous != "offline" and service.status == "offline"
         if became_offline:
             service.retry_after = time.time() + SERVICE_REDISCOVERY_COOLDOWN
+        if previous != service.status:
+            self._notify_state_change()
         return service, became_offline
 
     def _broadcast(self, session: TerminalSession, chunk: bytes) -> None:
@@ -1047,11 +1497,19 @@ class TerminalManager:
             try:
                 queue.put_nowait(chunk)
             except asyncio.QueueFull:
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(chunk)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
+                # Dropping a queued chunk would punch a hole into the middle of a
+                # raw VT stream: truncated UTF-8 or CSI/OSC sequences, and lost
+                # mode changes (alt screen, SGR, DECSTBM) that leave the emulator
+                # wrong for the rest of the connection — with nothing able to
+                # detect it. Discard everything pending for this one subscriber
+                # and hand its sender an explicit gap marker to resync from.
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(STREAM_GAP)
 
     def _mark_exited(self, session: TerminalSession) -> None:
         if self.backend == "tmux":
@@ -1075,6 +1533,7 @@ class TerminalManager:
             session.return_code = None
             self._owned_pids.discard(session.pid)
         session.exited_at = time.time()
+        self._notify_state_change()
         marker = b"\r\n\x1b[90m[process exited]\x1b[0m\r\n"
         self._append(session, marker)
         self._broadcast(session, marker)
@@ -1095,15 +1554,15 @@ class TerminalManager:
         elif attempt < 20:
             self.loop.call_later(0.05, self._reap_child, session, attempt + 1)
 
-    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes]]:
+    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes | StreamGap]]:
         session = self.sessions[session_id]
         if self.backend == "tmux" and session.active and session.fd < 0:
             self._spawn_tmux_client(session)
-        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
+        queue: asyncio.Queue[bytes | StreamGap] = asyncio.Queue(maxsize=1024)
         session.subscribers.add(queue)
         return b"".join(session.chunks), queue
 
-    def detach(self, session_id: str, queue: asyncio.Queue[bytes]) -> None:
+    def detach(self, session_id: str, queue: asyncio.Queue[bytes | StreamGap]) -> None:
         session = self.sessions.get(session_id)
         if session:
             session.subscribers.discard(queue)
@@ -1208,6 +1667,7 @@ class TerminalManager:
         if not session:
             return False
         if self.backend == "tmux":
+            self._stop_tmux_artifact_capture(session)
             self._close_client(session)
             if session.tmux_name:
                 self._tmux_run("kill-session", "-t", session.tmux_name, check=False)
@@ -1216,6 +1676,7 @@ class TerminalManager:
             session.exited_at = time.time()
             session.subscribers.clear()
             self.sessions.pop(session_id, None)
+            self._notify_state_change()
             return True
         if session.active:
             if session.pid > 1:
@@ -1252,11 +1713,13 @@ class TerminalManager:
             session.exited_at = time.time()
         session.subscribers.clear()
         self.sessions.pop(session_id, None)
+        self._notify_state_change()
         return True
 
     async def close(self) -> None:
         if self.backend == "tmux":
             for session in tuple(self.sessions.values()):
+                self._stop_tmux_artifact_capture(session)
                 self._close_client(session)
                 session.subscribers.clear()
             return

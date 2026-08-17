@@ -43,6 +43,8 @@ jobs:
         run: npm --prefix frontend ci
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
+      - name: Run terminal layout contracts
+        run: npm --prefix frontend run test:layout
       - name: Build frontend
         env:
           AGENTSERVER_BUILD_SHA: ${{ github.sha }}
@@ -76,7 +78,7 @@ jobs:
 
   build-release:
     name: build release
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -114,7 +116,7 @@ jobs:
 
   deploy-production:
     name: deploy production
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs:
       - verify
       - build-release

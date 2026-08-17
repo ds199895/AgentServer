@@ -51,6 +51,10 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   const [coarsePointer] = useState(() => window.matchMedia('(pointer: coarse)').matches)
   const selectedDevice = useMemo(() => devices.find((device) => device.id === selectedId) || null, [devices, selectedId])
   const selectedSessions = useMemo(() => sessions.filter((session) => session.device_id === selectedId), [sessions, selectedId])
+  const selectedRecentSession = useMemo(
+    () => [...selectedSessions].reverse().find((session) => session.active) || selectedSessions.at(-1) || null,
+    [selectedSessions],
+  )
   const selectedSession = useMemo(() => sessions.find((session) => session.id === selectedSessionId) || null, [sessions, selectedSessionId])
   const selectedSessionDevice = useMemo(() => devices.find((device) => device.id === selectedSession?.device_id) || null, [devices, selectedSession])
   const sceneVersion = useMemo(() => [
@@ -655,15 +659,40 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       drawCharacterTarget(selectedSessionIdRef.current, '#8affd2', true)
     }
 
+    // 这个循环会重画整个像素世界。终端页常驻挂载着 compact 缩略图，
+    // 所以它必须在不可见时彻底停下，可见时也不该跟终端抢满帧。
+    const minFrameInterval = compact ? 1000 / 12 : 0
     let frame = 0
+    let lastDrawAt = 0
+    let onScreen = true
     const animate = (now: number) => {
-      drawFrame(now)
       frame = window.requestAnimationFrame(animate)
+      if (minFrameInterval && now - lastDrawAt < minFrameInterval) return
+      lastDrawAt = now
+      drawFrame(now)
     }
-    frame = window.requestAnimationFrame(animate)
+    const startLoop = () => {
+      if (!frame) frame = window.requestAnimationFrame(animate)
+    }
+    const stopLoop = () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      frame = 0
+    }
+    // rAF 已经会在标签页隐藏时暂停；IntersectionObserver 负责的是
+    // 画布被滚出视口/被收起的情况，那时 rAF 仍在正常触发。
+    const visibilityObserver = new IntersectionObserver((entries) => {
+      const nextOnScreen = entries[entries.length - 1].isIntersecting
+      if (nextOnScreen === onScreen) return
+      onScreen = nextOnScreen
+      if (onScreen) startLoop()
+      else stopLoop()
+    })
+    visibilityObserver.observe(canvas)
+    startLoop()
 
     return () => {
-      window.cancelAnimationFrame(frame)
+      stopLoop()
+      visibilityObserver.disconnect()
       resizeObserver.disconnect()
       canvas.removeEventListener('pointerdown', onPointerDown)
       canvas.removeEventListener('pointermove', onPointerMove)
@@ -781,7 +810,16 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
             <span className="grid gap-1 rounded-[7px] border border-[#22313b] bg-[#0b1117] p-2"><small className="text-[8px] text-[#63727e]">端口</small><strong className="truncate font-mono text-[10px] text-[#cdd7de]">{selectedDevice.remote_port}</strong></span>
           </div>
           <div className="flex gap-[7px] max-md:flex-wrap">
-            <Button size="sm" className="h-auto px-3 py-[9px] text-[10px] font-bold" disabled={busyId === selectedDevice.id || !selectedDevice.ssh_available} onClick={() => onOpen(selectedDevice)}>打开终端</Button>
+            {selectedRecentSession && (
+              <Button
+                size="sm"
+                className="h-auto px-3 py-[9px] text-[10px] font-bold"
+                onClick={() => onSelectTerminal(selectedRecentSession.id)}
+              >
+                继续最近终端
+              </Button>
+            )}
+            <Button variant={selectedSessions.length > 0 ? 'outline' : 'default'} size="sm" className="h-auto px-3 py-[9px] text-[10px] font-bold" disabled={busyId === selectedDevice.id || !selectedDevice.ssh_available} onClick={() => onOpen(selectedDevice)}>新建终端</Button>
             <Button variant="outline" size="sm" className="h-auto px-3 py-[9px] text-[10px]" onClick={() => onProbe(selectedDevice)}>检测</Button>
             <Button variant="outline" size="sm" className="h-auto px-3 py-[9px] text-[10px]" onClick={() => onEdit(selectedDevice)}>编辑</Button>
           </div>

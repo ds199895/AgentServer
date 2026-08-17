@@ -11,6 +11,15 @@ export type TerminalSession = {
   device_name: string | null
   remote_port: number | null
   services: DetectedService[]
+  workspace?: {
+    kind: 'local' | 'sftp' | string
+    root: string
+    platform: 'posix' | 'windows' | string
+    current_path?: string | null
+    binding_id?: string
+    available?: boolean
+    error?: string
+  }
 }
 
 export type DetectedService = {
@@ -67,6 +76,107 @@ export type Preview = {
   url: string | null
 }
 
+export type WorkspaceEntry = {
+  name: string
+  path: string
+  kind: 'file' | 'directory' | 'symlink' | 'other'
+  size: number
+  modified_at: number
+  version: string
+  hidden?: boolean
+  readonly?: boolean
+}
+
+export type WorkspaceBreadcrumb = {
+  name: string
+  path: string
+}
+
+export type WorkspaceListing = {
+  workspace_id: string
+  path: string
+  root: string
+  provider: string
+  platform: 'posix' | 'windows' | string
+  current_path: string | null
+  parent: string | null
+  parent_path: string | null
+  entries: WorkspaceEntry[]
+  breadcrumbs: WorkspaceBreadcrumb[]
+  revision: string
+  next_cursor: string | null
+  truncated: boolean
+  capabilities: {
+    read: boolean
+    write: boolean
+    watch: boolean
+    pagination: boolean
+  }
+}
+
+export type WorkspaceRequestOptions = {
+  cursor?: string | null
+  revision?: string | null
+  limit?: number
+  signal?: AbortSignal
+}
+
+export class ApiError extends Error {
+  status?: number
+  code?: string
+}
+
+export type FileGrant = {
+  id: string
+  terminal_id: string
+  name: string
+  path: string
+  media_type: string
+  size: number
+  kind: 'file'
+  version: string
+  etag: string
+  preview_mode: 'image' | 'text' | 'pdf' | 'download'
+  inline_safe: boolean
+  modified_at: number
+  expires_at: number
+  image_width: number | null
+  image_height: number | null
+  /** Client-side override used for durable, content-addressed attachments. */
+  content_url?: string
+  immutable?: boolean
+}
+
+export type ArtifactAttachment = {
+  id: string
+  media_type: string
+  size: number
+  width: number
+  height: number
+  name?: string
+}
+
+export type ArtifactEvent = {
+  sequence?: number
+  id: string
+  type: string
+  event: string
+  owner?: string
+  terminal_id?: string
+  name: string
+  path: string
+  media_type?: string | null
+  size?: number | null
+  kind: string
+  version: string
+  source?: string
+  created_at: number
+  timestamp: number
+  message?: string
+  schema_version?: number
+  attachment: ArtifactAttachment | null
+}
+
 export const frontendBuildSha = __AGENTSERVER_BUILD_SHA__
 
 type TerminalSessionPayload = Omit<TerminalSession, 'services'> & {
@@ -80,6 +190,12 @@ function normalizeTerminalSession(session: TerminalSessionPayload): TerminalSess
   }
 }
 
+/** Apply the same older-backend tolerance to pushed payloads as to HTTP ones. */
+export function normalizeTerminalSessions(payload: unknown): TerminalSession[] {
+  if (!Array.isArray(payload)) return []
+  return payload.map((session) => normalizeTerminalSession(session as TerminalSessionPayload))
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -88,14 +204,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     let message = `请求失败 (${response.status})`
+    let code: string | undefined
     try {
-      const body = (await response.json()) as { detail?: string }
-      if (body.detail) message = body.detail
+      const body = (await response.json()) as {
+        detail?: string | { code?: string; message?: string }
+      }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.detail?.message) message = body.detail.message
+      if (typeof body.detail === 'object') code = body.detail?.code
     } catch {
       // Keep the status-based fallback message.
     }
-    const error = new Error(message) as Error & { status?: number }
+    const error = new ApiError(message)
     error.status = response.status
+    error.code = code
     throw error
   }
   return response.json() as Promise<T>
@@ -132,22 +254,47 @@ export const api = {
   syncDevices: () => request<{ last_sync_at: number }>('/api/devices/sync', { method: 'POST' }),
   probeDevice: (id: string) =>
     request<{ available: boolean; error: string }>(`/api/devices/${id}/probe`, { method: 'POST' }),
-  createDeviceTerminal: async (id: string, name?: string) => {
+  createDeviceTerminal: async (id: string, name?: string, workspaceRoot?: string) => {
     const session = await request<TerminalSessionPayload>(`/api/devices/${id}/terminals`, {
       method: 'POST',
-      body: JSON.stringify({ name: name || null }),
+      body: JSON.stringify({ name: name || null, workspace_root: workspaceRoot || null }),
     })
     return normalizeTerminalSession(session)
   },
-  createTerminal: async (name?: string) => {
+  createTerminal: async (name?: string, workspaceRoot?: string) => {
     const session = await request<TerminalSessionPayload>('/api/terminals', {
       method: 'POST',
-      body: JSON.stringify({ name: name || null }),
+      body: JSON.stringify({ name: name || null, workspace_root: workspaceRoot || null }),
     })
     return normalizeTerminalSession(session)
   },
   deleteTerminal: (id: string) =>
     request<{ ok: boolean }>(`/api/terminals/${id}`, { method: 'DELETE' }),
+  workspace: (id: string, path = '', options: WorkspaceRequestOptions = {}) => {
+    const query = new URLSearchParams()
+    query.set('path', path)
+    if (options.cursor) query.set('cursor', options.cursor)
+    if (options.revision) query.set('revision', options.revision)
+    if (options.limit) query.set('limit', String(options.limit))
+    return request<WorkspaceListing>(
+      `/api/terminals/${encodeURIComponent(id)}/workspace?${query}`,
+      { signal: options.signal },
+    )
+  },
+  resolveFile: (id: string, path: string) =>
+    request<FileGrant>(`/api/terminals/${encodeURIComponent(id)}/files/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+  fileContentUrl: (grant: Pick<FileGrant, 'id' | 'terminal_id' | 'content_url'>) => {
+    if (grant.content_url) return grant.content_url
+    const query = new URLSearchParams({ terminal_id: grant.terminal_id })
+    return `/api/files/${encodeURIComponent(grant.id)}/content?${query}`
+  },
+  attachmentContentUrl: (terminalId: string, attachmentId: string) =>
+    `/api/terminals/${encodeURIComponent(terminalId)}/attachments/${encodeURIComponent(attachmentId)}`,
+  artifacts: (id: string) =>
+    request<ArtifactEvent[]>(`/api/terminals/${encodeURIComponent(id)}/artifacts`),
   previews: () => request<Preview[]>('/api/previews'),
   createPreview: (deviceId: string, port: number, label?: string, terminalId?: string) =>
     request<Preview>(`/api/devices/${deviceId}/previews`, {
