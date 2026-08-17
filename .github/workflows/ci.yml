@@ -104,7 +104,7 @@ jobs:
       - id: metadata
         name: Record artifact metadata
         run: echo "artifact-name=agentserver-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.metadata.outputs.artifact-name }}
           path: |
