@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 私下报告安全漏洞
+    url: https://github.com/ds199895/AgentServer/blob/main/SECURITY.md
+    about: 请先阅读安全策略；不要为未修复漏洞创建公开 Issue。
+  - name: 贡献指南
+    url: https://github.com/ds199895/AgentServer/blob/main/CONTRIBUTING.md
+    about: 提交代码或文档前请阅读贡献流程和验证要求。
