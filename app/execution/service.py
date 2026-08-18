@@ -138,12 +138,11 @@ class ExecutionService:
     def projection(
         self, *, owner_id: str, kind: EntityKind | str, entity_id: str
     ) -> Projection | None:
-        snapshot = self.store.snapshot(
+        return self.store.projection(
             owner_id=owner_id,
             aggregate_kind=str(kind),
             aggregate_id=entity_id,
         )
-        return snapshot.projections[0] if snapshot.projections else None
 
     def _revision(self, owner_id: str, kind: EntityKind | str, entity_id: str) -> int:
         projection = self.projection(owner_id=owner_id, kind=kind, entity_id=entity_id)
@@ -1600,19 +1599,20 @@ class ExecutionService:
         the browser stream.
         """
         timestamp = time.time() if now is None else float(now)
-        snapshot = self.store.snapshot(owner_id=owner_id)
-        changed = 0
-        agents = [
-            projection
-            for projection in snapshot.projections
-            if projection.aggregate_kind == EntityKind.AGENT_INSTANCE.value
-        ]
-        for agent in agents:
-            entity = self.store.get_entity(
+        agents = self.store.projections(
+            owner_id=owner_id,
+            aggregate_kind=EntityKind.AGENT_INSTANCE,
+        )
+        entities = {
+            entity.id: entity
+            for entity in self.store.entities(
                 owner_id=owner_id,
                 kind=EntityKind.AGENT_INSTANCE,
-                entity_id=agent.aggregate_id,
             )
+        }
+        changed = 0
+        for agent in agents:
+            entity = entities.get(agent.aggregate_id)
             if entity is None:
                 continue
             run_id = str(entity.attributes.get("run_id") or "")
@@ -2112,13 +2112,15 @@ class ExecutionService:
         events: Iterable[StoredEvent] = (),
         *,
         now: float | None = None,
+        entity: Entity | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
-        entity = self.store.get_entity(
-            owner_id=projection.owner_id,
-            kind=projection.aggregate_kind,
-            entity_id=projection.aggregate_id,
-        )
+        if entity is None:
+            entity = self.store.get_entity(
+                owner_id=projection.owner_id,
+                kind=projection.aggregate_kind,
+                entity_id=projection.aggregate_id,
+            )
         state = dict(projection.state)
         evidence = self._evidence_for(projection, events, now=timestamp)
         activity_evidence = evidence.get("activity")
@@ -2149,11 +2151,20 @@ class ExecutionService:
         from .observations import ObservationMerger
 
         merger = ObservationMerger()
+        events_by_aggregate: dict[tuple[str, str], list[StoredEvent]] = {}
         for event in snapshot.events:
+            if event.aggregate_kind is not None and event.aggregate_id is not None:
+                events_by_aggregate.setdefault(
+                    (event.aggregate_kind, event.aggregate_id), []
+                ).append(event)
             try:
                 merger.ingest(event)
             except (ValidationError, IdempotencyConflict):
                 continue
+        entities = {
+            (entity.kind, entity.id): entity
+            for entity in self.store.entities(owner_id=owner_id)
+        }
         by_kind: dict[str, list[dict[str, Any]]] = {
             "tasks": [],
             "assignments": [],
@@ -2173,8 +2184,17 @@ class ExecutionService:
             projections[(projection.aggregate_kind, projection.aggregate_id)] = projection
             key = key_for_kind.get(projection.aggregate_kind)
             if key:
+                aggregate_key = (
+                    projection.aggregate_kind,
+                    projection.aggregate_id,
+                )
                 by_kind[key].append(
-                    self._projection_view(projection, snapshot.events, now=now)
+                    self._projection_view(
+                        projection,
+                        events_by_aggregate.get(aggregate_key, ()),
+                        now=now,
+                        entity=entities.get(aggregate_key),
+                    )
                 )
         timestamp = time.time() if now is None else float(now)
         for key, identifier_name in (

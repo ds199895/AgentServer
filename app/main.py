@@ -40,7 +40,7 @@ from .artifacts import (
 )
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
-from .execution import ExecutionError, ExecutionStore, new_id
+from .execution import EntityKind, ExecutionError, ExecutionStore, new_id
 from .execution.api import build_execution_router
 from .execution.control import ExecutionControlBroker, read_linux_process_identity
 from .execution.observations import ObservationPublisher
@@ -1697,21 +1697,29 @@ async def reconcile_execution_state(
             # aggregate is temporarily invalid.
             pass
         try:
-            view = await asyncio.to_thread(
-                service.execution_view, owner_id=owner_id
+            terminal_projections, terminal_entities = await asyncio.gather(
+                asyncio.to_thread(
+                    store.projections,
+                    owner_id=owner_id,
+                    aggregate_kind=EntityKind.TERMINAL,
+                ),
+                asyncio.to_thread(
+                    store.entities,
+                    owner_id=owner_id,
+                    kind=EntityKind.TERMINAL,
+                ),
             )
         except Exception:
             continue
-        terminals = view.get("terminals")
-        if not isinstance(terminals, list):
-            continue
-        for terminal in terminals:
+        entities_by_id = {entity.id: entity for entity in terminal_entities}
+        for projection in terminal_projections:
             try:
-                terminal_id = str(terminal["id"])
-                state = terminal["state"]
-                attributes = terminal["attributes"]
-                if not isinstance(state, dict) or not isinstance(attributes, dict):
+                terminal_id = projection.aggregate_id
+                entity = entities_by_id.get(terminal_id)
+                if entity is None:
                     continue
+                state = projection.state
+                attributes = entity.attributes
                 terminal_state = str(state.get("lifecycle") or "")
                 launch_id = str(attributes.get("launch_id") or "")
                 session = manager.sessions.get(terminal_id)
@@ -1735,7 +1743,7 @@ async def reconcile_execution_state(
                     continue
                 if terminal_state not in {"requested", "provisioning", "connecting"}:
                     continue
-                updated_at = float(terminal.get("updated_at") or 0)
+                updated_at = projection.updated_at
                 if active or timestamp - updated_at < orphan_timeout:
                     continue
                 await lifecycle.mark_durable_unavailable(

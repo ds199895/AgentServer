@@ -254,8 +254,15 @@ class TerminalExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.dict(
             os.environ, {"TERMINAL_LAUNCH_ORPHAN_TIMEOUT": "1"}
-        ):
+        ), patch.object(
+            self.service,
+            "execution_view",
+            wraps=self.service.execution_view,
+        ) as execution_view:
             await reconcile_execution_state(application, now=time.time() + 60)
+        # Only the two state-changing terminal service calls build a response
+        # view; the periodic scan itself reads current projections directly.
+        self.assertEqual(2, execution_view.call_count)
 
         self.assertEqual("failed", self.state(orphan))
         self.assertEqual("exited", self.state(missing_ready))

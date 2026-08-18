@@ -5,6 +5,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from app.execution import (
     EntityKind,
@@ -439,6 +440,31 @@ class ExecutionServiceTests(unittest.TestCase):
             "lost",
             self.service.get_run(owner_id="alice", run_id=str(run["id"]))["state"]["lifecycle"],
         )
+
+    def test_liveness_reconciliation_does_not_replay_event_history(self) -> None:
+        _task, run, token = self.assignment()
+        claims = self.claims(token)
+        self.service.ingest_runtime_event(
+            self.runtime_event("agent.registered", run, seq=1, expected_revision=0),
+            claims=claims,
+        )
+        lease = self.store.get_lease(
+            owner_id="alice",
+            resource_kind=EntityKind.AGENT_INSTANCE,
+            resource_id=str(run["attributes"]["agent_instance_id"]),
+        )
+        assert lease is not None
+
+        with patch.object(
+            self.store,
+            "snapshot",
+            side_effect=AssertionError("liveness must use current projections"),
+        ):
+            changed = self.service.reconcile_liveness(
+                owner_id="alice", now=lease.expires_at + 1
+            )
+
+        self.assertEqual(1, changed)
 
     def test_heartbeat_with_lost_terminal_lease_does_not_create_agent_lease(self) -> None:
         _task, run, token = self.assignment()

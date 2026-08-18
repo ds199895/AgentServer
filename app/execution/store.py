@@ -410,6 +410,38 @@ class ExecutionStore:
             )
         return self._projection_from_row(row)
 
+    def projections(
+        self,
+        *,
+        owner_id: str,
+        aggregate_kind: EntityKind | str | None = None,
+    ) -> tuple[Projection, ...]:
+        """Return current projections without replaying the event log.
+
+        Background reconciliation only needs durable current state. Routing it
+        through :meth:`snapshot` made every five-second pass deserialize the
+        owner's complete event history, which eventually monopolized the GIL
+        as the production log grew.
+        """
+        owner_id = self._require(owner_id, "owner_id")
+        conditions = ["owner_id = ?"]
+        parameters: list[Any] = [owner_id]
+        if aggregate_kind is not None:
+            conditions.append("aggregate_kind = ?")
+            parameters.append(enum_value(aggregate_kind))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM execution_projections WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY aggregate_kind, aggregate_id",
+                parameters,
+            ).fetchall()
+        return tuple(
+            projection
+            for projection in map(self._projection_from_row, rows)
+            if projection is not None
+        )
+
     def _duplicate_result(
         self,
         connection: sqlite3.Connection,
@@ -1926,6 +1958,28 @@ class ExecutionStore:
                 (owner_id, enum_value(kind), entity_id),
             ).fetchone()
         return self._entity_from_row(row) if row is not None else None
+
+    def entities(
+        self,
+        *,
+        owner_id: str,
+        kind: EntityKind | str | None = None,
+    ) -> tuple[Entity, ...]:
+        """Return an owner's entities in one query for bulk state views."""
+        owner_id = self._require(owner_id, "owner_id")
+        conditions = ["owner_id = ?"]
+        parameters: list[Any] = [owner_id]
+        if kind is not None:
+            conditions.append("entity_kind = ?")
+            parameters.append(enum_value(kind))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM execution_entities WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY entity_kind, entity_id",
+                parameters,
+            ).fetchall()
+        return tuple(self._entity_from_row(row) for row in rows)
 
     @staticmethod
     def _relation_from_row(row: sqlite3.Row) -> EntityRelation:

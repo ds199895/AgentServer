@@ -263,6 +263,39 @@ class AppendAndProjectionTests(ExecutionStoreTestCase):
             owner_id="alice", aggregate_kind="run", aggregate_id="run-1"
         ).revision)
 
+    def test_current_projection_and_entity_reads_skip_event_deserialization(self) -> None:
+        self.store.register_entity(
+            owner_id="alice", kind=EntityKind.RUN, entity_id="run-current"
+        )
+        expected = self.store.append(
+            event(
+                "run.requested",
+                1,
+                run_id="run-current",
+                expected_revision=0,
+            )
+        ).projection
+        self.store.register_entity(
+            owner_id="bob", kind=EntityKind.RUN, entity_id="run-other"
+        )
+
+        original = self.store._event_from_row
+        self.store._event_from_row = lambda _row: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("current-state reads must not replay events")
+        )
+        try:
+            self.assertEqual(
+                (expected,),
+                self.store.projections(
+                    owner_id="alice", aggregate_kind=EntityKind.RUN
+                ),
+            )
+            entities = self.store.entities(owner_id="alice", kind=EntityKind.RUN)
+        finally:
+            self.store._event_from_row = original  # type: ignore[method-assign]
+
+        self.assertEqual(["run-current"], [entity.id for entity in entities])
+
     def test_outbox_is_written_in_event_transaction_then_marked_published(self) -> None:
         result = self.store.append(event("observation.cwd.changed", 1))
         with sqlite3.connect(self.database_path) as connection:
