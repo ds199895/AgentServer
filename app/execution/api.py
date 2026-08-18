@@ -190,8 +190,7 @@ def _bearer(request: Request, capability: str) -> ReporterClaims:
         raise HTTPException(status_code=401, detail=str(error)) from error
 
 
-def _projection_delta(service: ExecutionService, owner_id: str, event: Any) -> dict[str, Any]:
-    view = service.execution_view(owner_id=owner_id)
+def _projection_delta(view: dict[str, Any], event: Any) -> dict[str, Any]:
     keys = ("tasks", "assignments", "runs", "agents", "terminals")
     identifiers = {
         "tasks": event.scope.task_id,
@@ -243,6 +242,31 @@ def build_execution_router(
     cookie_name: str,
 ) -> APIRouter:
     router = APIRouter()
+    # All execution WebSockets for an owner observe the same committed log.
+    # Cache a view by its durable cursor so replaying N events (or broadcasting
+    # one event to N browser tabs) builds the expensive evidence view once.
+    projection_views: dict[str, dict[str, Any]] = {}
+    projection_view_locks: dict[str, asyncio.Lock] = {}
+
+    async def projection_delta(
+        service: ExecutionService,
+        owner_id: str,
+        event: Any,
+    ) -> dict[str, Any]:
+        required_sequence = int(event.global_sequence)
+        view = projection_views.get(owner_id)
+        if view is None or int(view.get("as_of_sequence", 0)) < required_sequence:
+            lock = projection_view_locks.setdefault(owner_id, asyncio.Lock())
+            async with lock:
+                view = projection_views.get(owner_id)
+                if view is None or int(view.get("as_of_sequence", 0)) < required_sequence:
+                    view = await asyncio.to_thread(
+                        service.execution_view,
+                        owner_id=owner_id,
+                    )
+                    projection_views[owner_id] = view
+        return _projection_delta(view, event)
+
     @router.post("/api/tasks", status_code=201)
     async def create_task(
         body: CreateTaskBody,
@@ -777,7 +801,9 @@ def build_execution_router(
                         "type": "event",
                         "cursor": event.global_sequence,
                         "event": event.as_dict(),
-                        "projection": _projection_delta(service, username, event),
+                        "projection": await projection_delta(
+                            service, username, event
+                        ),
                     }
                 )
             async for item in subscription:
@@ -796,7 +822,9 @@ def build_execution_router(
                         "type": "event",
                         "cursor": item.global_sequence,
                         "event": item.as_dict(),
-                        "projection": _projection_delta(service, username, item),
+                        "projection": await projection_delta(
+                            service, username, item
+                        ),
                     }
                 )
 

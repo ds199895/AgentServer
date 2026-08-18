@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -535,13 +536,20 @@ class ExecutionApiTests(unittest.TestCase):
 
     def test_browser_websocket_replays_from_cursor_and_rejects_bad_cookie(self) -> None:
         task = self.client.post("/api/tasks", json={"title": "Stream me"}).json()
-        with self.client.websocket_connect(
-            "/ws/execution?after_sequence=0", cookies={"session": "valid-session"}
-        ) as socket:
-            message = socket.receive_json()
-            self.assertEqual("event", message["type"])
-            self.assertGreaterEqual(message["cursor"], 1)
-            self.assertIn("tasks", message["projection"])
+        replay_count = len(self.store.snapshot(owner_id="alice").events)
+        with patch.object(
+            self.service,
+            "execution_view",
+            wraps=self.service.execution_view,
+        ) as execution_view:
+            with self.client.websocket_connect(
+                "/ws/execution?after_sequence=0", cookies={"session": "valid-session"}
+            ) as socket:
+                messages = [socket.receive_json() for _ in range(replay_count)]
+            self.assertEqual(1, execution_view.call_count)
+            self.assertTrue(all(message["type"] == "event" for message in messages))
+            self.assertGreaterEqual(messages[0]["cursor"], 1)
+            self.assertIn("tasks", messages[-1]["projection"])
         with self.client.websocket_connect("/ws/execution") as socket:
             with self.assertRaises(WebSocketDisconnect) as closed:
                 socket.receive_json()
