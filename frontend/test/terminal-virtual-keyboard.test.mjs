@@ -17,6 +17,11 @@ test('plain accessory keys preserve their terminal sequences', () => {
   assert.equal(encodeVirtualKey('escape', none), '\x1b')
   assert.equal(encodeVirtualKey('enter', none), '\r')
   assert.equal(encodeVirtualKey('tab', none), '\t')
+  assert.equal(encodeVirtualKey('ctrlC', none), '\x03')
+  assert.equal(
+    encodeVirtualKey('ctrlC', { shift: false, ctrl: true, alt: false }),
+    '\x03',
+  )
   assert.equal(encodeVirtualKey('arrowUp', none), '\x1b[A')
   assert.equal(encodeVirtualKey('arrowUp', none, true), '\x1bOA')
 })

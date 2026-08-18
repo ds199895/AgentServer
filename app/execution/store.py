@@ -75,46 +75,13 @@ class ExecutionSubscription:
         self._last_sequence = self.snapshot.as_of_sequence
         self._scan_sequence = self.snapshot.as_of_sequence
         self._pending_events: dict[int, StoredEvent] = {}
-        self._poll_wakeup = asyncio.Event()
+        self._poll_wakeup: asyncio.Event | None = None
 
     def _start_polling(self) -> None:
         if self._poll_task is None:
-            self._poll_wakeup.set()
-            self._poll_task = self._loop.create_task(self._poll())
-
-    async def _poll(self) -> None:
-        try:
-            while not self._closed and not self._overflowed:
-                if not self._poll_wakeup.is_set():
-                    try:
-                        await asyncio.wait_for(
-                            self._poll_wakeup.wait(),
-                            timeout=self._store.subscription_poll_interval,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-                self._poll_wakeup.clear()
-                events = await asyncio.to_thread(
-                    self._store._subscription_events_after,
-                    self._scan_sequence,
-                    self._store.subscription_poll_limit,
-                )
-                if self._closed or self._overflowed:
-                    return
-                self._store._apply_polled_events(self, events)
-                if (
-                    len(events) >= self._store.subscription_poll_limit
-                    and not self._overflowed
-                ):
-                    self._poll_wakeup.set()
-        except asyncio.CancelledError:
-            return
-        except sqlite3.Error:
-            if not self._closed:
-                self._store._mark_subscription_resync(
-                    self,
-                    latest_sequence=self._scan_sequence,
-                )
+            self._poll_task, self._poll_wakeup = (
+                self._store._start_subscription_poller(self._loop)
+            )
 
     def __aiter__(self) -> ExecutionSubscription:
         return self
@@ -140,8 +107,10 @@ class ExecutionSubscription:
             self._closed = True
             self._store._unsubscribe(self)
             task = self._poll_task
-            if task is not None and task is not asyncio.current_task():
-                task.cancel()
+            should_stop = self._store._stop_subscription_poller_if_idle(
+                self._loop, task
+            )
+            if should_stop and task is not None and task is not asyncio.current_task():
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             while True:
@@ -191,6 +160,14 @@ class ExecutionStore:
         self.subscription_poll_limit = int(subscription_poll_limit)
         self._lock = threading.RLock()
         self._subscribers: set[ExecutionSubscription] = set()
+        # Polling is shared per event loop. A browser may open several execution
+        # WebSockets, but they all consume the same global SQLite event page.
+        self._subscription_pollers: dict[
+            asyncio.AbstractEventLoop, asyncio.Task[None]
+        ] = {}
+        self._subscription_wakeups: dict[
+            asyncio.AbstractEventLoop, asyncio.Event
+        ] = {}
         self._initialize()
         self.command_queue = CommandQueue(self.database_path, lock=self._lock)
 
@@ -1044,6 +1021,100 @@ class ExecutionStore:
             subscription._start_polling()
             return subscription
 
+    def _start_subscription_poller(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> tuple[asyncio.Task[None], asyncio.Event]:
+        task = self._subscription_pollers.get(loop)
+        wakeup = self._subscription_wakeups.get(loop)
+        if task is None or task.done() or wakeup is None:
+            wakeup = asyncio.Event()
+            wakeup.set()
+            task = loop.create_task(self._poll_subscriptions(loop, wakeup))
+            self._subscription_pollers[loop] = task
+            self._subscription_wakeups[loop] = wakeup
+        return task, wakeup
+
+    def _subscriptions_for_loop(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> tuple[ExecutionSubscription, ...]:
+        return tuple(
+            subscription
+            for subscription in self._subscribers
+            if subscription._loop is loop
+            and not subscription._closed
+            and not subscription._overflowed
+        )
+
+    async def _poll_subscriptions(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        wakeup: asyncio.Event,
+    ) -> None:
+        task = asyncio.current_task()
+        try:
+            while True:
+                subscriptions = self._subscriptions_for_loop(loop)
+                if not subscriptions:
+                    return
+                if not wakeup.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            wakeup.wait(),
+                            timeout=self.subscription_poll_interval,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                wakeup.clear()
+                subscriptions = self._subscriptions_for_loop(loop)
+                if not subscriptions:
+                    return
+                after_sequence = min(
+                    subscription._scan_sequence
+                    for subscription in subscriptions
+                )
+                events = await asyncio.to_thread(
+                    self._subscription_events_after,
+                    after_sequence,
+                    self.subscription_poll_limit,
+                )
+                for subscription in self._subscriptions_for_loop(loop):
+                    self._apply_polled_events(subscription, events)
+                if len(events) >= self.subscription_poll_limit:
+                    wakeup.set()
+        except asyncio.CancelledError:
+            return
+        except sqlite3.Error:
+            for subscription in self._subscriptions_for_loop(loop):
+                self._mark_subscription_resync(
+                    subscription,
+                    latest_sequence=subscription._scan_sequence,
+                )
+        finally:
+            if self._subscription_pollers.get(loop) is task:
+                self._subscription_pollers.pop(loop, None)
+                self._subscription_wakeups.pop(loop, None)
+
+    def _stop_subscription_poller_if_idle(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        task: asyncio.Task[None] | None,
+    ) -> bool:
+        if self._subscriptions_for_loop(loop):
+            return False
+        if self._subscription_pollers.get(loop) is task:
+            self._subscription_pollers.pop(loop, None)
+            self._subscription_wakeups.pop(loop, None)
+        if task is not None and not task.done():
+            task.cancel()
+        return task is not None
+
+    def _wake_subscription_poller(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        wakeup = self._subscription_wakeups.get(loop)
+        if wakeup is not None:
+            wakeup.set()
+
     @staticmethod
     def _matches(subscription: ExecutionSubscription, event: StoredEvent) -> bool:
         if event.scope.owner_id != subscription.owner_id:
@@ -1163,7 +1234,7 @@ class ExecutionStore:
                 latest_sequence=max(subscription._pending_events),
             )
             return
-        subscription._poll_wakeup.set()
+        self._wake_subscription_poller(subscription._loop)
 
     def _apply_polled_events(
         self,

@@ -25,7 +25,7 @@ const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
 const textEncoder = new TextEncoder()
 
-type RestoreOptions = { rebuildAtlas?: boolean }
+type RestoreOptions = { rebuildAtlas?: boolean; recreateRenderer?: boolean }
 
 type TerminalContextMenu = {
   x: number
@@ -47,7 +47,8 @@ const VIRTUAL_KEYS: VirtualKey[] = [
   { label: '←', title: '方向键左', key: 'arrowLeft', className: 'col-start-1 row-start-3' },
   { label: '↓', title: '方向键下', key: 'arrowDown', className: 'col-start-2 row-start-3' },
   { label: '→', title: '方向键右', key: 'arrowRight', className: 'col-start-3 row-start-3' },
-  { label: 'Tab', title: 'Tab', key: 'tab', className: 'col-start-1 row-start-4 col-span-3' },
+  { label: 'Tab', title: 'Tab', key: 'tab', className: 'col-start-1 row-start-4 col-span-2' },
+  { label: '^C', title: 'Ctrl+C(中断进程)', key: 'ctrlC', className: 'col-start-3 row-start-4' },
 ]
 
 const VIRTUAL_MODIFIERS: Array<{ modifier: VirtualModifier; label: string }> = [
@@ -107,6 +108,7 @@ export default function TerminalPane({
   const focusedRef = useRef(focused)
   const virtualKeyboardOpenRef = useRef(false)
   const restoreRef = useRef<((options?: RestoreOptions) => void) | null>(null)
+  const suspendRendererRef = useRef<(() => void) | null>(null)
   const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const noticeTimerRef = useRef<number | undefined>(undefined)
@@ -267,24 +269,30 @@ export default function TerminalPane({
     })
     const fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
-    // xterm 6 ships only the DOM renderer, which builds a span per style run per
-    // row. The WebGL addon registers itself during open()'s onWillOpen, so it has
-    // to be loaded first; if construction or context creation fails, xterm falls
-    // back to the DOM renderer on its own.
     let webglAddon: WebglAddon | null = null
-    try {
-      // Hidden tabs keep their canvas. Preserving its drawing buffer avoids a
-      // blank first frame when Chromium discards an occluded WebGL surface.
-      const addon = new WebglAddon(true)
-      addon.onContextLoss(() => {
-        addon.dispose()
-        if (webglAddon === addon) webglAddon = null
-      })
-      terminal.loadAddon(addon)
-      webglAddon = addon
-    } catch {
-      webglAddon = null
+    const installWebglRenderer = () => {
+      if (webglAddon || disposed) return
+      try {
+        // preserveDrawingBuffer forces extra GPU synchronization on every
+        // frame. A fresh renderer on reveal is both cheaper and more reliable.
+        const addon = new WebglAddon()
+        addon.onContextLoss(() => {
+          addon.dispose()
+          if (webglAddon === addon) webglAddon = null
+          window.requestAnimationFrame(() => {
+            if (!disposed && visibleRef.current) terminal.refresh(0, terminal.rows - 1)
+          })
+        })
+        terminal.loadAddon(addon)
+        webglAddon = addon
+      } catch {
+        // xterm's DOM renderer remains active when WebGL is unavailable.
+        webglAddon = null
+      }
     }
+    // Loading before open lets the addon install during xterm's onWillOpen.
+    let disposed = false
+    installWebglRenderer()
     terminal.open(hostRef.current)
     terminalRef.current = terminal
     terminal.attachCustomKeyEventHandler((event) => {
@@ -334,7 +342,6 @@ export default function TerminalPane({
     let socket: WebSocket | null = null
     let reconnectTimer: number | undefined
     let reconnectAttempt = 0
-    let disposed = false
     let hasConnected = false
     let replayingSnapshot = true
     const recoveryInput = new RecoveryInputBuffer()
@@ -359,13 +366,26 @@ export default function TerminalPane({
       }
     }
 
-    const restore = ({ rebuildAtlas = false }: RestoreOptions = {}) => {
+    const suspendRenderer = () => {
+      webglAddon?.dispose()
+      webglAddon = null
+    }
+    suspendRendererRef.current = suspendRenderer
+
+    const restore = ({
+      rebuildAtlas = false,
+      recreateRenderer = false,
+    }: RestoreOptions = {}) => {
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
       restoreFrame = window.requestAnimationFrame(() => {
         fit()
         refreshFrame = window.requestAnimationFrame(() => {
           if (!visibleRef.current || disposed) return
+          if (recreateRenderer) {
+            suspendRenderer()
+            installWebglRenderer()
+          }
           // The WebGL texture atlas can become invalid while Chromium occludes
           // a hidden tab or after the OS resumes from sleep. Rebuild it only at
           // those explicit recovery boundaries.
@@ -617,6 +637,7 @@ export default function TerminalPane({
       recoveryInput.clear()
       socket?.close(1000)
       restoreRef.current = null
+      suspendRendererRef.current = null
       terminalRef.current = null
       // Release the WebGL context before the terminal so the addon does not
       // touch an already-disposed renderer.
@@ -630,8 +651,9 @@ export default function TerminalPane({
     visibleRef.current = visible
     focusedRef.current = focused
     if (visible) {
-      restoreRef.current?.({ rebuildAtlas: true })
+      restoreRef.current?.({ rebuildAtlas: true, recreateRenderer: true })
     } else {
+      suspendRendererRef.current?.()
       setContextMenu(null)
       setPastePanelOpen(false)
       virtualKeyboardOpenRef.current = false
@@ -644,7 +666,7 @@ export default function TerminalPane({
   return (
     <div className={cn(
       'absolute inset-0 min-h-0 min-w-0 grid-rows-[30px_minmax(0,1fr)] max-md:grid-rows-[28px_minmax(0,1fr)]',
-      visible ? 'grid' : 'hidden',
+      visible ? 'grid visible' : 'grid invisible',
     )} data-terminal-recovering={recovering ? 'true' : 'false'}>
       <header
         aria-label={`${deviceLabel} ${terminalLabel} 终端信息`}

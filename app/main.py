@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -114,6 +115,7 @@ signer = SessionSigner(session_secret)
 preview_signer = SessionSigner(session_secret, max_age=120)
 preview_access_signer = SessionSigner(session_secret, max_age=24 * 60 * 60)
 devices = DeviceStore(DATA_DIR / "agent_server.db")
+performance_logger = logging.getLogger("agentserver.performance")
 
 
 DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
@@ -127,6 +129,22 @@ TERMINAL_SNAPSHOT_BYTES = max(
 # Session-state pushes are coalesced over this window so a burst of transitions
 # (a device reconnecting, several services going offline) sends one snapshot.
 SESSION_PUSH_DEBOUNCE_SECONDS = 0.25
+
+
+async def event_loop_lag_monitor() -> None:
+    interval = max(0.25, float(os.getenv("EVENT_LOOP_LAG_INTERVAL", "1")))
+    warning = max(0.05, float(os.getenv("EVENT_LOOP_LAG_WARNING", "0.25")))
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + interval
+    while True:
+        await asyncio.sleep(interval)
+        now = loop.time()
+        lag = max(0.0, now - expected)
+        expected = now + interval
+        if lag >= warning:
+            performance_logger.warning("event_loop_lag duration_ms=%.1f", lag * 1000)
+
+
 DOWNLOAD_FILES = {
     "install-frpc-ssh.sh": (ROOT / "scripts" / "install_frpc_ssh.sh", "text/x-shellscript"),
     "install-frpc-ssh.ps1": (ROOT / "scripts" / "install_frpc_ssh.ps1", "text/plain"),
@@ -790,7 +808,7 @@ async def lifespan(app: FastAPI):
                 device_id=device_id,
                 attributes={"intended_agent_kind": agent_kind},
             )
-            session = app.state.terminals.create_process(
+            session = await app.state.terminals.create_process_async(
                 name=str(config.get("name") or device["name"]),
                 argv=ssh_command(device),
                 cols=int(config.get("cols") or 120),
@@ -879,6 +897,7 @@ async def lifespan(app: FastAPI):
     service_monitor_task: asyncio.Task[None] | None = None
     agent_probe_task: asyncio.Task[None] | None = None
     execution_reconcile_task: asyncio.Task[None] | None = None
+    event_loop_lag_task: asyncio.Task[None] | None = None
     frp_monitor_task: asyncio.Task[None] | None = None
     cleanup_started = False
     runtime_instance_lock = RuntimeInstanceLock(
@@ -905,6 +924,7 @@ async def lifespan(app: FastAPI):
             service_monitor_task,
             agent_probe_task,
             execution_reconcile_task,
+            event_loop_lag_task,
         ):
             with contextlib.suppress(BaseException):
                 await stop_task(task)
@@ -987,6 +1007,8 @@ async def lifespan(app: FastAPI):
             execution_reconcile_loop(app)
         )
         app.state.execution_reconcile_task = execution_reconcile_task
+        event_loop_lag_task = asyncio.create_task(event_loop_lag_monitor())
+        app.state.event_loop_lag_task = event_loop_lag_task
 
         dashboard_url = os.getenv("FRPS_DASHBOARD_URL", "").strip()
         if dashboard_url:
@@ -1013,6 +1035,30 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_performance_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration = time.perf_counter() - started
+        # Server-Timing is useful in browser traces even below the log threshold.
+        if "response" in locals():
+            response.headers["Server-Timing"] = f"app;dur={duration * 1000:.1f}"
+        threshold = max(0.05, float(os.getenv("SLOW_REQUEST_SECONDS", "0.25")))
+        if duration >= threshold:
+            performance_logger.warning(
+                "slow_request method=%s path=%s status=%d duration_ms=%.1f",
+                request.method,
+                request.url.path,
+                status_code,
+                duration * 1000,
+            )
 preview_origin = os.getenv("PREVIEW_PUBLIC_ORIGIN", "").strip()
 if preview_origin:
     preview_hostname = urlsplit(preview_origin).hostname
@@ -1292,7 +1338,7 @@ async def list_terminals(
     manager: TerminalManager = Depends(terminal_manager),
     username: str = Depends(current_user),
 ) -> list[dict[str, object]]:
-    return manager.list(username)
+    return await manager.list_async(username)
 
 
 @app.get("/api/devices")
@@ -1714,17 +1760,21 @@ async def execution_reconcile_loop(app: FastAPI) -> None:
 
 
 async def service_monitor_loop(app: FastAPI) -> None:
-    interval = max(2.0, float(os.getenv("SERVICE_PROBE_INTERVAL", "10")))
+    interval = max(2.0, float(os.getenv("SERVICE_PROBE_INTERVAL", "15")))
     process_interval = max(
-        interval, float(os.getenv("SERVICE_PROCESS_SCAN_INTERVAL", "10"))
+        interval, float(os.getenv("SERVICE_PROCESS_SCAN_INTERVAL", "30"))
     )
     process_missing_threshold = max(
         1, int(os.getenv("SERVICE_PROCESS_MISSING_SCANS", "2"))
     )
     threshold = max(1, int(os.getenv("SERVICE_PROBE_FAILURES", "2")))
-    semaphore = asyncio.Semaphore(max(1, int(os.getenv("SERVICE_PROBE_CONCURRENCY", "3"))))
+    semaphore = asyncio.Semaphore(max(1, int(os.getenv("SERVICE_PROBE_CONCURRENCY", "2"))))
     scan_semaphore = asyncio.Semaphore(
-        max(1, int(os.getenv("SERVICE_PROCESS_SCAN_CONCURRENCY", "3")))
+        max(1, int(os.getenv("SERVICE_PROCESS_SCAN_CONCURRENCY", "2")))
+    )
+    probe_budget = max(1, int(os.getenv("SERVICE_PROBE_BUDGET", "12")))
+    online_probe_interval = max(
+        interval, float(os.getenv("SERVICE_ONLINE_PROBE_INTERVAL", "60"))
     )
     discovery_event = app.state.terminals.service_discovery_event
     next_process_scan = 0.0
@@ -1747,7 +1797,12 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     online, error = await probe_device_service(
                         device, port, scheme, timeout=probe_timeout
                     )
-                    if not online and source == "process" and scheme == "http":
+                    if (
+                        not online
+                        and source == "process"
+                        and scheme == "http"
+                        and os.getenv("SERVICE_PROCESS_TRY_HTTPS", "0") == "1"
+                    ):
                         online, error = await probe_device_service(
                             device, port, "https", timeout=probe_timeout
                         )
@@ -1772,11 +1827,16 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     await app.state.previews.delete_for_service(session_id, port)
 
     while True:
+        cycle_started = time.perf_counter()
+        process_scan_ran = False
+        scanned_device_count = 0
+        discovered_listener_count = 0
         # New terminal-output candidates should be checked immediately instead
         # of waiting for the next periodic lifecycle probe.
         discovery_event.clear()
         now = asyncio.get_running_loop().time()
         if now >= next_process_scan:
+            process_scan_ran = True
             device_ids = sorted(
                 {
                     str(session.device_id)
@@ -1784,6 +1844,7 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     if session.active and session.kind == "ssh" and session.device_id
                 }
             )
+            scanned_device_count = len(device_ids)
 
             async def scan(
                 device_id: str,
@@ -1811,6 +1872,7 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     app.state.terminals.sync_device_agents(device_id, agents)
                 if listeners is None:
                     continue
+                discovered_listener_count += len(listeners)
                 removed = app.state.terminals.sync_process_listeners(
                     device_id,
                     listeners,
@@ -1820,6 +1882,25 @@ async def service_monitor_loop(app: FastAPI) -> None:
                     with contextlib.suppress(Exception):
                         await app.state.previews.delete_for_service(session_id, port)
             next_process_scan = asyncio.get_running_loop().time() + process_interval
+        candidate_services = app.state.terminals.service_candidates()
+        wall_time = time.time()
+        candidate_services = [
+            (session, service)
+            for session, service in candidate_services
+            if service.status != "online"
+            or service.last_checked_at is None
+            or wall_time - service.last_checked_at >= online_probe_interval
+        ]
+        candidate_services.sort(
+            key=lambda item: (
+                item[1].status != "checking",
+                item[1].source == "process",
+                item[0].id,
+                item[1].port,
+            )
+        )
+        candidate_count = len(candidate_services)
+        candidate_services = candidate_services[:probe_budget]
         candidates = [
             (
                 session.id,
@@ -1828,12 +1909,22 @@ async def service_monitor_loop(app: FastAPI) -> None:
                 service.url,
                 service.source,
             )
-            for session, service in app.state.terminals.service_candidates()
+            for session, service in candidate_services
         ]
         if candidates:
             await asyncio.gather(
                 *(check(*candidate) for candidate in candidates),
                 return_exceptions=True,
+            )
+        if process_scan_ran or time.perf_counter() - cycle_started >= interval:
+            performance_logger.info(
+                "service_monitor duration_ms=%.1f devices=%d listeners=%d "
+                "candidates=%d probes=%d",
+                (time.perf_counter() - cycle_started) * 1000,
+                scanned_device_count,
+                discovered_listener_count,
+                candidate_count,
+                len(candidates),
             )
         try:
             await asyncio.wait_for(discovery_event.wait(), timeout=interval)
@@ -1910,7 +2001,7 @@ async def create_terminal(
                 launch_id=launch_id,
                 attributes={"intended_agent_kind": body.agent},
             )
-            session = manager.create(
+            session = await manager.create_async(
                 body.name,
                 body.cols,
                 body.rows,
@@ -1965,7 +2056,9 @@ async def delete_terminal(
     manager: TerminalManager = Depends(terminal_manager),
     username: str = Depends(current_user),
 ) -> dict[str, bool]:
-    session = manager.get_for_owner(session_id, username)
+    session = manager.sessions.get(session_id)
+    if session is not None and session.owner != username:
+        session = None
     if not session:
         raise HTTPException(status_code=404, detail="Terminal not found")
     await request.app.state.previews.delete_for_terminal(session_id)
@@ -2783,7 +2876,7 @@ async def sessions_socket(websocket: WebSocket) -> None:
     waiter = manager.subscribe_state()
 
     async def send_snapshots() -> None:
-        await websocket.send_json(manager.list(username))
+        await websocket.send_json(await manager.list_async(username))
         while True:
             await waiter.wait()
             # Coalesce a burst of transitions into one push, then clear again so
@@ -2791,7 +2884,7 @@ async def sessions_socket(websocket: WebSocket) -> None:
             # rather than triggering a second, identical one.
             await asyncio.sleep(SESSION_PUSH_DEBOUNCE_SECONDS)
             waiter.clear()
-            await websocket.send_json(manager.list(username))
+            await websocket.send_json(await manager.list_async(username))
 
     async def receive_until_disconnect() -> None:
         while True:

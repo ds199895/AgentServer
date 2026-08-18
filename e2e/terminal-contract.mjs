@@ -753,6 +753,72 @@ try {
   await groupSessionPreviewButton(page, terminalId).click()
   await waitForPaneTabCount(page, 3, 2)
   const primaryPane = page.locator(`[data-terminal-id="${terminalId}"]`)
+
+  // Real keyboard input (including erase) must reach the PTY exactly, and a
+  // burst of terminal switches must restore a non-zero renderer without a
+  // wheel event or other manual repaint trigger.
+  await primaryPane.locator('[data-terminal-recovering="false"]').waitFor()
+  await primaryPane.locator('.terminal-host').click()
+  await page.keyboard.type("printf 'input-delete-wrong'")
+  // Remove the closing quote plus all five letters in "wrong".
+  for (let index = 0; index < 6; index += 1) await page.keyboard.press('Backspace')
+  await page.keyboard.type("right'")
+  await page.keyboard.press('Enter')
+  for (let index = 0; index < 8; index += 1) {
+    await activatePaneTab(page, 3, switchTerminalId)
+    await activatePaneTab(page, 3, terminalId)
+  }
+  const rendererMetrics = await primaryPane.evaluate((node) => {
+    const host = node.querySelector('.terminal-host')
+    const screen = node.querySelector('.xterm-screen')
+    const hostRect = host?.getBoundingClientRect()
+    const screenRect = screen?.getBoundingClientRect()
+    return {
+      visible: node.getAttribute('data-terminal-visible') === 'true',
+      hostWidth: hostRect?.width || 0,
+      hostHeight: hostRect?.height || 0,
+      screenWidth: screenRect?.width || 0,
+      screenHeight: screenRect?.height || 0,
+    }
+  })
+  if (
+    !rendererMetrics.visible ||
+    rendererMetrics.hostWidth <= 0 ||
+    rendererMetrics.hostHeight <= 0 ||
+    rendererMetrics.screenWidth <= 0 ||
+    rendererMetrics.screenHeight <= 0
+  ) {
+    fail(`terminal renderer did not recover after switching: ${JSON.stringify(rendererMetrics)}`)
+  }
+  const inputSnapshot = await page.evaluate((id) => new Promise((resolve) => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const socket = new WebSocket(`${protocol}//${location.host}/ws/terminal/${id}`)
+    socket.binaryType = 'arraybuffer'
+    const decoder = new TextDecoder()
+    let output = ''
+    const timeout = setTimeout(() => {
+      socket.close()
+      resolve({ ok: false, output })
+    }, 3000)
+    socket.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        output += decoder.decode(new Uint8Array(event.data), { stream: true })
+      }
+      if (event.data === '\x01[snapshot-complete]') {
+        clearTimeout(timeout)
+        socket.close()
+        resolve({ ok: output.includes('input-delete-right'), output })
+      }
+    }
+    socket.onerror = () => {
+      clearTimeout(timeout)
+      resolve({ ok: false, output })
+    }
+  }), terminalId)
+  if (!inputSnapshot.ok) {
+    fail(`keyboard input or Backspace did not reach the PTY exactly: ${JSON.stringify(inputSnapshot.output.slice(-500))}`)
+  }
+
   await primaryPane.getByRole('button', { name: '打开工作区文件' }).click()
   const workspacePane = page.getByRole('complementary', { name: /工作区/ })
   await workspacePane.waitFor()
@@ -1024,7 +1090,7 @@ try {
   if (meaningfulConsoleErrors.length) {
     fail(`console errors: ${meaningfulConsoleErrors.join(' | ')}`)
   }
-  console.log('empty-pane split, device preview/pin, pane-tab drag, detach-vs-delete, persistence, focus/mobile, cache, workspace, artifact, and image contracts passed')
+  console.log('terminal input/switch recovery, empty-pane split, device preview/pin, pane-tab drag, detach-vs-delete, persistence, focus/mobile, cache, workspace, artifact, and image contracts passed')
 } finally {
   await page.evaluate(async ({ ids, ownedNamePrefix }) => {
     const response = await fetch('/api/terminals')

@@ -69,8 +69,40 @@ NON_SERVICE_URL_CONTEXT = re.compile(
     re.IGNORECASE,
 )
 MAX_DETECTED_SERVICES = 8
-MAX_PROCESS_SERVICE_CANDIDATES = 20
+MAX_PROCESS_SERVICE_CANDIDATES = 8
 SERVICE_REDISCOVERY_COOLDOWN = 5 * 60
+SERVICE_REDISCOVERY_MAX_COOLDOWN = 60 * 60
+NON_HTTP_SERVICE_PORTS = frozenset(
+    {
+        1883,  # MQTT
+        2181,  # ZooKeeper
+        3306,  # MySQL
+        4369,  # Erlang port mapper
+        5432,  # PostgreSQL
+        5672,  # AMQP
+        6379,  # Redis
+        7000,  # Cassandra internode
+        9042,  # Cassandra CQL
+        11211,  # Memcached
+        27017,  # MongoDB
+    }
+)
+NON_HTTP_PROCESS_MARKERS = (
+    "redis-server",
+    "postgres",
+    "mysqld",
+    "mariadbd",
+    "mongod",
+    "memcached",
+    "rabbitmq",
+    "beam.smp",
+    "zookeeper",
+    "sshd",
+    "containerd",
+    "dockerd",
+    "frpc",
+    "frps",
+)
 LISTENER_SCAN_MARKER = "__AGENTSERVER_LISTENERS__"
 LISTENER_RECORD_MARKER = "__AGENTSERVER_LISTENER__"
 AGENT_SCAN_MARKER = "__AGENTSERVER_AGENTS__"
@@ -412,6 +444,43 @@ def process_service_label(command: str, port: int) -> str:
     return f"Web 服务 :{port}"
 
 
+def is_process_service_candidate(listener: ListeningProcess) -> bool:
+    """Reject listeners that are clearly not browser-preview services."""
+    if listener.port == 15672:  # RabbitMQ's management UI is HTTP.
+        return True
+    if listener.port in NON_HTTP_SERVICE_PORTS:
+        return False
+    command = listener.command.strip().lower()
+    return not any(marker in command for marker in NON_HTTP_PROCESS_MARKERS)
+
+
+def process_service_candidate_rank(listener: ListeningProcess) -> tuple[int, int]:
+    """Prefer conventional web runtimes/ports when a host has many listeners."""
+    command = listener.command.lower()
+    web_process = any(
+        marker in command
+        for marker in (
+            "node",
+            "python",
+            "gunicorn",
+            "uvicorn",
+            "nginx",
+            "caddy",
+            "php",
+            "dotnet",
+            "java",
+            "ruby",
+            "rails",
+        )
+    )
+    common_port = (
+        listener.port in {3000, 4000, 5000, 5173, 8000, 8080, 8888}
+        or 3000 <= listener.port <= 5999
+        or 8000 <= listener.port <= 8999
+    )
+    return (0 if web_process or common_port else 1, listener.port)
+
+
 def _listener_port(address: str) -> int | None:
     address = address.strip()
     match = re.search(r"(?:\]|:|\.)(\d{1,5})$", address)
@@ -582,6 +651,7 @@ class DetectedService:
     process_detail: str = ""
     process_seen_at: float | None = None
     process_missing_count: int = 0
+    probe_backoff_count: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -837,6 +907,7 @@ class TerminalManager:
         self._owned_pids: set[int] = set()
         self.loop = asyncio.get_running_loop()
         self.service_discovery_event = asyncio.Event()
+        self._tmux_state_refresh_lock = asyncio.Lock()
         self._tmux_states_cache: tuple[float, dict[str, tuple[bool, str, bool]]] | None = None
         # Each state subscriber owns its own Event. A single shared Event would
         # let one client's clear() swallow a notification another had not read.
@@ -985,6 +1056,9 @@ class TerminalManager:
             for session in tuple(self.sessions.values()):
                 if session.active:
                     self._refresh_tmux_state(session, states)
+        return self._session_payloads(owner)
+
+    def _session_payloads(self, owner: str | None) -> list[dict[str, object]]:
         sessions = sorted(
             (
                 session
@@ -994,6 +1068,18 @@ class TerminalManager:
             key=lambda item: item.created_at,
         )
         return [session.as_dict() for session in sessions]
+
+    async def list_async(
+        self, owner: str | None = None
+    ) -> list[dict[str, object]]:
+        if self.backend != "tmux":
+            return self._session_payloads(owner)
+        async with self._tmux_state_refresh_lock:
+            states = await asyncio.to_thread(self._tmux_pane_states, max_age=1.0)
+        for session in tuple(self.sessions.values()):
+            if session.active:
+                self._refresh_tmux_state(session, states)
+        return self._session_payloads(owner)
 
     def get(self, session_id: str) -> TerminalSession | None:
         session = self.sessions.get(session_id)
@@ -1181,6 +1267,7 @@ class TerminalManager:
         session_id: str | None = None,
         launch_id: str | None = None,
         managed_env: Mapping[str, str] | None = None,
+        _defer_tmux_activation: bool = False,
     ) -> TerminalSession:
         if not Path(self.cwd).is_dir():
             raise ValueError(f"TERMINAL_CWD does not exist: {self.cwd}")
@@ -1214,6 +1301,7 @@ class TerminalManager:
                 session_id=session_id,
                 launch_id=launch_id,
                 managed_environment=launch_environment,
+                activate=not _defer_tmux_activation,
             )
 
         display_name = (name or "Terminal").strip()[:80] or "Terminal"
@@ -1268,6 +1356,15 @@ class TerminalManager:
         self._notify_state_change()
         return session
 
+    async def create_async(self, *args: object, **kwargs: object) -> TerminalSession:
+        """Create without running tmux subprocesses on the owner event loop."""
+        if self.backend != "tmux":
+            return self.create(*args, **kwargs)  # type: ignore[arg-type]
+        kwargs["_defer_tmux_activation"] = True
+        session = await asyncio.to_thread(self.create, *args, **kwargs)  # type: ignore[arg-type]
+        self._activate_tmux_session(session)
+        return session
+
     def create_process(
         self,
         *,
@@ -1285,6 +1382,7 @@ class TerminalManager:
         session_id: str | None = None,
         launch_id: str | None = None,
         managed_env: Mapping[str, str] | None = None,
+        _defer_tmux_activation: bool = False,
     ) -> TerminalSession:
         if not argv:
             raise ValueError("Process command is empty")
@@ -1323,6 +1421,7 @@ class TerminalManager:
                 session_id=session_id,
                 launch_id=launch_id,
                 managed_environment=launch_environment,
+                activate=not _defer_tmux_activation,
             )
 
         def launch_process() -> None:
@@ -1369,6 +1468,17 @@ class TerminalManager:
         self.resize(session_id, cols, rows)
         self.loop.add_reader(fd, self._read_ready, session_id)
         self._notify_state_change()
+        return session
+
+    async def create_process_async(
+        self, **kwargs: object
+    ) -> TerminalSession:
+        """Process variant of create_async used by remote terminal launches."""
+        if self.backend != "tmux":
+            return self.create_process(**kwargs)  # type: ignore[arg-type]
+        kwargs["_defer_tmux_activation"] = True
+        session = await asyncio.to_thread(self.create_process, **kwargs)  # type: ignore[arg-type]
+        self._activate_tmux_session(session)
         return session
 
     def _tmux_command(self, *arguments: str) -> list[str]:
@@ -1688,6 +1798,7 @@ class TerminalManager:
         session_id: str,
         launch_id: str,
         managed_environment: Mapping[str, str],
+        activate: bool = True,
     ) -> TerminalSession:
         if self.store is None:
             raise RuntimeError("Persistent terminal store is not configured")
@@ -1756,22 +1867,35 @@ class TerminalManager:
         except BaseException:
             self._tmux_run("kill-session", "-t", tmux_name, check=False)
             raise
+        try:
+            if initial_input:
+                self._tmux_run("send-keys", "-t", tmux_name, "-l", initial_input)
+                self._tmux_run("send-keys", "-t", tmux_name, "Enter")
+        except BaseException:
+            self.store.delete(session.id)
+            self._tmux_run("kill-session", "-t", tmux_name, check=False)
+            raise
+        if activate:
+            self._activate_tmux_session(session)
+        return session
+
+    def _activate_tmux_session(self, session: TerminalSession) -> None:
+        """Attach loop-owned readers after blocking provisioning has finished."""
+        if self.store is None:
+            raise RuntimeError("Persistent terminal store is not configured")
         self.sessions[session.id] = session
         try:
             self._start_tmux_artifact_capture(session)
             self._spawn_tmux_client(session)
-            if initial_input:
-                self._tmux_run("send-keys", "-t", tmux_name, "-l", initial_input)
-                self._tmux_run("send-keys", "-t", tmux_name, "Enter")
         except BaseException:
             self._stop_tmux_artifact_capture(session)
             self._close_client(session)
             self.sessions.pop(session.id, None)
             self.store.delete(session.id)
-            self._tmux_run("kill-session", "-t", tmux_name, check=False)
+            if session.tmux_name:
+                self._tmux_run("kill-session", "-t", session.tmux_name, check=False)
             raise
         self._notify_state_change()
-        return session
 
     def _spawn_tmux_client(self, session: TerminalSession) -> None:
         if session.fd >= 0 or not session.tmux_name:
@@ -2219,13 +2343,27 @@ class TerminalManager:
                 self._set_agent(session, kind, source="output")
 
     def service_candidates(self) -> list[tuple[TerminalSession, DetectedService]]:
-        return [
-            (session, service)
-            for session in self.sessions.values()
-            if session.active and session.device_id
-            for service in session.services.values()
-            if service.status != "offline"
-        ]
+        candidates: dict[tuple[str, int, str], tuple[TerminalSession, DetectedService]] = {}
+        for session in self.sessions.values():
+            if not session.active or not session.device_id:
+                continue
+            for service in session.services.values():
+                if service.status == "offline":
+                    continue
+                scheme = "https" if service.url.lower().startswith("https://") else "http"
+                key = (session.device_id, service.port, scheme)
+                current = candidates.get(key)
+                if current is None or (
+                    service.source != "process",
+                    service.status == "checking",
+                    service.last_seen_at,
+                ) > (
+                    current[1].source != "process",
+                    current[1].status == "checking",
+                    current[1].last_seen_at,
+                ):
+                    candidates[key] = (session, service)
+        return list(candidates.values())
 
     def sync_process_listeners(
         self,
@@ -2243,7 +2381,23 @@ class TerminalManager:
         if not sessions:
             return []
         sessions.sort(key=lambda item: (item.last_activity_at, item.created_at), reverse=True)
-        listener_by_port = {listener.port: listener for listener in listeners}
+        process_candidates = sorted(
+            (listener for listener in listeners if is_process_service_candidate(listener)),
+            key=process_service_candidate_rank,
+        )[:MAX_PROCESS_SERVICE_CANDIDATES]
+        # Preserve listeners already corroborated by terminal output even when
+        # the automatic process-only budget is full.
+        output_ports = {
+            service.port
+            for session in sessions
+            for service in session.services.values()
+            if service.source in {"output", "hybrid"}
+        }
+        listener_by_port = {
+            listener.port: listener
+            for listener in listeners
+            if listener.port in output_ports or listener in process_candidates
+        }
         known_by_port: dict[int, tuple[TerminalSession, DetectedService]] = {}
         duplicate_services: list[tuple[TerminalSession, DetectedService]] = []
         for session in sessions:
@@ -2300,9 +2454,18 @@ class TerminalManager:
                 continue
 
             owner = sessions[0]
-            if len(owner.services) >= MAX_PROCESS_SERVICE_CANDIDATES:
+            process_only = [
+                service
+                for service in owner.services.values()
+                if service.source == "process"
+            ]
+            if len(process_only) >= MAX_PROCESS_SERVICE_CANDIDATES:
                 removable = sorted(
-                    (service for service in owner.services.values() if service.status != "online"),
+                    (
+                        service
+                        for service in process_only
+                        if service.status != "online"
+                    ),
                     key=lambda service: service.last_seen_at,
                 )
                 if not removable:
@@ -2517,6 +2680,7 @@ class TerminalManager:
             service.status = "online"
             service.error = ""
             service.failure_count = 0
+            service.probe_backoff_count = 0
         else:
             service.failure_count += 1
             service.error = error or "服务端口当前不可访问"
@@ -2526,7 +2690,13 @@ class TerminalManager:
                 service.status = "checking"
         became_offline = previous != "offline" and service.status == "offline"
         if became_offline:
-            service.retry_after = time.time() + SERVICE_REDISCOVERY_COOLDOWN
+            service.probe_backoff_count += 1
+            cooldown = min(
+                SERVICE_REDISCOVERY_MAX_COOLDOWN,
+                SERVICE_REDISCOVERY_COOLDOWN
+                * (2 ** min(service.probe_backoff_count - 1, 4)),
+            )
+            service.retry_after = time.time() + cooldown
         if previous != service.status:
             self._notify_state_change()
         return service, became_offline
@@ -2844,13 +3014,21 @@ class TerminalManager:
         if not session:
             return False
         if self.backend == "tmux":
-            self._stop_tmux_artifact_capture(session)
+            # Reader and PTY ownership stays on the event loop. The external
+            # tmux/SQLite teardown can safely run off-loop.
+            self._stop_tmux_artifact_capture(session, stop_pipe=False)
             self._close_client(session)
-            if session.tmux_name:
-                self._tmux_run("kill-session", "-t", session.tmux_name, check=False)
-            if self.store:
-                self.store.delete(session_id)
             session.exited_at = session.exited_at or time.time()
+            tmux_name = session.tmux_name
+            store = self.store
+
+            def destroy_tmux_session() -> None:
+                if tmux_name:
+                    self._tmux_run("kill-session", "-t", tmux_name, check=False)
+                if store:
+                    store.delete(session_id)
+
+            await asyncio.to_thread(destroy_tmux_session)
             self._finalize_session_exit(session)
             session.subscribers.clear()
             self.sessions.pop(session_id, None)

@@ -8,6 +8,7 @@ export type VirtualKeyName =
   | 'arrowDown'
   | 'arrowRight'
   | 'tab'
+  | 'ctrlC'
 
 export type VirtualModifierState = Record<VirtualModifier, boolean>
 
@@ -32,6 +33,8 @@ export function encodeVirtualKey(
     (modifiers.ctrl ? 4 : 0)
 
   if (key === 'tab') return modifiers.shift ? '\x1b[Z' : '\t'
+  // Ctrl+C 就是 ETX 控制字节,无需与其他修饰键组合。
+  if (key === 'ctrlC') return '\x03'
   if (key === 'enter') return modifiers.alt ? '\x1b\r' : '\r'
   if (key === 'escape') return modifiers.alt ? '\x1b\x1b' : '\x1b'
 

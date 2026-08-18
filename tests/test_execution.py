@@ -431,6 +431,20 @@ class SnapshotAndSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(poll_task.done())
         self.assertNotIn(subscription, self.store._subscribers)
 
+    async def test_subscriptions_on_one_loop_share_one_database_poller(self) -> None:
+        first = self.store.subscribe(owner_id="alice")
+        second = self.store.subscribe(owner_id="bob")
+
+        self.assertIs(first._poll_task, second._poll_task)
+        self.assertEqual(1, len(self.store._subscription_pollers))
+
+        await first.aclose()
+        assert second._poll_task is not None
+        self.assertFalse(second._poll_task.done())
+        await second.aclose()
+        self.assertTrue(second._poll_task.done())
+        self.assertEqual({}, self.store._subscription_pollers)
+
     async def test_owner_filter_and_cursor_replay(self) -> None:
         first = self.store.append(event("observation.process.started", 1)).event
         self.store.append(

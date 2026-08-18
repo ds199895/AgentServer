@@ -1494,6 +1494,76 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             older.exited_at = older.exited_at or 1
             newer.exited_at = newer.exited_at or 1
 
+    async def test_process_scan_filters_non_http_services_and_caps_candidates(self) -> None:
+        session = TerminalSession(
+            id="filtered-listeners",
+            name="Remote",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+        )
+        self.manager.sessions = {session.id: session}
+        try:
+            listeners = [
+                ListeningProcess(6379, 1, "redis-server"),
+                ListeningProcess(5432, 2, "postgres"),
+            ]
+            listeners.extend(
+                ListeningProcess(3000 + index, 100 + index, "node")
+                for index in range(10)
+            )
+            self.manager.sync_process_listeners("device-001", listeners)
+            self.assertNotIn(6379, session.services)
+            self.assertNotIn(5432, session.services)
+            self.assertEqual(8, len(session.services))
+        finally:
+            session.exited_at = 1
+
+    async def test_service_candidates_deduplicate_device_port_and_prefer_output(self) -> None:
+        process_session = TerminalSession(
+            id="process-service",
+            name="Process",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+        )
+        output_session = TerminalSession(
+            id="output-service",
+            name="Output",
+            pid=-1,
+            fd=-1,
+            command="ssh",
+            cwd=self.directory.name,
+            kind="ssh",
+            device_id="device-001",
+            exited_at=None,
+        )
+        process_session.services[3000] = DetectedService(
+            3000, "http://localhost:3000/", "Node.js", source="process"
+        )
+        output_session.services[3000] = DetectedService(
+            3000, "http://localhost:3000/", "Vite", source="output"
+        )
+        self.manager.sessions = {
+            process_session.id: process_session,
+            output_session.id: output_session,
+        }
+        try:
+            candidates = self.manager.service_candidates()
+            self.assertEqual(1, len(candidates))
+            self.assertIs(output_session, candidates[0][0])
+        finally:
+            process_session.exited_at = 1
+            output_session.exited_at = 1
+
     async def test_process_scan_enriches_output_service_without_reassigning_it(self) -> None:
         owner = TerminalSession(
             id="output-owner",
@@ -1785,6 +1855,41 @@ class TerminalStoreTests(unittest.TestCase):
 
 
 class TmuxTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_tmux_launch_offloads_provisioning_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.terminal.shutil.which", return_value="/usr/bin/tmux"
+        ), patch.object(TerminalManager, "_restore_tmux_sessions"):
+            manager = TerminalManager(
+                command="",
+                cwd=directory,
+                shell="/bin/sh",
+                backend="tmux",
+                database_path=Path(directory) / "terminals.db",
+                tmux_socket=Path(directory) / "tmux.sock",
+            )
+            owner_thread = threading.get_ident()
+            command_threads: list[tuple[str, int]] = []
+
+            def tmux_run(*arguments: str, check: bool = True):
+                command_threads.append((arguments[0], threading.get_ident()))
+                return subprocess.CompletedProcess(
+                    ["tmux"], 0, stdout="4321\n", stderr=""
+                )
+
+            with patch.object(manager, "_tmux_run", tmux_run), patch.object(
+                manager, "_spawn_tmux_client"
+            ):
+                session = await manager.create_async("Async tmux")
+
+            new_session_thread = next(
+                thread_id
+                for command, thread_id in command_threads
+                if command == "new-session"
+            )
+            self.assertNotEqual(owner_thread, new_session_thread)
+            self.assertIs(session, manager.sessions[session.id])
+            await manager.close()
+
     async def test_tmux_control_process_does_not_inherit_dynamic_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "app.terminal.shutil.which", return_value="/usr/bin/tmux"
