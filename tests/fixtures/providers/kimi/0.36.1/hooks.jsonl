@@ -1,0 +1,6 @@
+{"hook_event_name":"PermissionRequest","session_id":"fixture-session","tool_name":"Bash","tool_call_id":"fixture-permission","tool_input":{"command":"FIXTURE_PRIVATE_KIMI_PERMISSION"}}
+{"hook_event_name":"PermissionResult","session_id":"fixture-session","tool_name":"Bash","tool_call_id":"fixture-permission","decision":"allow"}
+{"hook_event_name":"SubagentStart","session_id":"fixture-session","agent_name":"reusable-profile","prompt":"FIXTURE_PRIVATE_KIMI_SUBAGENT_PROMPT"}
+{"hook_event_name":"SubagentStop","session_id":"fixture-session","agent_name":"reusable-profile","response":"FIXTURE_PRIVATE_KIMI_SUBAGENT_OUTPUT"}
+{"hook_event_name":"TaskStarted","session_id":"fixture-session","task_kind":"agent","task_id":"fixture-background-agent","description":"FIXTURE_PRIVATE_KIMI_TASK"}
+{"hook_event_name":"StopFailure","session_id":"fixture-session","error":"FIXTURE_PRIVATE_KIMI_STOP_ERROR"}

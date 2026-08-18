@@ -1,0 +1,9 @@
+{"type":"system","subtype":"init","session_id":"fixture-session","cwd":"/private/workspace","tools":["Bash"],"model":"fixture-model"}
+{"type":"assistant","session_id":"fixture-session","message":{"role":"assistant","content":[{"type":"text","text":"FIXTURE_PRIVATE_CLAUDE_TEXT"}]}}
+{"type":"assistant","session_id":"fixture-session","message":{"role":"assistant","content":[{"type":"tool_use","id":"fixture-tool-ok","name":"Bash","input":{"command":"FIXTURE_PRIVATE_CLAUDE_COMMAND"}}]}}
+{"type":"user","session_id":"fixture-session","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-tool-ok","content":"FIXTURE_PRIVATE_CLAUDE_OUTPUT"}]}}
+{"type":"assistant","session_id":"fixture-session","message":{"role":"assistant","content":[{"type":"tool_use","id":"fixture-tool-failed","name":"Read","input":{"file_path":"FIXTURE_PRIVATE_CLAUDE_PATH"}}]}}
+{"type":"user","session_id":"fixture-session","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-tool-failed","is_error":true,"content":"FIXTURE_PRIVATE_CLAUDE_ERROR"}]}}
+{"type":"system","subtype":"compact_boundary","session_id":"fixture-session","compact_metadata":{"trigger":"auto"}}
+{"type":"stream_event","session_id":"fixture-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"FIXTURE_PRIVATE_CLAUDE_DELTA"}}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"fixture-session","result":"FIXTURE_PRIVATE_CLAUDE_RESULT"}

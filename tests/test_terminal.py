@@ -153,6 +153,7 @@ class AgentSignatureTests(unittest.TestCase):
         self.assertEqual("codex", agent_signature("codex-cli resume abc123"))
         self.assertEqual("claude", agent_signature("╭─── Claude Code v1.0.83 ───╮"))
         self.assertEqual("kimi", agent_signature("Kimi CLI v0.58 — Moonshot AI"))
+        self.assertEqual("kimi", agent_signature("▐█▛█▛█▌  Welcome to Kimi Code!"))
 
     def test_ignores_ordinary_shell_output(self) -> None:
         self.assertIsNone(agent_signature("user@host:~$ ls -la"))
@@ -503,6 +504,33 @@ class TerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager.detach(session.id, queue)
             self.manager.detach(session.id, healthy)
+
+    async def test_attach_bounds_cold_snapshot_and_keeps_normal_read_chunks_whole(self) -> None:
+        session = self.manager.create("Bounded snapshot")
+        session.chunks.clear()
+        session.buffer_size = 0
+        for chunk in (b"old-" * 20, b"middle-" * 12, b"latest-" * 10):
+            self.manager._append(session, chunk)
+
+        snapshot, queue = self.manager.attach(session.id, max_snapshot_bytes=150)
+        try:
+            self.assertEqual(b"latest-" * 10, snapshot)
+            self.assertLessEqual(len(snapshot), 150)
+        finally:
+            self.manager.detach(session.id, queue)
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            self.manager.attach(session.id, max_snapshot_bytes=0)
+
+        session.chunks.clear()
+        session.buffer_size = 0
+        self.manager._append(session, b"oversized-restored-tmux-history")
+        snapshot, queue = self.manager.attach(session.id, max_snapshot_bytes=8)
+        try:
+            self.assertEqual(b"-history", snapshot)
+            self.assertEqual(8, len(snapshot))
+        finally:
+            self.manager.detach(session.id, queue)
 
     async def test_session_cleanup_never_signals_special_pids(self) -> None:
         with patch("app.terminal.subprocess.run") as process_scan, patch(

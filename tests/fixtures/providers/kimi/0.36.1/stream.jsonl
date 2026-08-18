@@ -1,0 +1,9 @@
+{"role":"meta","type":"system.version","version":"0.36.1"}
+{"role":"assistant","content":"FIXTURE_PRIVATE_KIMI_TEXT"}
+{"role":"meta","type":"session.resume_hint","message":"FIXTURE_PRIVATE_KIMI_RESUME"}
+{"role":"meta","type":"retry","attempt":2,"message":"FIXTURE_PRIVATE_KIMI_RETRY"}
+{"role":"assistant","content":null,"tool_calls":[{"id":"fixture-tool-ok","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"FIXTURE_PRIVATE_KIMI_COMMAND\"}"}}]}
+{"role":"tool","tool_call_id":"fixture-tool-ok","content":"FIXTURE_PRIVATE_KIMI_OUTPUT"}
+{"role":"assistant","content":null,"tool_calls":[{"id":"fixture-tool-failed","type":"function","function":{"name":"Read","arguments":"{\"path\":\"FIXTURE_PRIVATE_KIMI_PATH\"}"}}]}
+{"role":"tool","tool_call_id":"fixture-tool-failed","is_error":true,"content":"FIXTURE_PRIVATE_KIMI_ERROR"}
+{"role":"assistant","content":"FIXTURE_PRIVATE_KIMI_FINAL_TEXT"}

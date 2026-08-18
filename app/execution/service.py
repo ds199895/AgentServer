@@ -78,6 +78,7 @@ RUNTIME_EVENT_TYPES = frozenset(
         "span.ended",
         "artifact.published",
         "child_run.requested",
+        "child_run.observed",
         "child_run.linked",
         "run.succeeded",
         "run.failed",

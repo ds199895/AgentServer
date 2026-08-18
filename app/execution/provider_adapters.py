@@ -5,6 +5,7 @@ import hmac
 import math
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
@@ -49,11 +50,13 @@ _FAILURE_CODES = frozenset(
 )
 _TOOL_KIND_ALIASES = {
     "agent": "subagent",
+    "agentswarm": "subagent",
     "apply_patch": "file_change",
     "bash": "command_execution",
     "command": "command_execution",
     "command_execution": "command_execution",
     "edit": "file_change",
+    "fetchurl": "web_search",
     "file_change": "file_change",
     "glob": "file_read",
     "grep": "file_read",
@@ -69,6 +72,7 @@ _TOOL_KIND_ALIASES = {
     "write": "file_change",
 }
 _ARTIFACT_KINDS = frozenset({"file", "image", "log", "report"})
+_DELEGATION_PHASES = frozenset({"started", "completed", "failed", "cancelled"})
 _MEDIA_TYPE = re.compile(
     r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}$"
 )
@@ -84,6 +88,7 @@ _UNTYPED_EVENT_TYPES = frozenset(
         "span.updated",
         "span.ended",
         "child_run.requested",
+        "child_run.observed",
         "artifact.published",
         "run.succeeded",
         "run.failed",
@@ -155,6 +160,9 @@ def _provider_reference(
 
 def _tool_kind(value: object) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized.startswith("mcp__"):
+        # Kimi/Claude expose MCP tools as mcp__<server>__<tool>.
+        return "mcp_tool_call"
     return _TOOL_KIND_ALIASES.get(normalized, "other_tool")
 
 
@@ -288,7 +296,8 @@ def sanitize_runtime_payload(
             "span_id",
             reference_key=reference_key,
         )
-        assert span_id is not None
+        if span_id is None:
+            raise ValueError("provider span_id is required")
         result = {"span_id": span_id}
         if event_type == "span.updated":
             result.update(_progress_payload(payload))
@@ -306,7 +315,8 @@ def sanitize_runtime_payload(
             "delegation_id",
             reference_key=reference_key,
         )
-        assert delegation_id is not None
+        if delegation_id is None:
+            raise ValueError("provider delegation_id is required")
         return {
             "delegation_id": delegation_id,
             "agent_kind": _known_code(
@@ -316,6 +326,18 @@ def sanitize_runtime_payload(
                 default=provider_kind if provider_kind in _PROVIDER_KINDS else "generic",
             ),
             "title": "Observed provider delegation",
+        }
+    if event_type == "child_run.observed":
+        return {
+            "agent_kind": _known_code(
+                payload.get("agent_kind"),
+                "agent_kind",
+                _PROVIDER_KINDS,
+                default=provider_kind if provider_kind in _PROVIDER_KINDS else "generic",
+            ),
+            "phase": _known_code(
+                payload.get("phase"), "delegation phase", _DELEGATION_PHASES
+            ),
         }
     if event_type == "run.failed":
         return {
@@ -542,7 +564,8 @@ class CodexAdapter(ProviderAdapter):
             delegation_id = _provider_reference(
                 "delegation", event.get("agent_id"), "agent_id"
             )
-            assert delegation_id is not None
+            if delegation_id is None:
+                raise ValueError("Codex SubagentStart requires agent_id")
             agent_kind = str(event.get("agent_type") or "codex").strip().lower()
             if agent_kind not in _PROVIDER_KINDS:
                 agent_kind = "codex"
@@ -707,13 +730,695 @@ class CodexAdapter(ProviderAdapter):
 
 
 class ClaudeAdapter(ProviderAdapter):
+    """Normalize Claude Code CLI hook and ``--output-format stream-json`` events.
+
+    Hook payloads follow the documented ``hook_event_name`` stdin contract;
+    tool calls are keyed by ``tool_use_id``. ``claude -p --output-format
+    stream-json`` lines use the Messages-API envelope
+    (``system``/``assistant``/``user``/``result``); tool calls are keyed by
+    the ``tool_use``/``tool_result`` content block id. Prompt text, tool
+    input/output, assistant text and transcripts are dropped; only machine
+    identifiers are kept, and only as hashed transport references.
+    """
+
     kind = "claude"
-    capabilities = ProviderAdapter.capabilities | {"tool_events", "cancel"}
+    capabilities = ProviderAdapter.capabilities | {
+        "tool_events",
+        "delegation_observation",
+        "cancel",
+        "native_hooks",
+        "jsonl",
+    }
+
+    def normalize_many(
+        self, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        hook_name = str(event.get("hook_event_name") or "")
+        if hook_name:
+            return self._normalize_hook(hook_name, event)
+        event_type = str(event.get("type") or "")
+        if event_type:
+            return self._normalize_jsonl(event_type, event)
+        raise ValueError("unsupported Claude event")
+
+    def _normalize_hook(
+        self, hook_name: str, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        metadata: dict[str, Any] = {}
+        if hook_name == "SessionStart":
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.registered",
+                    {**metadata, "kind": self.kind, "source": "claude_hook"},
+                ),
+            )
+        if hook_name == "SessionEnd":
+            reason = str(event.get("reason") or "other").strip().lower()
+            if reason not in _STOP_REASONS:
+                reason = "other"
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.stopping",
+                    {**metadata, "reason": reason},
+                ),
+            )
+        if hook_name == "UserPromptSubmit":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "Notification":
+            # Permission/idle/elicitation pings duplicate the PreToolUse,
+            # PermissionRequest and Stop facts below; no lifecycle fact here.
+            return ()
+        if hook_name == "PermissionRequest":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "waiting",
+                        "wait_reason": "approval",
+                    },
+                ),
+            )
+        if hook_name == "PreToolUse":
+            raw_tool_name = str(event.get("tool_name") or "")
+            tool_name = _tool_kind(raw_tool_name)
+            tool_id = _provider_reference(
+                "tool", event.get("tool_use_id"), "tool_use_id"
+            )
+            activity = _tool_activity(raw_tool_name, event.get("tool_input"))
+            activity_payload: dict[str, Any] = {**metadata, "activity": activity}
+            if activity == "waiting":
+                # There is no canonical child Run yet; SubagentStart below is
+                # the durable delegation handshake input.
+                activity_payload["activity"] = "tooling"
+            values = [NormalizedRuntimeEvent("run.activity.changed", activity_payload)]
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.started",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "kind": "tool",
+                        },
+                    )
+                )
+            return tuple(values)
+        if hook_name in {"PostToolUse", "PostToolUseFailure"}:
+            tool_name = _tool_kind(event.get("tool_name"))
+            tool_id = _provider_reference(
+                "tool", event.get("tool_use_id"), "tool_use_id"
+            )
+            # PostToolUse only fires for a successful call and
+            # PostToolUseFailure only for a failed one, so the outcome is
+            # decided by the event name rather than free-text tool_output.
+            outcome = "succeeded" if hook_name == "PostToolUse" else "failed"
+            values: list[NormalizedRuntimeEvent] = []
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "outcome": outcome,
+                        },
+                    )
+                )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        if hook_name == "PermissionDenied":
+            # Auto mode declined the pending call; the span PreToolUse opened
+            # never runs, so close it instead of leaving it open forever.
+            tool_id = _provider_reference(
+                "tool", event.get("tool_use_id"), "tool_use_id"
+            )
+            values = []
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": _tool_kind(event.get("tool_name")),
+                            "outcome": "cancelled",
+                        },
+                    )
+                )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        if hook_name == "SubagentStart":
+            delegation_id = _provider_reference(
+                "delegation", event.get("agent_id"), "agent_id"
+            )
+            if delegation_id is None:
+                raise ValueError("Claude SubagentStart requires agent_id")
+            return (
+                NormalizedRuntimeEvent(
+                    "child_run.requested",
+                    {
+                        **metadata,
+                        "delegation_id": delegation_id,
+                        "agent_kind": self.kind,
+                        "title": "Observed Claude delegation",
+                    },
+                ),
+            )
+        if hook_name == "SubagentStop":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "PreCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "planning"},
+                ),
+            )
+        if hook_name == "PostCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "Stop":
+            # Stop is a turn boundary, not proof that the delegated Task has
+            # succeeded.  Keep result authority with explicit completion.
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "finalizing"},
+                ),
+            )
+        if hook_name == "StopFailure":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "finalizing",
+                        "provider_status": "failed",
+                        "code": "provider_error",
+                    },
+                ),
+            )
+        raise ValueError("unsupported Claude hook event")
+
+    def _normalize_jsonl(
+        self, event_type: str, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        metadata: dict[str, Any] = {}
+        if event_type == "system":
+            subtype = str(event.get("subtype") or "").strip().lower()
+            if subtype == "init":
+                return (
+                    NormalizedRuntimeEvent(
+                        "agent.registered",
+                        {**metadata, "kind": self.kind, "source": "claude_jsonl"},
+                    ),
+                )
+            if subtype == "compact_boundary":
+                return (
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed",
+                        {**metadata, "activity": "planning"},
+                    ),
+                )
+            # Other system announcements carry no lifecycle fact.
+            return ()
+        if event_type == "stream_event":
+            # Partial text/usage deltas duplicate the full assistant/user
+            # messages handled below; they add no new lifecycle fact.
+            return ()
+        if event_type == "assistant":
+            message = event.get("message")
+            if not isinstance(message, Mapping):
+                raise ValueError("Claude assistant event requires a message object")
+            content = message.get("content")
+            if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+                raise ValueError("Claude assistant message content must be a list")
+            tool_uses = [
+                block
+                for block in content
+                if isinstance(block, Mapping) and block.get("type") == "tool_use"
+            ]
+            if not tool_uses:
+                return (
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed",
+                        {**metadata, "activity": "thinking"},
+                    ),
+                )
+            values: list[NormalizedRuntimeEvent] = []
+            for block in tool_uses:
+                raw_name = str(block.get("name") or "")
+                activity = _tool_activity(raw_name, block.get("input"))
+                if activity == "waiting":
+                    activity = "tooling"
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed", {**metadata, "activity": activity}
+                    )
+                )
+                span_id = _provider_reference("tool", block.get("id"), "content.id")
+                if span_id:
+                    values.append(
+                        NormalizedRuntimeEvent(
+                            "span.started",
+                            {
+                                **metadata,
+                                "span_id": span_id,
+                                "name": _tool_kind(raw_name),
+                                "kind": "tool",
+                            },
+                        )
+                    )
+            return tuple(values)
+        if event_type == "user":
+            message = event.get("message")
+            if not isinstance(message, Mapping):
+                raise ValueError("Claude user event requires a message object")
+            content = message.get("content")
+            if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+                raise ValueError("Claude user message content must be a list")
+            tool_results = [
+                block
+                for block in content
+                if isinstance(block, Mapping) and block.get("type") == "tool_result"
+            ]
+            values = []
+            for block in tool_results:
+                # Tool result blocks carry no tool name; the span id
+                # correlates back to the assistant tool_use block.
+                span_id = _provider_reference(
+                    "tool", block.get("tool_use_id"), "content.tool_use_id"
+                )
+                if span_id:
+                    values.append(
+                        NormalizedRuntimeEvent(
+                            "span.ended",
+                            {
+                                **metadata,
+                                "span_id": span_id,
+                                "name": "other_tool",
+                                "outcome": "failed"
+                                if block.get("is_error")
+                                else "succeeded",
+                            },
+                        )
+                    )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        if event_type == "result":
+            # A Claude turn can belong to a provider subagent sharing the
+            # parent terminal.  It is not proof that the AgentServer Task
+            # succeeded.
+            is_error = bool(event.get("is_error"))
+            payload: dict[str, Any] = {
+                **metadata,
+                "activity": "finalizing",
+                "provider_status": "failed" if is_error else "completed",
+            }
+            if is_error:
+                payload["code"] = "provider_error"
+            return (NormalizedRuntimeEvent("run.activity.changed", payload),)
+        raise ValueError("unsupported Claude JSONL event")
 
 
 class KimiAdapter(ProviderAdapter):
+    """Normalize Kimi Code CLI hook and stream-json events.
+
+    Hook payloads follow the documented ``[[hooks]]`` stdin contract
+    (``hook_event_name`` plus event-specific fields; tool calls are keyed by
+    ``tool_call_id``).  ``kimi -p --output-format stream-json`` lines use the
+    documented ``role`` / ``tool_calls`` message shapes.  Prompt text, tool
+    input/output, error messages and subagent responses are dropped; only
+    machine identifiers are kept, and only as hashed transport references.
+    """
+
     kind = "kimi"
-    capabilities = ProviderAdapter.capabilities | {"tool_events", "cancel"}
+    capabilities = ProviderAdapter.capabilities | {
+        "tool_events",
+        "delegation_observation",
+        "cancel",
+        "native_hooks",
+        "jsonl",
+    }
+
+    def normalize_many(
+        self, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        hook_name = str(event.get("hook_event_name") or "")
+        if hook_name:
+            return self._normalize_hook(hook_name, event)
+        role = str(event.get("role") or "")
+        if role:
+            return self._normalize_jsonl(role, event)
+        raise ValueError("unsupported Kimi event")
+
+    def _normalize_hook(
+        self, hook_name: str, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        metadata: dict[str, Any] = {}
+        if hook_name == "SessionStart":
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.registered",
+                    {**metadata, "kind": self.kind, "source": "kimi_hook"},
+                ),
+            )
+        if hook_name == "SessionEnd":
+            reason = str(event.get("reason") or "other").strip().lower()
+            reason = {"exit": "shutdown", "archive": "other"}.get(reason, reason)
+            if reason not in _STOP_REASONS:
+                reason = "other"
+            return (
+                NormalizedRuntimeEvent(
+                    "agent.stopping",
+                    {**metadata, "reason": reason},
+                ),
+            )
+        if hook_name in {"UserPromptSubmit", "TurnStarted"}:
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name in {"UserPromptQueued", "SessionHeartbeat", "Notification"}:
+            # Pure observation pings: the run is busy or nothing changed, so
+            # there is no lifecycle fact worth a bridge request.
+            return ()
+        if hook_name == "PermissionRequest":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "waiting",
+                        "wait_reason": "approval",
+                    },
+                ),
+            )
+        if hook_name == "PermissionResult":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "PreToolUse":
+            raw_tool_name = str(event.get("tool_name") or "")
+            tool_name = _tool_kind(raw_tool_name)
+            tool_id = _provider_reference(
+                "tool",
+                event.get("tool_call_id") or event.get("tool_use_id"),
+                "tool_call_id",
+            )
+            activity = _tool_activity(raw_tool_name, event.get("tool_input"))
+            activity_payload: dict[str, Any] = {**metadata, "activity": activity}
+            if activity == "waiting":
+                # Subagent tools share the parent terminal; there is no
+                # canonical child Run yet, so do not report a waiting target.
+                activity_payload["activity"] = "tooling"
+            values = [NormalizedRuntimeEvent("run.activity.changed", activity_payload)]
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.started",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "kind": "tool",
+                        },
+                    )
+                )
+            return tuple(values)
+        if hook_name in {"PostToolUse", "PostToolUseFailure"}:
+            tool_name = _tool_kind(event.get("tool_name"))
+            tool_id = _provider_reference(
+                "tool",
+                event.get("tool_call_id") or event.get("tool_use_id"),
+                "tool_call_id",
+            )
+            # Kimi fires PostToolUse only after a successful tool call and
+            # PostToolUseFailure after a failed or blocked one, so the outcome
+            # is decided by the event name rather than free-text output.
+            outcome = "succeeded" if hook_name == "PostToolUse" else "failed"
+            values: list[NormalizedRuntimeEvent] = []
+            if tool_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": tool_id,
+                            "name": tool_name,
+                            "outcome": outcome,
+                        },
+                    )
+                )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        if hook_name == "SubagentStart":
+            # Kimi currently documents only agent_name, which is a profile name
+            # and can repeat concurrently. Never fabricate correlation from it.
+            delegation_id = _provider_reference(
+                "delegation",
+                event.get("agent_id") or event.get("task_id"),
+                "agent_id",
+            )
+            if delegation_id is None:
+                return (
+                    NormalizedRuntimeEvent(
+                        "child_run.observed",
+                        {
+                            **metadata,
+                            "agent_kind": "kimi",
+                            "phase": "started",
+                        },
+                    ),
+                )
+            return (
+                NormalizedRuntimeEvent(
+                    "child_run.requested",
+                    {
+                        **metadata,
+                        "delegation_id": delegation_id,
+                        "agent_kind": "kimi",
+                        "title": "Observed Kimi delegation",
+                    },
+                ),
+            )
+        if hook_name == "SubagentStop":
+            return (
+                NormalizedRuntimeEvent(
+                    "child_run.observed",
+                    {
+                        **metadata,
+                        "agent_kind": "kimi",
+                        "phase": "completed",
+                    },
+                ),
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "TaskStarted":
+            task_kind = str(
+                event.get("task_kind") or event.get("kind") or ""
+            ).strip().lower()
+            task_id = event.get("task_id")
+            delegation_id = _provider_reference(
+                "delegation",
+                str(task_id) if isinstance(task_id, (str, int)) else None,
+                "task_id",
+            )
+            if task_kind != "agent" or delegation_id is None:
+                # Background process/question tasks are not agent delegations.
+                return ()
+            return (
+                NormalizedRuntimeEvent(
+                    "child_run.requested",
+                    {
+                        **metadata,
+                        "delegation_id": delegation_id,
+                        "agent_kind": "kimi",
+                        "title": "Observed Kimi background agent",
+                    },
+                ),
+            )
+        if hook_name == "PreCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "planning"},
+                ),
+            )
+        if hook_name == "PostCompact":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                ),
+            )
+        if hook_name == "Stop":
+            # Stop is a turn boundary, not proof that the delegated Task has
+            # succeeded.  Keep result authority with explicit completion.
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "finalizing"},
+                ),
+            )
+        if hook_name == "StopFailure":
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "finalizing",
+                        "provider_status": "failed",
+                        "code": "provider_error",
+                    },
+                ),
+            )
+        if hook_name == "Interrupt":
+            # The user aborted the current turn; the AgentServer Task keeps its
+            # own cancel authority.
+            return (
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {
+                        **metadata,
+                        "activity": "finalizing",
+                        "provider_status": "cancelled",
+                    },
+                ),
+            )
+        raise ValueError("unsupported Kimi hook event")
+
+    def _normalize_jsonl(
+        self, role: str, event: Mapping[str, Any]
+    ) -> tuple[NormalizedRuntimeEvent, ...]:
+        metadata: dict[str, Any] = {}
+        if role == "meta":
+            if str(event.get("type") or "") == "system.version":
+                return (
+                    NormalizedRuntimeEvent(
+                        "agent.registered",
+                        {**metadata, "kind": self.kind, "source": "kimi_jsonl"},
+                    ),
+                )
+            # Other meta lines (resume hints, notices) carry no lifecycle fact.
+            return ()
+        if role == "assistant":
+            tool_calls = event.get("tool_calls")
+            if not tool_calls:
+                return (
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed",
+                        {**metadata, "activity": "thinking"},
+                    ),
+                )
+            if not isinstance(tool_calls, Sequence) or isinstance(
+                tool_calls, (str, bytes)
+            ):
+                raise ValueError("Kimi assistant tool_calls must be a list")
+            values: list[NormalizedRuntimeEvent] = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, Mapping):
+                    raise ValueError("Kimi assistant tool call must be an object")
+                function = tool_call.get("function") or {}
+                if not isinstance(function, Mapping):
+                    raise ValueError("Kimi assistant tool call requires a function")
+                raw_name = str(function.get("name") or "")
+                activity = _tool_activity(raw_name)
+                if activity == "waiting":
+                    activity = "tooling"
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "run.activity.changed", {**metadata, "activity": activity}
+                    )
+                )
+                span_id = _provider_reference(
+                    "tool", tool_call.get("id"), "tool_calls.id"
+                )
+                if span_id:
+                    values.append(
+                        NormalizedRuntimeEvent(
+                            "span.started",
+                            {
+                                **metadata,
+                                "span_id": span_id,
+                                "name": _tool_kind(raw_name),
+                                "kind": "tool",
+                            },
+                        )
+                    )
+            return tuple(values)
+        if role == "tool":
+            # Tool result messages carry no tool name; the span id correlates
+            # back to the assistant tool_calls entry.
+            span_id = _provider_reference(
+                "tool", event.get("tool_call_id"), "tool_call_id"
+            )
+            outcome = "failed" if event.get("is_error") else "succeeded"
+            values = []
+            if span_id:
+                values.append(
+                    NormalizedRuntimeEvent(
+                        "span.ended",
+                        {
+                            **metadata,
+                            "span_id": span_id,
+                            "name": "other_tool",
+                            "outcome": outcome,
+                        },
+                    )
+                )
+            values.append(
+                NormalizedRuntimeEvent(
+                    "run.activity.changed",
+                    {**metadata, "activity": "thinking"},
+                )
+            )
+            return tuple(values)
+        raise ValueError("unsupported Kimi JSONL event")
 
 
 ADAPTERS: dict[str, ProviderAdapter] = {

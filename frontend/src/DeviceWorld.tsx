@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUpRight, LayoutGrid, XIcon } from 'lucide-react'
 import type { Device, TerminalSession } from './api'
 import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type SceneModel, type TerminalExecutionVisual } from './pixel/scene'
+import { BubbleTracker, bubbleAlpha, bubblePop, drawBubble } from './pixel/bubbles'
 import { AGENT_OUTFITS, CHAR_DIMS, getAtlas, getCharacter, getScreen, makeFloorLabel, RACK_LEDS, STATUS_COLOR } from './pixel/sprites'
 import { DeviceIcon } from '@/components/device-bits'
 import { Eyebrow } from '@/components/Eyebrow'
@@ -13,6 +14,7 @@ import {
   activeRunForTerminal,
   evidenceFreshness,
   fieldEvidence,
+  isTerminalRun,
   runStatusLabel,
 } from '@/execution-state'
 import { cn } from '@/lib/utils'
@@ -87,8 +89,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
         activity: run?.activity ?? null,
         waitReason: run?.wait_reason ?? null,
         stale: run
-          ? run.stale === true
-            || evidenceFreshness(fieldEvidence(run, 'activity'), execution.freshness_now) === 'stale'
+          ? !isTerminalRun(run)
+            && (run.stale === true
+              || evidenceFreshness(fieldEvidence(run, 'activity'), execution.freshness_now) === 'stale')
           : agent?.stale === true,
         agentCwd: agent?.cwd || '',
         runLabel: run ? runStatusLabel(run, execution.freshness_now) : null,
@@ -128,6 +131,8 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   const activeSessionIdRef = useRef(activeSessionId)
   const hoveredRoomIdRef = useRef<string | null>(null)
   const hoveredSessionIdRef = useRef<string | null>(null)
+  // Survives canvas rebuilds so a bubble pops on state *changes*, not on load.
+  const bubbleTrackerRef = useRef(new BubbleTracker())
   useEffect(() => { busyIdRef.current = busyId }, [busyId])
   useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
   useEffect(() => { selectedSessionIdRef.current = selectedSessionId }, [selectedSessionId])
@@ -147,6 +152,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
 
   useEffect(() => {
     const host = hostRef.current
+    bubbleTrackerRef.current.prune(new Set(sessions.map((session) => session.id)))
     if (!host || !scene.rooms.length) return
 
     const atlas = getAtlas()
@@ -501,7 +507,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       }
     }
 
-    const drawRoom = (room: RoomModel, time: number, phase: number) => {
+    const drawRoom = (room: RoomModel, time: number, phase: number, wallTime: number) => {
       const { x, y } = room
       const layout = roomLayout(room)
       const lit = room.status !== 'offline'
@@ -633,6 +639,35 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           glow(markerX, markerY + 8, 13, '#77f2b4', alpha)
         }
         context.restore()
+        if (!compact) {
+          // Speech bubble: pops when a hook/reporter event moved this
+          // character's state; a pending wait stays pinned until resolved.
+          const bubbleState = {
+            lifecycle: char.lifecycle,
+            activity: char.activity,
+            waitReason: char.waitReason,
+            stale: char.stale,
+          }
+          const bubble = bubbleTrackerRef.current.track(char.sessionId, bubbleState, wallTime)
+          if (bubble) {
+            const alpha = bubbleAlpha(bubble, bubbleState, wallTime)
+            if (alpha > 0) {
+              drawBubble(
+                context,
+                x + char.x + (char.pose === 'sit' ? 9 : 8),
+                y + char.y - 1,
+                bubble,
+                alpha,
+                {
+                  unit: 1 / camera.scale,
+                  clampX0: x + WALL,
+                  clampX1: x + ROOM_W - WALL,
+                  pop: bubblePop(bubble, wallTime, reduceMotion),
+                },
+              )
+            }
+          }
+        }
         if (char.sessionId === activeSessionIdRef.current) {
           // pulsing ground ring under the character whose terminal tab is active
           const centerX = char.pose === 'sit' ? char.x + 9 : char.x + 8
@@ -724,7 +759,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       context.roundRect(PAD + 5, PAD + 7, scene.worldW - PAD * 2, scene.worldH - PAD * 2, 8)
       context.fill()
 
-      scene.rooms.forEach((room, index) => drawRoom(room, time, index * 1.37))
+      scene.rooms.forEach((room, index) => drawRoom(room, time, index * 1.37, now / 1000))
 
       const hovered = hoveredRoomIdRef.current ? scene.rooms.find((room) => room.device.id === hoveredRoomIdRef.current) : null
       if (hovered && hovered.device.id !== selectedIdRef.current) {
@@ -780,7 +815,13 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
     let onScreen = true
     const animate = (now: number) => {
       frame = window.requestAnimationFrame(animate)
-      if (minFrameInterval && now - lastDrawAt < minFrameInterval) return
+      const terminalInputFocused = compact
+        && document.activeElement instanceof Element
+        && document.activeElement.closest('.terminal-host') !== null
+      // Keep the overview live, but give keyboard echo and xterm rendering
+      // priority while a terminal owns focus.
+      const interval = terminalInputFocused ? 500 : minFrameInterval
+      if (interval && now - lastDrawAt < interval) return
       lastDrawAt = now
       drawFrame(now)
     }

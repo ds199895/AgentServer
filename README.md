@@ -74,8 +74,9 @@ Run 时间线、父子 Run 树、Linux 本地控制通道和浏览器断线重�
 它属于最近使用的终端。
 
 主动上报入口包括 [Reporter CLI](scripts/agentserver_report.py)、HTTP batch API 和
-[Device Bridge](scripts/agentserver_bridge.py)，Codex Hook/JSONL 可通过
-[Provider Hook](scripts/agentserver_provider_hook.py) 归一化。Reporter 可上报
+[Device Bridge](scripts/agentserver_bridge.py)，Codex、Claude Code 与 Kimi Code 的原生 Hook 可通过
+[Provider Hook](scripts/agentserver_provider_hook.py) 归一化，非交互 JSONL 则由
+[Provider Exec](scripts/agentserver_provider_exec.py) 透明转发。Reporter 可上报
 `thinking`、`coding`、`tooling`、`testing`、`waiting`、进度、Span、Artifact、完成与失败。
 详细运行方式、REST / WebSocket 契约、安全边界、配置和当前限制见
 [Agent Runtime v1 文档](docs/agent-runtime-framework.md)。
@@ -476,13 +477,13 @@ AgentServer 使用或受到以下开源项目启发，感谢所有维护者和�
 - [x] 提供 Run 时间线、父子 Run 树、终端精确绑定和 projection 驱动的状态动画。
 - [x] 提供 Linux 本地控制 Broker、Reporter CLI/API、离线 spool、短期 Token 轮换和
   带 Lease fence 的命令 ACK journal。
-- [x] 接入 Codex Hook/JSONL 原生事件，默认丢弃 prompt、命令参数、tool output 和 transcript。
+- [x] 接入 Codex、Claude、Kimi Hook/JSONL 原生事件和脱敏夹具，默认丢弃 prompt、命令参数、
+  tool output 和 transcript，并保留非交互 Provider 的 stdout 与退出码。
 - [x] 提供 CloudEvents、OpenTelemetry、A2A、MCP 的脱敏映射库，并强制显式 key/sink 边界。
 
 ### TODO
 
 - [ ] 为远端 Bridge 增加设备级 enrollment、长期凭据换取、自动安装/升级和 Windows 安全管道。
-- [ ] 完成 Claude、Kimi 原生事件 Adapter，并用真实 Provider 事件夹具持续回归。
 - [ ] 增加经过 tenant ACL、持久 pseudonym key 与背压保护的 OTel/CloudEvents/A2A/MCP exporter。
 - [ ] 需要横向扩展时迁移共享 EventStore / live transport；v1 会主动拒绝多个 API worker。
 - [ ] 支持自定义房间、工位、角色外观和场景主题。

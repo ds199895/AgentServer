@@ -82,7 +82,7 @@ AGENT_RECORD_MARKER = "__AGENTSERVER_AGENT__"
 AGENT_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("codex", ("openai codex", "codex-cli")),
     ("claude", ("claude code",)),
-    ("kimi", ("kimi cli", "kimi-cli")),
+    ("kimi", ("kimi code", "kimi cli", "kimi-cli")),
     # deepseek has no official CLI yet; the slot is reserved for its banner.
     ("deepseek", ()),
 )
@@ -2597,13 +2597,39 @@ class TerminalManager:
         elif attempt < 20:
             self.loop.call_later(0.05, self._reap_child, session, attempt + 1)
 
-    def attach(self, session_id: str) -> tuple[bytes, asyncio.Queue[bytes | StreamGap]]:
+    def attach(
+        self, session_id: str, *, max_snapshot_bytes: int | None = None
+    ) -> tuple[bytes, asyncio.Queue[bytes | StreamGap]]:
         session = self.sessions[session_id]
         if self.backend == "tmux" and session.active and session.fd < 0:
             self._spawn_tmux_client(session)
+        if max_snapshot_bytes is not None and max_snapshot_bytes <= 0:
+            raise ValueError("max_snapshot_bytes must be positive")
+        if max_snapshot_bytes is None:
+            snapshot = b"".join(session.chunks)
+        else:
+            # Prefer retained read chunks whole instead of introducing an extra
+            # byte-level cut in the bounded replay.
+            selected: list[bytes] = []
+            selected_bytes = 0
+            for chunk in reversed(session.chunks):
+                remaining = max_snapshot_bytes - selected_bytes
+                if remaining <= 0:
+                    break
+                if len(chunk) > remaining:
+                    # Normal PTY reads are capped at 64 KiB, but a restored tmux
+                    # capture can enter the buffer as one large chunk. Keep the
+                    # newest tail so the configured cold-replay limit remains a
+                    # hard bound even for that exceptional path.
+                    if not selected:
+                        selected.append(chunk[-remaining:])
+                    break
+                selected.append(chunk)
+                selected_bytes += len(chunk)
+            snapshot = b"".join(reversed(selected))
         queue: asyncio.Queue[bytes | StreamGap] = asyncio.Queue(maxsize=1024)
         session.subscribers.add(queue)
-        return b"".join(session.chunks), queue
+        return snapshot, queue
 
     def detach(self, session_id: str, queue: asyncio.Queue[bytes | StreamGap]) -> None:
         session = self.sessions.get(session_id)

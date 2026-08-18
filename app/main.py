@@ -120,6 +120,10 @@ DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 # Terminal scrollback replays are sliced to this size so a single attach cannot
 # hand the event loop a multi-megabyte frame in one go.
 SNAPSHOT_CHUNK_BYTES = 64 * 1024
+TERMINAL_SNAPSHOT_BYTES = max(
+    SNAPSHOT_CHUNK_BYTES,
+    int(os.getenv("TERMINAL_SNAPSHOT_BYTES", str(512 * 1024))),
+)
 # Session-state pushes are coalesced over this window so a burst of transitions
 # (a device reconnecting, several services going offline) sends one snapshot.
 SESSION_PUSH_DEBOUNCE_SECONDS = 0.25
@@ -2821,7 +2825,9 @@ async def terminal_socket(websocket: WebSocket, session_id: str) -> None:
         return
 
     await websocket.accept()
-    snapshot, queue = manager.attach(session_id)
+    snapshot, queue = manager.attach(
+        session_id, max_snapshot_bytes=TERMINAL_SNAPSHOT_BYTES
+    )
     # Scrollback can reach TERMINAL_SCROLLBACK_BYTES (2 MiB by default). Send it
     # in slices and yield between them so one attach cannot stall the event loop
     # — every other terminal's output is pumped from this same loop.

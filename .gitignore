@@ -19,3 +19,4 @@ frps.toml.backup.*
 *.key
 deploy/*.env
 design/
+.claude/worktrees/

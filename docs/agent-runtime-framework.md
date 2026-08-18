@@ -183,22 +183,120 @@ workspace-relative path、受限 kind/media type，不会自动上传文件内�
 
 ### Provider Hook
 
-`scripts/agentserver_provider_hook.py` 接受单个 hook JSON；`--jsonl` 会逐行消费持续的 Provider
-事件流。例如在受管 Terminal 内连接 Codex 非交互流：
+`scripts/agentserver_provider_hook.py` 接受 Provider 传入的单个 hook JSON；
+`scripts/agentserver_provider_exec.py` 则托管非交互 JSONL 命令，同时原样转发 stdout 并保留
+Provider 的退出码。例如在受管 Terminal 内运行 Codex：
 
 ```bash
-codex exec --json "任务" \
-  | ./.venv/bin/python scripts/agentserver_provider_hook.py --provider codex --jsonl
+./.venv/bin/python scripts/agentserver_provider_exec.py --provider codex -- \
+  codex exec --json "任务"
 ```
+
+不要把 Provider 直接管道到 `provider_hook.py --jsonl`：普通 shell 默认返回最后一个进程的退出码，
+还会让 observer 吞掉 Provider stdout。`provider_exec.py` 对每行遥测独立失败开放，超限或畸形行也
+会继续排空和透传；到达 EOF 时会关闭未完成 Span 并进入非权威的 `finalizing`。
 
 Codex Adapter 已映射 Session/Prompt、tool/span、阶段和 provider stop 事实。Provider 的 Stop 或
 `turn.completed` 只进入 `finalizing`，不会擅自把 Run 判为成功；最终结果仍需可信 Reporter 或
 AgentServer 控制面确认。内建 subagent 事件当前只作为 delegation observation 审计，不会伪造
 一个共享父 Terminal Lease 的 Child Run。
 
+Kimi Code 通过 `~/.kimi-code/config.toml` 的 `[[hooks]]` 接入同一个 Provider Hook（hook 命令的
+工作目录是 Kimi 会话的项目目录，下面假定在该仓库内运行）：
+
+```toml
+[[hooks]]
+event = "SessionStart"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "TurnStarted"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "PermissionRequest"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "PermissionResult"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "PreToolUse"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "PostToolUse"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "PostToolUseFailure"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "Stop"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "StopFailure"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "Interrupt"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+
+[[hooks]]
+event = "SessionEnd"
+command = "./.venv/bin/python scripts/agentserver_provider_hook.py --provider kimi"
+```
+
+需要委派和 compact 观测时，再按同一形式加入 `SubagentStart`、`SubagentStop`、`TaskStarted`、
+`PreCompact`、`PostCompact`；也可加入 `UserPromptSubmit`。`UserPromptQueued`、
+`SessionHeartbeat`、`Notification` 会被 Adapter 接收但不产生运行事件。Kimi 的退出码语义是 `2`
+表示阻断主流程，因此 Provider Hook 出错时一律以 `1` 失败开放（fail-open），遥测故障永远不会
+阻塞工具调用。
+
+非交互流同样支持 `kimi -p --output-format stream-json`：
+
+```bash
+./.venv/bin/python scripts/agentserver_provider_exec.py --provider kimi -- \
+  kimi -p "任务" --output-format stream-json
+```
+
+Kimi Adapter 映射 Session/Turn、tool/span（`tool_call_id` 只做哈希传输引用）、Permission
+等待、Subagent/Task 委派观测、Compact 阶段和 Stop/Interrupt 边界；`Stop` 与
+`session.resume_hint` 等 meta 行同样不会擅自判定 Run 结果。只有稳定 `agent_id`/`task_id` 的
+委派才产生可关联的 `child_run.requested`；仅有可重复 `agent_name` 时只记录不关联的
+`child_run.observed`。
+
+Claude Code 可在项目 `.claude/settings.json`（或对应的用户级 settings）中配置相同 Hook。下面是
+最小配置；`PostToolUseFailure`、`PermissionRequest`、`SubagentStart`、`SubagentStop`、
+`PreCompact`、`PostCompact`、`StopFailure`、`SessionEnd` 可按同一结构加入：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "./.venv/bin/python scripts/agentserver_provider_hook.py --provider claude"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "./.venv/bin/python scripts/agentserver_provider_hook.py --provider claude"}]}],
+    "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "./.venv/bin/python scripts/agentserver_provider_hook.py --provider claude"}]}],
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "./.venv/bin/python scripts/agentserver_provider_hook.py --provider claude"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "./.venv/bin/python scripts/agentserver_provider_hook.py --provider claude"}]}]
+  }
+}
+```
+
+Claude 非交互 stream-json 使用同一个透明 wrapper：
+
+```bash
+./.venv/bin/python scripts/agentserver_provider_exec.py --provider claude -- \
+  claude -p --verbose --output-format stream-json "任务"
+```
+
+Claude Adapter 映射 Messages API 的 `system`/`assistant`/`user`/`result` 行、tool use/result Span、
+compact 边界和原生 Hook；最终 `result` 同样只产生 `finalizing`，不越权决定 AgentServer Run 结果。
+
 Adapter 严格按事件类型重建 payload，只保留公开 machine code、阶段和数值进度；prompt、命令、
-tool input/output、assistant 文本和 transcript 不会进入 Execution 事件。Claude/Kimi 目前只有
-严格的 provider-neutral 归一化边界，原生事件映射仍待补充。
+tool input/output、assistant 文本和 transcript 不会进入 Execution 事件。
 
 ## 6. 本地 Broker 与远端 Bridge
 
@@ -359,7 +457,8 @@ git diff --check
   通过独立 UID/容器和稳定的系统级 Broker identity 隔离。
 - Bridge 不内置具体 Agent 的 cancel/input 副作用；adapter 必须提供以 `command_id` 幂等的 handler，
   或显式处理 `uncertain` 恢复。
-- Claude/Kimi 尚无经过真实 Provider 事件夹具验证的原生 Adapter；未知形状会失败关闭。
+- Provider Adapter 只兼容文档化并由脱敏夹具覆盖的事件形状；Provider 升级引入的未知形状会
+  单行失败开放并留下有限诊断，不会猜测字段语义或中断后续 JSONL。
 - Codex 内建 subagent 当前是审计 observation，不等同于跨设备 Child Run。跨设备委派必须先由
   AgentServer 控制面创建 Child Task / Assignment / Run。
 - 外部 OTel/CloudEvents/A2A/MCP exporter、设备级 enrollment 和多 API worker 横向扩展尚未实现。

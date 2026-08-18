@@ -180,6 +180,51 @@ class ExecutionControlBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("coding", run["state"]["activity"])
         self.assertEqual("adapter", run["evidence"]["activity"]["source"])
 
+    async def test_uncorrelated_child_observation_is_sanitized_and_persisted(self) -> None:
+        task = self.service.create_task(owner_id="alice", title="Observed delegation")
+        assigned = self.service.assign_task(
+            owner_id="alice",
+            task_id=task["id"],
+            terminal_id="terminal-1",
+            agent_kind="kimi",
+            expected_task_revision=task["revision"],
+        )
+        run_id = assigned["runs"][0]["id"]
+
+        result = self.broker.handle_request(
+            {
+                "action": "event",
+                "scope": self.scope(),
+                "event_type": "child_run.observed",
+                "adapter": "kimi",
+                "payload": {
+                    "agent_kind": "kimi",
+                    "phase": "started",
+                    "agent_name": "SECRET-REPEATED-PROFILE",
+                    "response": "SECRET-SUBAGENT-OUTPUT",
+                },
+            }
+        )
+
+        self.assertEqual("accepted", result["status"])
+        observations = [
+            event
+            for event in self.service.store.snapshot(owner_id="alice").events
+            if event.type == "child_run.observed"
+        ]
+        self.assertEqual(1, len(observations))
+        self.assertEqual(run_id, observations[0].scope.run_id)
+        self.assertEqual(
+            {"agent_kind": "kimi", "phase": "started"},
+            observations[0].payload,
+        )
+        serialized = json.dumps(observations[0].as_dict(), sort_keys=True)
+        self.assertNotIn("SECRET-REPEATED-PROFILE", serialized)
+        self.assertNotIn("SECRET-SUBAGENT-OUTPUT", serialized)
+        run = self.service.get_run(owner_id="alice", run_id=run_id)
+        self.assertEqual("running", run["state"]["lifecycle"])
+        self.assertEqual("unknown", run["state"]["activity"])
+
     async def test_control_ingress_rebuilds_schema_and_ignores_caller_event_id(self) -> None:
         task = self.service.create_task(owner_id="alice", title="Sanitized local work")
         self.service.assign_task(

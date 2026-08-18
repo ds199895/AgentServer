@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"turn.started","thread_id":"fixture-thread","turn_id":"fixture-turn"}
+{"type":"item.started","thread_id":"fixture-thread","turn_id":"fixture-turn","item":{"id":"fixture-command","type":"command_execution","status":"in_progress","command":"FIXTURE_PRIVATE_CODEX_COMMAND"}}
+{"type":"item.completed","thread_id":"fixture-thread","turn_id":"fixture-turn","item":{"id":"fixture-command","type":"command_execution","status":"completed","aggregated_output":"FIXTURE_PRIVATE_CODEX_OUTPUT"}}
+{"type":"turn.completed","thread_id":"fixture-thread","turn_id":"fixture-turn","usage":{"input_tokens":1,"output_tokens":1}}

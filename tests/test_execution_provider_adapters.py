@@ -15,11 +15,87 @@ from app.execution.provider_adapters import (
     ClaudeAdapter,
     CodexAdapter,
     KimiAdapter,
+    NormalizedRuntimeEvent,
     ProviderAdapter,
     sanitize_runtime_payload,
 )
-from app.execution.provider_hook import report_provider_event
+from app.execution.provider_hook import ProviderEventStream, report_provider_event
 from app.execution.service import ExecutionService
+
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "providers"
+
+
+class ProviderFixtureTests(unittest.TestCase):
+    def normalize_fixture(
+        self, provider: str, relative_path: str
+    ) -> list[NormalizedRuntimeEvent]:
+        stream = ProviderEventStream(provider)
+        events: list[NormalizedRuntimeEvent] = []
+        path = FIXTURE_ROOT / provider / relative_path
+        for line_number, encoded in enumerate(path.read_bytes().splitlines(), start=1):
+            with self.subTest(provider=provider, fixture=relative_path, line=line_number):
+                raw = json.loads(encoded)
+                events.extend(stream.normalize(raw))
+        events.extend(stream.finish())
+        return events
+
+    def assert_fixture_is_private(
+        self, events: list[NormalizedRuntimeEvent]
+    ) -> None:
+        serialized = json.dumps(
+            [
+                {"type": event.type, "payload": dict(event.payload)}
+                for event in events
+            ],
+            sort_keys=True,
+        )
+        self.assertNotIn("FIXTURE_PRIVATE_", serialized)
+
+    def test_documented_codex_stream_fixture(self) -> None:
+        events = self.normalize_fixture("codex", "documented/stream.jsonl")
+        self.assertEqual(
+            [
+                "agent.registered",
+                "run.activity.changed",
+                "run.activity.changed",
+                "span.started",
+                "span.ended",
+                "run.activity.changed",
+                "run.activity.changed",
+            ],
+            [event.type for event in events],
+        )
+        self.assertEqual("finalizing", events[-1].payload["activity"])
+        self.assert_fixture_is_private(events)
+
+    def test_documented_claude_stream_fixture(self) -> None:
+        events = self.normalize_fixture("claude", "documented/stream.jsonl")
+        self.assertEqual(2, sum(event.type == "span.started" for event in events))
+        ended = [event for event in events if event.type == "span.ended"]
+        self.assertEqual(
+            ["succeeded", "failed"],
+            [event.payload["outcome"] for event in ended],
+        )
+        self.assertEqual("finalizing", events[-1].payload["activity"])
+        self.assert_fixture_is_private(events)
+
+    def test_kimi_0361_stream_and_hook_fixtures(self) -> None:
+        stream_events = self.normalize_fixture("kimi", "0.36.1/stream.jsonl")
+        self.assertEqual(2, sum(event.type == "span.started" for event in stream_events))
+        ended = [event for event in stream_events if event.type == "span.ended"]
+        self.assertEqual(
+            ["succeeded", "failed"],
+            [event.payload["outcome"] for event in ended],
+        )
+        self.assertEqual("finalizing", stream_events[-1].payload["activity"])
+
+        hook_events = self.normalize_fixture("kimi", "0.36.1/hooks.jsonl")
+        self.assertIn("child_run.observed", [event.type for event in hook_events])
+        self.assertIn("child_run.requested", [event.type for event in hook_events])
+        observed = [event for event in hook_events if event.type == "child_run.observed"]
+        self.assertEqual(["started", "completed"], [event.payload["phase"] for event in observed])
+        self.assert_fixture_is_private(stream_events + hook_events)
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -148,7 +224,7 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual("finalizing", completed.payload["activity"])
 
     def test_untyped_provider_adapters_drop_prompt_command_and_nested_payloads(self) -> None:
-        for adapter in (ClaudeAdapter(), KimiAdapter(), ProviderAdapter()):
+        for adapter in (ProviderAdapter(),):
             with self.subTest(adapter=adapter.kind):
                 [event] = adapter.normalize_many(
                     {
@@ -164,7 +240,7 @@ class CodexAdapterTests(unittest.TestCase):
                 self.assertEqual({"activity": "coding"}, event.payload)
 
     def test_untyped_provider_adapters_reject_unknown_types_and_classifications(self) -> None:
-        for adapter in (ClaudeAdapter(), KimiAdapter(), ProviderAdapter()):
+        for adapter in (ProviderAdapter(),):
             with self.subTest(adapter=adapter.kind, case="event_type"):
                 with self.assertRaisesRegex(
                     ValueError, "unsupported untyped"
@@ -193,7 +269,7 @@ class CodexAdapterTests(unittest.TestCase):
                         adapter.normalize_many({"type": event_type, "payload": payload})
 
     def test_provider_tool_names_are_canonical_and_unknown_status_fails_closed(self) -> None:
-        [started] = ClaudeAdapter().normalize_many(
+        [started] = ProviderAdapter().normalize_many(
             {
                 "type": "span.started",
                 "payload": {
@@ -212,7 +288,9 @@ class CodexAdapterTests(unittest.TestCase):
             },
         )
         self.assertTrue(started.payload["span_id"].startswith("provider-span-"))
-        self.assertNotIn("span-1", str(started.payload))
+        self.assertNotIn(
+            "span-1", started.payload["span_id"].removeprefix("provider-span-")
+        )
 
         stopped = self.adapter.normalize_many(
             {
@@ -343,6 +421,642 @@ class CodexAdapterTests(unittest.TestCase):
                         {"type": "artifact.published", "payload": payload}
                     )
                 self.assertNotIn("secret_token_123", str(raised.exception))
+
+
+class KimiAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = KimiAdapter()
+
+    def test_session_hooks_do_not_copy_sensitive_text(self) -> None:
+        registered = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "session_top_secret",
+                "cwd": "/workspace",
+                "client_type": "kimi_code_cli",
+                "source": "startup",
+                "model": "kimi-code/k3",
+                "profile": "agent",
+            }
+        )
+        self.assertEqual("agent.registered", registered[0].type)
+        self.assertEqual(
+            {"kind": "kimi", "source": "kimi_hook"}, registered[0].payload
+        )
+        self.assertNotIn("session_top_secret", str(registered[0].payload))
+
+        stopping = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "exit"}
+        )[0]
+        self.assertEqual("agent.stopping", stopping.type)
+        self.assertEqual("shutdown", stopping.payload["reason"])
+        archived = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "archive"}
+        )[0]
+        self.assertEqual("other", archived.payload["reason"])
+        unknown = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "TOP_SECRET_STOP_REASON"}
+        )[0]
+        self.assertEqual("other", unknown.payload["reason"])
+        self.assertNotIn("TOP_SECRET", str(unknown.payload))
+
+    def test_prompt_and_turn_hooks_drop_prompt_text(self) -> None:
+        for hook_name in ("UserPromptSubmit", "TurnStarted"):
+            with self.subTest(hook_name=hook_name):
+                [event] = self.adapter.normalize_many(
+                    {
+                        "hook_event_name": hook_name,
+                        "prompt": "TOP-SECRET-PROMPT",
+                        "turn_id": 0,
+                        "origin_kind": "user",
+                    }
+                )
+                self.assertEqual("run.activity.changed", event.type)
+                self.assertEqual({"activity": "thinking"}, event.payload)
+
+        for hook_name in ("UserPromptQueued", "SessionHeartbeat", "Notification"):
+            with self.subTest(hook_name=hook_name):
+                self.assertEqual(
+                    (), self.adapter.normalize_many({"hook_event_name": hook_name})
+                )
+
+    def test_tool_hooks_create_sanitized_span_and_activity(self) -> None:
+        started = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_call_id": "tool_TOPSECRETID",
+                "tool_input": {"path": "secret.py"},
+            }
+        )
+        self.assertEqual(
+            ["run.activity.changed", "span.started"],
+            [event.type for event in started],
+        )
+        self.assertEqual("coding", started[0].payload["activity"])
+        self.assertEqual("file_change", started[1].payload["name"])
+        self.assertTrue(started[1].payload["span_id"].startswith("provider-tool-"))
+        self.assertNotIn("tool_TOPSECRETID", str(started[1].payload))
+        self.assertNotIn("tool_input", started[1].payload)
+
+        # The same raw tool_call_id must correlate start and end spans.
+        ended = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_call_id": "tool_TOPSECRETID",
+                "tool_input": {"path": "secret.py"},
+                "tool_output": "TOP-SECRET-OUTPUT",
+            }
+        )
+        self.assertEqual(
+            ["span.ended", "run.activity.changed"],
+            [event.type for event in ended],
+        )
+        self.assertEqual(started[1].payload["span_id"], ended[0].payload["span_id"])
+        self.assertEqual("succeeded", ended[0].payload["outcome"])
+        self.assertNotIn("TOP-SECRET-OUTPUT", str(ended[0].payload))
+
+        failed = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_call_id": "tool_other",
+                "error": {"code": "internal", "message": "TOP-SECRET-ERROR"},
+            }
+        )
+        self.assertEqual("span.ended", failed[0].type)
+        self.assertEqual("failed", failed[0].payload["outcome"])
+        self.assertNotIn("TOP-SECRET-ERROR", str(failed[0].payload))
+
+    def test_agent_tool_activity_is_downgraded_and_mcp_names_canonical(self) -> None:
+        [activity, span] = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_call_id": "tool_sub",
+                "tool_input": {"prompt": "TOP-SECRET-PROMPT"},
+            }
+        )
+        self.assertEqual("tooling", activity.payload["activity"])
+        self.assertEqual("subagent", span.payload["name"])
+
+        [_activity, mcp_span] = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__docs__search",
+                "tool_call_id": "tool_mcp",
+            }
+        )
+        self.assertEqual("mcp_tool_call", mcp_span.payload["name"])
+
+    def test_permission_compact_and_stop_hooks(self) -> None:
+        waiting = self.adapter.normalize_many(
+            {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
+        )[0]
+        self.assertEqual("waiting", waiting.payload["activity"])
+        self.assertEqual("approval", waiting.payload["wait_reason"])
+
+        resolved = self.adapter.normalize_many(
+            {"hook_event_name": "PermissionResult", "tool_name": "Bash"}
+        )[0]
+        self.assertEqual("thinking", resolved.payload["activity"])
+
+        compacting = self.adapter.normalize_many({"hook_event_name": "PreCompact"})[0]
+        self.assertEqual("planning", compacting.payload["activity"])
+        compacted = self.adapter.normalize_many({"hook_event_name": "PostCompact"})[0]
+        self.assertEqual("thinking", compacted.payload["activity"])
+
+        stopped = self.adapter.normalize_many(
+            {"hook_event_name": "Stop", "stop_hook_active": False}
+        )[0]
+        self.assertEqual("finalizing", stopped.payload["activity"])
+        self.assertNotIn("stop_hook_active", stopped.payload)
+
+        failed = self.adapter.normalize_many(
+            {"hook_event_name": "StopFailure", "error": "TOP-SECRET-ERROR"}
+        )[0]
+        self.assertEqual("finalizing", failed.payload["activity"])
+        self.assertEqual("failed", failed.payload["provider_status"])
+        self.assertNotIn("TOP-SECRET-ERROR", str(failed.payload))
+
+        interrupted = self.adapter.normalize_many(
+            {"hook_event_name": "Interrupt", "reason": "TOP-SECRET-REASON"}
+        )[0]
+        self.assertEqual("finalizing", interrupted.payload["activity"])
+        self.assertEqual("cancelled", interrupted.payload["provider_status"])
+        self.assertNotIn("TOP-SECRET-REASON", str(interrupted.payload))
+
+    def test_subagent_and_task_hooks_are_delegation_observations(self) -> None:
+        child = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SubagentStart",
+                "agent_name": "TOP-SECRET-AGENT-NAME".lower(),
+                "prompt": "TOP-SECRET-PROMPT",
+            }
+        )
+        self.assertEqual("child_run.observed", child[0].type)
+        self.assertEqual("started", child[0].payload["phase"])
+        self.assertEqual("kimi", child[0].payload["agent_kind"])
+        self.assertNotIn("top-secret-agent-name", str(child[0].payload))
+        self.assertNotIn("prompt", child[0].payload)
+        self.assertIn("delegation_observation", self.adapter.capabilities)
+
+        stopped = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SubagentStop",
+                "agent_name": "explore",
+                "response": "TOP-SECRET-RESPONSE",
+            }
+        )
+        self.assertEqual(
+            ["child_run.observed", "run.activity.changed"],
+            [event.type for event in stopped],
+        )
+        self.assertEqual("completed", stopped[0].payload["phase"])
+        self.assertEqual("thinking", stopped[1].payload["activity"])
+        self.assertNotIn("response", str(stopped))
+
+        correlated = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-unique-1",
+                "agent_name": "explore",
+            }
+        )
+        self.assertEqual("child_run.requested", correlated[0].type)
+        self.assertTrue(
+            correlated[0].payload["delegation_id"].startswith(
+                "provider-delegation-"
+            )
+        )
+
+        background = self.adapter.normalize_many(
+            {
+                "hook_event_name": "TaskStarted",
+                "task_id": "task-1",
+                "kind": "agent",
+                "description": "TOP-SECRET-DESCRIPTION",
+            }
+        )
+        self.assertEqual("child_run.requested", background[0].type)
+        self.assertNotIn("task-1", str(background[0].payload))
+        self.assertNotIn("description", background[0].payload)
+
+        for payload in (
+            {"hook_event_name": "TaskStarted", "task_id": "task-2", "kind": "process"},
+            {"hook_event_name": "TaskStarted", "kind": "agent"},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual((), self.adapter.normalize_many(payload))
+
+    def test_stream_json_shapes_map_to_lifecycle_and_tool_spans(self) -> None:
+        registered = self.adapter.normalize_many(
+            {"role": "meta", "type": "system.version", "version": "0.36.1"}
+        )
+        self.assertEqual("agent.registered", registered[0].type)
+        self.assertEqual(
+            {"kind": "kimi", "source": "kimi_jsonl"}, registered[0].payload
+        )
+
+        self.assertEqual(
+            (),
+            self.adapter.normalize_many(
+                {
+                    "role": "meta",
+                    "type": "session.resume_hint",
+                    "session_id": "session_TOPSECRET",
+                    "command": "kimi -r session_TOPSECRET",
+                }
+            ),
+        )
+
+        [thinking] = self.adapter.normalize_many(
+            {"role": "assistant", "content": "TOP-SECRET-ANSWER"}
+        )
+        self.assertEqual("thinking", thinking.payload["activity"])
+        self.assertNotIn("content", thinking.payload)
+
+        started = self.adapter.normalize_many(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "tool_TOPSECRETID",
+                        "function": {
+                            "name": "Bash",
+                            "arguments": '{"command":"TOP-SECRET-COMMAND"}',
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            ["run.activity.changed", "span.started"],
+            [event.type for event in started],
+        )
+        self.assertEqual("tooling", started[0].payload["activity"])
+        self.assertEqual("command_execution", started[1].payload["name"])
+        self.assertNotIn("tool_TOPSECRETID", str(started[1].payload))
+        self.assertNotIn("TOP-SECRET-COMMAND", str(started))
+
+        ended = self.adapter.normalize_many(
+            {
+                "role": "tool",
+                "tool_call_id": "tool_TOPSECRETID",
+                "content": "TOP-SECRET-OUTPUT",
+            }
+        )
+        self.assertEqual(
+            ["span.ended", "run.activity.changed"],
+            [event.type for event in ended],
+        )
+        self.assertEqual(started[1].payload["span_id"], ended[0].payload["span_id"])
+        self.assertEqual("succeeded", ended[0].payload["outcome"])
+
+        failed = self.adapter.normalize_many(
+            {"role": "tool", "tool_call_id": "tool_2", "is_error": True}
+        )
+        self.assertEqual("failed", failed[0].payload["outcome"])
+
+    def test_unknown_events_fail_closed_without_echoing_input(self) -> None:
+        for raw in (
+            {"hook_event_name": "TOP_SECRET_HOOK_NAME"},
+            {"role": "TOP_SECRET_ROLE"},
+            {"unexpected": "TOP_SECRET_SHAPE"},
+            {"role": "assistant", "tool_calls": "TOP_SECRET_TOOL_CALLS"},
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as raised:
+                    self.adapter.normalize_many(raw)
+                self.assertNotIn("TOP_SECRET", str(raised.exception))
+
+
+class ClaudeAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = ClaudeAdapter()
+
+    def test_session_hooks_do_not_copy_sensitive_text(self) -> None:
+        registered = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "session_top_secret",
+                "cwd": "/workspace",
+                "transcript_path": "/secret/transcript.jsonl",
+                "source": "startup",
+            }
+        )
+        self.assertEqual("agent.registered", registered[0].type)
+        self.assertEqual(
+            {"kind": "claude", "source": "claude_hook"}, registered[0].payload
+        )
+        self.assertNotIn("session_top_secret", str(registered[0].payload))
+
+        stopping = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "prompt_input_exit"}
+        )[0]
+        self.assertEqual("agent.stopping", stopping.type)
+        self.assertEqual("prompt_input_exit", stopping.payload["reason"])
+        resumed = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "resume"}
+        )[0]
+        self.assertEqual("other", resumed.payload["reason"])
+        unknown = self.adapter.normalize_many(
+            {"hook_event_name": "SessionEnd", "reason": "TOP_SECRET_STOP_REASON"}
+        )[0]
+        self.assertEqual("other", unknown.payload["reason"])
+        self.assertNotIn("TOP_SECRET", str(unknown.payload))
+
+    def test_prompt_and_notification_hooks(self) -> None:
+        [event] = self.adapter.normalize_many(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "TOP-SECRET-PROMPT",
+                "prompt_id": "prompt-1",
+            }
+        )
+        self.assertEqual("run.activity.changed", event.type)
+        self.assertEqual({"activity": "thinking"}, event.payload)
+
+        self.assertEqual(
+            (),
+            self.adapter.normalize_many(
+                {
+                    "hook_event_name": "Notification",
+                    "notification_type": "idle_prompt",
+                    "message": "TOP-SECRET-MESSAGE",
+                }
+            ),
+        )
+
+    def test_tool_hooks_create_sanitized_span_and_activity(self) -> None:
+        started = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_use_id": "toolu_TOPSECRETID",
+                "tool_input": {"file_path": "secret.py"},
+            }
+        )
+        self.assertEqual(
+            ["run.activity.changed", "span.started"],
+            [event.type for event in started],
+        )
+        self.assertEqual("coding", started[0].payload["activity"])
+        self.assertEqual("file_change", started[1].payload["name"])
+        self.assertTrue(started[1].payload["span_id"].startswith("provider-tool-"))
+        self.assertNotIn("toolu_TOPSECRETID", str(started[1].payload))
+        self.assertNotIn("tool_input", started[1].payload)
+
+        # The same raw tool_use_id must correlate start and end spans.
+        ended = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_use_id": "toolu_TOPSECRETID",
+                "tool_output": "TOP-SECRET-OUTPUT",
+            }
+        )
+        self.assertEqual(
+            ["span.ended", "run.activity.changed"],
+            [event.type for event in ended],
+        )
+        self.assertEqual(started[1].payload["span_id"], ended[0].payload["span_id"])
+        self.assertEqual("succeeded", ended[0].payload["outcome"])
+        self.assertNotIn("TOP-SECRET-OUTPUT", str(ended[0].payload))
+
+        failed = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_other",
+                "tool_error": "TOP-SECRET-ERROR",
+            }
+        )
+        self.assertEqual("span.ended", failed[0].type)
+        self.assertEqual("failed", failed[0].payload["outcome"])
+        self.assertNotIn("TOP-SECRET-ERROR", str(failed[0].payload))
+
+    def test_agent_tool_activity_is_downgraded_and_mcp_names_canonical(self) -> None:
+        [activity, span] = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Task",
+                "tool_use_id": "toolu_sub",
+                "tool_input": {"prompt": "TOP-SECRET-PROMPT"},
+            }
+        )
+        self.assertEqual("tooling", activity.payload["activity"])
+        self.assertEqual("subagent", span.payload["name"])
+
+        [_activity, mcp_span] = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__docs__search",
+                "tool_use_id": "toolu_mcp",
+            }
+        )
+        self.assertEqual("mcp_tool_call", mcp_span.payload["name"])
+
+    def test_permission_denied_closes_the_open_span(self) -> None:
+        waiting = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_perm",
+            }
+        )[0]
+        self.assertEqual("waiting", waiting.payload["activity"])
+        self.assertEqual("approval", waiting.payload["wait_reason"])
+
+        denied = self.adapter.normalize_many(
+            {
+                "hook_event_name": "PermissionDenied",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_perm",
+                "tool_input": {"command": "TOP-SECRET-COMMAND"},
+            }
+        )
+        self.assertEqual(
+            ["span.ended", "run.activity.changed"],
+            [event.type for event in denied],
+        )
+        self.assertEqual("cancelled", denied[0].payload["outcome"])
+        self.assertEqual("thinking", denied[1].payload["activity"])
+        self.assertNotIn("TOP-SECRET-COMMAND", str(denied))
+
+    def test_compact_and_stop_hooks(self) -> None:
+        compacting = self.adapter.normalize_many({"hook_event_name": "PreCompact"})[0]
+        self.assertEqual("planning", compacting.payload["activity"])
+        compacted = self.adapter.normalize_many({"hook_event_name": "PostCompact"})[0]
+        self.assertEqual("thinking", compacted.payload["activity"])
+
+        stopped = self.adapter.normalize_many(
+            {"hook_event_name": "Stop", "last_assistant_message": "TOP-SECRET"}
+        )[0]
+        self.assertEqual("finalizing", stopped.payload["activity"])
+        self.assertNotIn("TOP-SECRET", str(stopped.payload))
+
+        failed = self.adapter.normalize_many(
+            {"hook_event_name": "StopFailure", "error_type": "rate_limit"}
+        )[0]
+        self.assertEqual("finalizing", failed.payload["activity"])
+        self.assertEqual("failed", failed.payload["provider_status"])
+
+    def test_subagent_hooks_are_delegation_observations(self) -> None:
+        child = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SubagentStart",
+                "agent_id": "TOP-SECRET-AGENT-ID",
+                "agent_type": "general-purpose",
+            }
+        )
+        self.assertEqual("child_run.requested", child[0].type)
+        self.assertTrue(
+            child[0].payload["delegation_id"].startswith("provider-delegation-")
+        )
+        self.assertEqual("claude", child[0].payload["agent_kind"])
+        self.assertNotIn("TOP-SECRET-AGENT-ID", str(child[0].payload))
+        self.assertIn("delegation_observation", self.adapter.capabilities)
+
+        stopped = self.adapter.normalize_many(
+            {
+                "hook_event_name": "SubagentStop",
+                "agent_id": "TOP-SECRET-AGENT-ID",
+                "agent_type": "general-purpose",
+                "last_assistant_message": "TOP-SECRET-RESPONSE",
+            }
+        )[0]
+        self.assertEqual("thinking", stopped.payload["activity"])
+        self.assertNotIn("TOP-SECRET-RESPONSE", str(stopped.payload))
+
+    def test_stream_json_shapes_map_to_lifecycle_and_tool_spans(self) -> None:
+        registered = self.adapter.normalize_many(
+            {"type": "system", "subtype": "init", "session_id": "session_TOPSECRET"}
+        )
+        self.assertEqual("agent.registered", registered[0].type)
+        self.assertEqual(
+            {"kind": "claude", "source": "claude_jsonl"}, registered[0].payload
+        )
+        self.assertNotIn("session_TOPSECRET", str(registered[0].payload))
+
+        compacting = self.adapter.normalize_many(
+            {"type": "system", "subtype": "compact_boundary"}
+        )[0]
+        self.assertEqual("planning", compacting.payload["activity"])
+
+        self.assertEqual(
+            (), self.adapter.normalize_many({"type": "system", "subtype": "mcp_status"})
+        )
+        self.assertEqual(
+            (),
+            self.adapter.normalize_many(
+                {"type": "stream_event", "event": {"type": "text_delta"}}
+            ),
+        )
+
+        [thinking] = self.adapter.normalize_many(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "TOP-SECRET-ANSWER"}],
+                },
+            }
+        )
+        self.assertEqual("thinking", thinking.payload["activity"])
+        self.assertNotIn("TOP-SECRET-ANSWER", str(thinking.payload))
+
+        started = self.adapter.normalize_many(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_TOPSECRETID",
+                            "name": "Bash",
+                            "input": {"command": "TOP-SECRET-COMMAND"},
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(
+            ["run.activity.changed", "span.started"],
+            [event.type for event in started],
+        )
+        self.assertEqual("tooling", started[0].payload["activity"])
+        self.assertEqual("command_execution", started[1].payload["name"])
+        self.assertNotIn("toolu_TOPSECRETID", str(started[1].payload))
+        self.assertNotIn("TOP-SECRET-COMMAND", str(started))
+
+        ended = self.adapter.normalize_many(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_TOPSECRETID",
+                            "content": "TOP-SECRET-OUTPUT",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(
+            ["span.ended", "run.activity.changed"],
+            [event.type for event in ended],
+        )
+        self.assertEqual(started[1].payload["span_id"], ended[0].payload["span_id"])
+        self.assertEqual("succeeded", ended[0].payload["outcome"])
+        self.assertNotIn("TOP-SECRET-OUTPUT", str(ended[0].payload))
+
+        failed = self.adapter.normalize_many(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual("failed", failed[0].payload["outcome"])
+
+        completed = self.adapter.normalize_many(
+            {"type": "result", "subtype": "success", "result": "TOP-SECRET-RESULT"}
+        )[0]
+        self.assertEqual("finalizing", completed.payload["activity"])
+        self.assertEqual("completed", completed.payload["provider_status"])
+        self.assertNotIn("TOP-SECRET-RESULT", str(completed.payload))
+
+        result_failed = self.adapter.normalize_many(
+            {"type": "result", "subtype": "error_during_execution", "is_error": True}
+        )[0]
+        self.assertEqual("failed", result_failed.payload["provider_status"])
+
+    def test_unknown_events_fail_closed_without_echoing_input(self) -> None:
+        for raw in (
+            {"hook_event_name": "TOP_SECRET_HOOK_NAME"},
+            {"type": "TOP_SECRET_JSONL_EVENT"},
+            {"unexpected": "TOP_SECRET_SHAPE"},
+            {"type": "assistant", "message": {"content": "TOP_SECRET_CONTENT"}},
+            {"type": "user", "message": {"content": "TOP_SECRET_CONTENT"}},
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as raised:
+                    self.adapter.normalize_many(raw)
+                self.assertNotIn("TOP_SECRET", str(raised.exception))
 
 
 class ProviderHookTests(unittest.TestCase):

@@ -19,10 +19,13 @@ import {
   type VirtualModifier,
   type VirtualModifierState,
 } from '@/terminal-virtual-keyboard'
+import { isSnapshotProtocolReply, RecoveryInputBuffer } from '@/terminal-stream'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
 const textEncoder = new TextEncoder()
+
+type RestoreOptions = { rebuildAtlas?: boolean }
 
 type TerminalContextMenu = {
   x: number
@@ -103,13 +106,14 @@ export default function TerminalPane({
   const visibleRef = useRef(visible)
   const focusedRef = useRef(focused)
   const virtualKeyboardOpenRef = useRef(false)
-  const restoreRef = useRef<(() => void) | null>(null)
+  const restoreRef = useRef<((options?: RestoreOptions) => void) | null>(null)
   const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const noticeTimerRef = useRef<number | undefined>(undefined)
   const [connection, setConnection] = useState<'connecting' | 'online' | 'offline'>(
     'connecting',
   )
+  const [recovering, setRecovering] = useState(true)
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null)
   const [pastePanelOpen, setPastePanelOpen] = useState(false)
   const [virtualKeyboardOpen, setVirtualKeyboardOpen] = useState(false)
@@ -137,11 +141,13 @@ export default function TerminalPane({
   const agentName = agentKind ? (AGENT_OUTFITS[agentKind]?.name ?? agentKind) : null
   const connectionLabel = !session.active
     ? '进程已退出'
-    : connection === 'online'
-    ? '已连接'
-    : connection === 'connecting'
-      ? '正在连接'
-      : '连接已断开，正在重试'
+    : connection === 'online' && recovering
+      ? '正在恢复终端'
+      : connection === 'online'
+        ? '已连接'
+        : connection === 'connecting'
+          ? '正在连接'
+          : '连接已断开，正在重试'
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -267,7 +273,9 @@ export default function TerminalPane({
     // back to the DOM renderer on its own.
     let webglAddon: WebglAddon | null = null
     try {
-      const addon = new WebglAddon()
+      // Hidden tabs keep their canvas. Preserving its drawing buffer avoids a
+      // blank first frame when Chromium discards an occluded WebGL surface.
+      const addon = new WebglAddon(true)
       addon.onContextLoss(() => {
         addon.dispose()
         if (webglAddon === addon) webglAddon = null
@@ -329,8 +337,11 @@ export default function TerminalPane({
     let disposed = false
     let hasConnected = false
     let replayingSnapshot = true
+    const recoveryInput = new RecoveryInputBuffer()
+    let recoveryOverflowReported = false
     let restoreFrame: number | undefined
     let refreshFrame: number | undefined
+    let resizeFrame: number | undefined
 
     const sendSize = () => {
       if (socket?.readyState === WebSocket.OPEN) {
@@ -348,20 +359,20 @@ export default function TerminalPane({
       }
     }
 
-    const restore = ({ rebuildAtlas = false } = {}) => {
+    const restore = ({ rebuildAtlas = false }: RestoreOptions = {}) => {
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
       restoreFrame = window.requestAnimationFrame(() => {
         fit()
         refreshFrame = window.requestAnimationFrame(() => {
           if (!visibleRef.current || disposed) return
-          // The WebGL texture atlas can come back corrupt after the OS resumes
-          // from sleep (Chromium/Nvidia), so rebuild it on the page-return path
-          // only. Doing it on every focus/visibility toggle would repaint every
-          // row twice for no benefit, and it is a plain no-op under the DOM
-          // renderer we fall back to.
+          // The WebGL texture atlas can become invalid while Chromium occludes
+          // a hidden tab or after the OS resumes from sleep. Rebuild it only at
+          // those explicit recovery boundaries.
+          // clearTextureAtlas already requests a full refresh in xterm. Calling
+          // refresh as well would enqueue a second full-viewport paint.
           if (rebuildAtlas) terminal.clearTextureAtlas()
-          terminal.refresh(0, terminal.rows - 1)
+          else terminal.refresh(0, terminal.rows - 1)
           // ResizeObserver、WS onopen 和 visibilitychange 都可能在用户已经
           // 聚焦分隔条/按钮后触发。只允许当前 pane 在页面没有交互焦点，或
           // 焦点本来就在自己的 xterm 内时恢复焦点，避免键盘操作被异步抢走。
@@ -379,6 +390,15 @@ export default function TerminalPane({
     }
     restoreRef.current = restore
 
+    const sendInput = (data: Uint8Array<ArrayBuffer>) => {
+      if (socket?.readyState === WebSocket.OPEN) socket.send(data)
+    }
+
+    const flushRecoveryInput = () => {
+      for (const data of recoveryInput.drain()) sendInput(data)
+      recoveryOverflowReported = false
+    }
+
     const connect = () => {
       if (disposed) return
       setConnection('connecting')
@@ -388,6 +408,8 @@ export default function TerminalPane({
       socket.onopen = () => {
         reconnectAttempt = 0
         replayingSnapshot = true
+        recoveryOverflowReported = false
+        setRecovering(true)
         if (hasConnected) {
           terminal.reset()
           terminal.clear()
@@ -402,6 +424,9 @@ export default function TerminalPane({
           // received before this marker have finished parsing.
           terminal.write('', () => {
             replayingSnapshot = false
+            setRecovering(false)
+            flushRecoveryInput()
+            restore({ rebuildAtlas: true })
           })
           return
         }
@@ -414,7 +439,9 @@ export default function TerminalPane({
         }
       }
       socket.onclose = (event) => {
+        replayingSnapshot = true
         setConnection('offline')
+        setRecovering(true)
         if (disposed || event.code === 4401 || event.code === 4404) return
         const delay = Math.min(750 * 2 ** reconnectAttempt, 8000)
         reconnectAttempt += 1
@@ -424,9 +451,15 @@ export default function TerminalPane({
     }
 
     const input = terminal.onData((data) => {
-      if (!replayingSnapshot && socket?.readyState === WebSocket.OPEN) {
-        socket.send(textEncoder.encode(data))
+      if (replayingSnapshot) {
+        if (isSnapshotProtocolReply(data)) return
+        if (!recoveryInput.push(data) && !recoveryOverflowReported) {
+          recoveryOverflowReported = true
+          showNotice('终端恢复期间输入过多，已停止继续缓存')
+        }
+        return
       }
+      sendInput(textEncoder.encode(data))
     })
     const host = hostRef.current
     const onContextMenu = (event: MouseEvent) => {
@@ -531,13 +564,28 @@ export default function TerminalPane({
     host.addEventListener('touchcancel', onTouchEnd)
     document.addEventListener('pointerdown', closeContextMenu)
     document.addEventListener('keydown', closeContextMenuOnEscape)
-    const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fit))
+    const resizeObserver = new ResizeObserver(() => {
+      window.cancelAnimationFrame(resizeFrame ?? 0)
+      resizeFrame = window.requestAnimationFrame(() => {
+        if (visibleRef.current) restore()
+      })
+    })
+    // xterm has its own IntersectionObserver and pauses rendering while a tab
+    // uses display:none. Register after terminal.open(), so this callback runs
+    // after xterm observes the reveal and schedules a reliable recovery paint.
+    const revealObserver = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1]
+      if (entry?.isIntersecting && visibleRef.current) {
+        restore({ rebuildAtlas: true })
+      }
+    })
     const restoreWhenPageReturns = () => {
       if (document.visibilityState === 'visible' && visibleRef.current) {
         restore({ rebuildAtlas: true })
       }
     }
     resizeObserver.observe(hostRef.current)
+    revealObserver.observe(hostRef.current)
     document.addEventListener('visibilitychange', restoreWhenPageReturns)
     window.addEventListener('focus', restoreWhenPageReturns)
     window.addEventListener('pageshow', restoreWhenPageReturns)
@@ -549,7 +597,9 @@ export default function TerminalPane({
       window.clearTimeout(noticeTimerRef.current)
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
+      window.cancelAnimationFrame(resizeFrame ?? 0)
       resizeObserver.disconnect()
+      revealObserver.disconnect()
       stopMomentum()
       scrollListener.dispose()
       stopMomentumRef.current = null
@@ -564,6 +614,7 @@ export default function TerminalPane({
       window.removeEventListener('focus', restoreWhenPageReturns)
       window.removeEventListener('pageshow', restoreWhenPageReturns)
       input.dispose()
+      recoveryInput.clear()
       socket?.close(1000)
       restoreRef.current = null
       terminalRef.current = null
@@ -579,7 +630,7 @@ export default function TerminalPane({
     visibleRef.current = visible
     focusedRef.current = focused
     if (visible) {
-      restoreRef.current?.()
+      restoreRef.current?.({ rebuildAtlas: true })
     } else {
       setContextMenu(null)
       setPastePanelOpen(false)
@@ -594,7 +645,7 @@ export default function TerminalPane({
     <div className={cn(
       'absolute inset-0 min-h-0 min-w-0 grid-rows-[30px_minmax(0,1fr)] max-md:grid-rows-[28px_minmax(0,1fr)]',
       visible ? 'grid' : 'hidden',
-    )}>
+    )} data-terminal-recovering={recovering ? 'true' : 'false'}>
       <header
         aria-label={`${deviceLabel} ${terminalLabel} 终端信息`}
         className={cn(
