@@ -141,7 +141,7 @@ class ExecutionStore:
         *,
         max_subscription_queue: int = 1024,
         max_parent_depth: int = 16,
-        subscription_poll_interval: float = 0.05,
+        subscription_poll_interval: float = 0.25,
         subscription_poll_limit: int = 256,
     ) -> None:
         if max_subscription_queue < 1:
@@ -1234,7 +1234,13 @@ class ExecutionStore:
                 latest_sequence=max(subscription._pending_events),
             )
             return
-        self._wake_subscription_poller(subscription._loop)
+        # A contiguous in-process publish has already advanced this subscriber
+        # and needs no SQLite round trip. Wake immediately only when a sequence
+        # gap proves that another Store/process committed an event in between;
+        # otherwise the low-rate fallback poll is sufficient for cross-process
+        # commits that have no local notification path.
+        if subscription._pending_events:
+            self._wake_subscription_poller(subscription._loop)
 
     def _apply_polled_events(
         self,

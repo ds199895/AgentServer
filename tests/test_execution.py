@@ -445,6 +445,34 @@ class SnapshotAndSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second._poll_task.done())
         self.assertEqual({}, self.store._subscription_pollers)
 
+    async def test_contiguous_local_publish_does_not_requery_sqlite(self) -> None:
+        store = ExecutionStore(
+            Path(self.directory.name) / "local-publish.db",
+            subscription_poll_interval=0.25,
+        )
+        query_count = 0
+        original_query = store._subscription_events_after
+
+        def counted_query(after_sequence: int, limit: int):
+            nonlocal query_count
+            query_count += 1
+            return original_query(after_sequence, limit)
+
+        store._subscription_events_after = counted_query  # type: ignore[method-assign]
+        subscription = store.subscribe(owner_id="alice")
+        while query_count == 0:
+            await asyncio.sleep(0.01)
+        baseline = query_count
+
+        expected = store.append(
+            event("observation.process.started", 1, payload={"pid": 1})
+        ).event
+        self.assertEqual(expected, await asyncio.wait_for(anext(subscription), 1))
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(baseline, query_count)
+        await subscription.aclose()
+
     async def test_owner_filter_and_cursor_replay(self) -> None:
         first = self.store.append(event("observation.process.started", 1)).event
         self.store.append(
