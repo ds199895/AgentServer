@@ -55,7 +55,7 @@ export type AgentSession = {
   cwd: string
   permission_mode: string
   model: string | null
-  state: 'starting' | 'ready' | 'running' | 'waiting' | 'stopping' | 'stopped' | 'failed'
+  state: 'starting' | 'ready' | 'running' | 'waiting' | 'disconnected' | 'stopping' | 'stopped' | 'failed'
   session_kind: 'agent'
   created_at: number
   updated_at: number
@@ -63,6 +63,13 @@ export type AgentSession = {
   last_error: string | null
   resume_cursor?: Record<string, unknown> | null
   sequence: number
+  executor_id: string
+  bridge_instance_id: string
+  transport: string
+  device_generation: number
+  platform: Record<string, unknown>
+  capabilities: Record<string, unknown>
+  connector_sequence: number
   messages: AgentMessage[]
   activities: AgentActivity[]
   requests: AgentRequest[]

@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 
 SessionState = Literal[
-    "starting", "ready", "running", "waiting", "stopping", "stopped", "failed"
+    "starting", "ready", "running", "waiting", "disconnected", "stopping", "stopped", "failed"
 ]
 TurnState = Literal["queued", "running", "completed", "failed", "interrupted"]
 MessageRole = Literal["user", "assistant", "system", "reasoning"]
@@ -102,6 +102,13 @@ class AgentSession:
     last_error: str | None = None
     resume_cursor: dict[str, Any] | None = None
     sequence: int = 0
+    executor_id: str = ""
+    bridge_instance_id: str = ""
+    transport: str = ""
+    device_generation: int = 0
+    platform: dict[str, Any] = field(default_factory=dict)
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    connector_sequence: int = 0
     messages: list[AgentMessage] = field(default_factory=list)
     activities: list[AgentActivity] = field(default_factory=list)
     requests: list[AgentRequest] = field(default_factory=list)
@@ -128,6 +135,13 @@ class AgentSession:
             "last_error": self.last_error,
             "resume_cursor": self.resume_cursor,
             "sequence": self.sequence,
+            "executor_id": self.executor_id,
+            "bridge_instance_id": self.bridge_instance_id,
+            "transport": self.transport,
+            "device_generation": self.device_generation,
+            "platform": self.platform,
+            "capabilities": self.capabilities,
+            "connector_sequence": self.connector_sequence,
         }
         if include_history:
             result.update(
@@ -147,6 +161,7 @@ class AgentSession:
             model=value.get("model"), state=value.get("state") or "starting",
             created_at=float(value.get("created_at") or 0), updated_at=float(value.get("updated_at") or 0),
             active_turn_id=value.get("active_turn_id"), last_error=value.get("last_error"), resume_cursor=value.get("resume_cursor"), sequence=int(value.get("sequence") or 0),
+            executor_id=str(value.get("executor_id") or ""), bridge_instance_id=str(value.get("bridge_instance_id") or ""), transport=str(value.get("transport") or ""), device_generation=int(value.get("device_generation") or 0), platform=dict(value.get("platform") or {}), capabilities=dict(value.get("capabilities") or {}), connector_sequence=int(value.get("connector_sequence") or 0),
         )
         session.messages = [AgentMessage(**item) for item in value.get("messages", [])]
         session.activities = [AgentActivity(**item) for item in value.get("activities", [])]

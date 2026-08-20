@@ -39,9 +39,9 @@ from .artifacts import (
     build_read_image_result,
 )
 from .agent_runtime.api import build_agent_router
+from .agent_runtime.connectors import DeviceRuntimeConnector
 from .agent_runtime.service import AgentSessionService
 from .agent_runtime.store import AgentEventStore
-from .agent_runtime.providers import CodexProviderBridge
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
 from .execution import EntityKind, ExecutionError, ExecutionStore, new_id
@@ -527,9 +527,6 @@ TerminalExecutionLifecycle = TerminalLifecycle
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     artifact_events = ArtifactEventStore(DATA_DIR / "agent_server.db")
-    agent_sessions = AgentSessionService(AgentEventStore(DATA_DIR / "agent_server.db"))
-    agent_sessions.registry.register("codex", CodexProviderBridge, replace=True)
-    app.state.agent_sessions = agent_sessions
 
     def publish_runtime_artifact(event) -> None:
         path = event.payload.get("path")
@@ -600,6 +597,11 @@ async def lifespan(app: FastAPI):
         offline_after=float(os.getenv("DEVICE_RUNTIME_OFFLINE_AFTER", "30")),
         max_active_sessions=int(os.getenv("DEVICE_RUNTIME_MAX_SESSIONS", "8")),
     )
+    agent_sessions = AgentSessionService(
+        AgentEventStore(DATA_DIR / "agent_server.db"),
+        DeviceRuntimeConnector(device_runtime),
+    )
+    app.state.agent_sessions = agent_sessions
     observation_publisher = ObservationPublisher(execution.record_observation)
     observation_translator = TerminalObservationTranslator(
         default_owner=ADMIN_USERNAME,

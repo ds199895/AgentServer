@@ -27,7 +27,14 @@ class AgentEventStore:
 
     def save_session(self, owner_id: str, session_id: str, data: dict[str, Any]) -> None:
         with self._lock, self._connect() as db:
-            db.execute("INSERT INTO agent_sessions(id, owner_id, data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id,data=excluded.data", (session_id, owner_id, json.dumps(data, separators=(",", ":"))))
+            cursor = db.execute(
+                "INSERT INTO agent_sessions(id, owner_id, data) VALUES(?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET data=excluded.data "
+                "WHERE agent_sessions.owner_id=excluded.owner_id",
+                (session_id, owner_id, json.dumps(data, separators=(",", ":"))),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("agent session id belongs to another owner")
 
     def load_session(self, owner_id: str, session_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as db:
@@ -40,11 +47,39 @@ class AgentEventStore:
         return [json.loads(row[0]) for row in rows]
 
     def append(self, value: AgentEvent) -> AgentEvent:
+        committed, _created = self.append_once(value)
+        return committed
+
+    def append_once(self, value: AgentEvent) -> tuple[AgentEvent, bool]:
         with self._lock, self._connect() as db:
+            existing = db.execute(
+                "SELECT sequence,event_id,type,payload,occurred_at,session_id "
+                "FROM agent_events WHERE event_id=?",
+                (value.id,),
+            ).fetchone()
+            if existing is not None:
+                payload = json.loads(existing[3])
+                if (
+                    str(existing[5]) != value.session_id
+                    or str(existing[2]) != value.type
+                    or payload != value.payload
+                ):
+                    raise ValueError("agent event id is bound to different contents")
+                return (
+                    AgentEvent(
+                        int(existing[0]),
+                        str(existing[1]),
+                        str(existing[5]),
+                        str(existing[2]),
+                        payload,
+                        float(existing[4]),
+                    ),
+                    False,
+                )
             row = db.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM agent_events WHERE session_id=?", (value.session_id,)).fetchone()
             sequence = int(row[0])
             db.execute("INSERT INTO agent_events(session_id,sequence,event_id,type,payload,occurred_at) VALUES(?,?,?,?,?,?)", (value.session_id, sequence, value.id, value.type, json.dumps(value.payload, separators=(",", ":")), value.occurred_at))
-        return AgentEvent(sequence, value.id, value.session_id, value.type, value.payload, value.occurred_at)
+        return AgentEvent(sequence, value.id, value.session_id, value.type, value.payload, value.occurred_at), True
 
     def events(self, owner_id: str, session_id: str, after: int = 0, limit: int = 1000) -> list[AgentEvent]:
         with self._lock, self._connect() as db:

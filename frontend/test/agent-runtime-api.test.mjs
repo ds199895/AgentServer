@@ -42,7 +42,7 @@ test('agent API encodes session and request ids and sends the expected payloads'
     model: null,
   })
   await agentRuntime.agentApi.get('session/1')
-  await agentRuntime.agentApi.turn('session/1', 'finish the task')
+  await agentRuntime.agentApi.turn('session/1', 'finish the task', 'stable-turn-id')
   await agentRuntime.agentApi.interrupt('session/1')
   await agentRuntime.agentApi.respond('session/1', 'request/1', { decision: 'deny' })
 
@@ -59,6 +59,7 @@ test('agent API encodes session and request ids and sends the expected payloads'
   ])
   assert.equal(JSON.parse(calls[1].init.body).session_id, 'stable-session-id')
   assert.equal(JSON.parse(calls[3].init.body).input, 'finish the task')
+  assert.equal(JSON.parse(calls[3].init.body).turn_id, 'stable-turn-id')
   assert.equal(JSON.parse(calls[5].init.body).request_id, 'request/1')
   assert.deepEqual(JSON.parse(calls[5].init.body).payload, { decision: 'deny' })
 })
@@ -104,7 +105,13 @@ test('device bootstrap API keeps enrollment credentials scoped and abortable', a
 
 test('application mounts the agent session pane and no longer references the legacy dialog', async () => {
   const app = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
+  const dashboard = await readFile(new URL('../src/components/DeviceDashboard.tsx', import.meta.url), 'utf8')
   assert.match(app, /<AgentSessionPane sessionId=\{agentSessionId\}/)
+  assert.match(app, /<AgentStartDialog/)
+  assert.doesNotMatch(app, /provider: 'generic'/)
+  assert.match(dashboard, /device\.runtime\?\.state !== 'online'/)
+  assert.match(dashboard, /provider\.available/)
+  assert.doesNotMatch(dashboard, /disabled=\{!device\.ssh_available\} onClick=\{\(\) => onStartAgent/)
   assert.doesNotMatch(app, /DeviceRuntimeDialog/)
   assert.match(app, /setUsername\(null\); setAgentSessionId\(null\)/)
 })

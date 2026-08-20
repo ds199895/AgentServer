@@ -10,9 +10,14 @@ export const agentApi = {
   sessions: () => request<{ sessions: AgentSession[] }>('/api/agent/sessions'),
   create: (body: Pick<AgentSession, 'provider' | 'device_id' | 'cwd' | 'permission_mode' | 'model'> & { session_id?: string }) => request<{ session: AgentSession }>('/api/agent/sessions', { method: 'POST', body: JSON.stringify(body) }),
   get: (id: string) => request<{ session: AgentSession }>(`/api/agent/sessions/${encodeURIComponent(id)}`),
-  turn: (id: string, input: string) => request<{ turn: AgentSession['turns'][number] }>(`/api/agent/sessions/${encodeURIComponent(id)}/turns`, { method: 'POST', body: JSON.stringify({ input }) }),
+  turn: (id: string, input: string, turnId?: string) => request<{ turn: AgentSession['turns'][number] }>(`/api/agent/sessions/${encodeURIComponent(id)}/turns`, { method: 'POST', body: JSON.stringify({ input, turn_id: turnId }) }),
   interrupt: (id: string) => request<{ accepted: boolean }>(`/api/agent/sessions/${encodeURIComponent(id)}/interrupt`, { method: 'POST', body: '{}' }),
   respond: (id: string, requestId: string, payload: Record<string, unknown>) => request<{ accepted: boolean }>(`/api/agent/sessions/${encodeURIComponent(id)}/requests/respond`, { method: 'POST', body: JSON.stringify({ request_id: requestId, payload }) }),
+}
+
+export function newAgentTurnId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 }
 
 export function agentSessionSocketUrl(id: string, afterSequence = 0): string {

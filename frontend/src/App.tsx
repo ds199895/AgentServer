@@ -3,6 +3,7 @@ import { XIcon } from 'lucide-react'
 
 import { api, frontendBuildSha, normalizeTerminalSessions, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { agentApi } from '@/agent/api'
+import { AgentStartDialog } from '@/agent/AgentStartDialog'
 import { AgentSessionPane } from '@/agent/AgentSessionPane'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
@@ -159,6 +160,7 @@ export default function App() {
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null)
+  const [agentStartDevice, setAgentStartDevice] = useState<Device | null>(null)
   const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
   const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -1010,14 +1012,7 @@ export default function App() {
               onAdd={() => setDeviceDialog('new')}
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
               onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
-              onStartAgent={(device) => void (async () => {
-                try {
-                  const value = await agentApi.create({ provider: 'generic', device_id: device.id, cwd: '.' , permission_mode: 'workspace-write', model: null })
-                  setAgentSessionId(value.session.id)
-                } catch (reason) {
-                  setError(reason instanceof Error ? reason.message : 'Agent session creation failed')
-                }
-              })()}
+              onStartAgent={setAgentStartDevice}
               onSelectAgent={(_sessionId, deviceId) => {
                 void deviceId
                 setAgentSessionId(_sessionId)
@@ -1073,6 +1068,19 @@ export default function App() {
           device={deviceDialog === 'new' ? undefined : deviceDialog}
           onClose={() => setDeviceDialog(null)}
           onSaved={() => void load()}
+        />
+      )}
+      {agentStartDevice && (
+        <AgentStartDialog
+          device={agentStartDevice}
+          onClose={() => setAgentStartDevice(null)}
+          onStart={async (options) => {
+            const value = await agentApi.create({
+              ...options,
+              device_id: agentStartDevice.id,
+            })
+            setAgentSessionId(value.session.id)
+          }}
         />
       )}
       {agentSessionId && (

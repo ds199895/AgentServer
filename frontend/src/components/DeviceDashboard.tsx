@@ -30,6 +30,13 @@ function runtimeStateLabel(device: Device): string {
   }
 }
 
+function availableAgentProviders(device: Device): string[] {
+  if (device.runtime?.state !== 'online') return []
+  return (device.runtime.providers || [])
+    .filter((provider) => provider.available)
+    .map((provider) => provider.id)
+}
+
 type Props = {
   devices: Device[]
   sessions: TerminalSession[]
@@ -153,6 +160,7 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
               {devices.map((device) => {
                 const deviceSessions = sessionsByDevice.get(device.id) || []
                 const recentSession = [...deviceSessions].reverse().find((session) => session.active) || deviceSessions.at(-1)
+                const providers = availableAgentProviders(device)
                 return (
                 <TableRow key={device.id}>
                   <TableCell>
@@ -218,7 +226,7 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                         <MonitorPlay />
                         <span className="max-md:hidden">预览</span>
                       </Button>
-                      <Button variant="outline" size="xs" aria-label={`在 ${device.name} 启动 Agent 会话`} title="启动 Agent 会话" className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={!device.ssh_available} onClick={() => onStartAgent(device)}>
+                      <Button variant="outline" size="xs" aria-label={`在 ${device.name} 启动 Agent 会话`} title={providers.length ? `启动 Agent：${providers.join(', ')}` : '设备 Agent Runtime 或 provider 不可用'} className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={!providers.length} onClick={() => onStartAgent(device)}>
                         <Bot /><span className="max-md:hidden">Agent</span>
                       </Button>
                       <Button variant="outline" size="xs" aria-label={`检测 ${device.name}`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onProbe(device)}>
