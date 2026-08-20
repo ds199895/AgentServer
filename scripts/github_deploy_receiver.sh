@@ -112,4 +112,7 @@ fi
 DEPLOY_SCRIPT="$INCOMING_DIR/deploy_release.sh"
 tar -xOzf "$ARTIFACT" ./scripts/deploy_release.sh > "$DEPLOY_SCRIPT"
 chmod 0700 "$DEPLOY_SCRIPT"
-DEPLOY_SMOKE_URL=https://agent.metakroma.com "$DEPLOY_SCRIPT" "$ARTIFACT"
+# Validate the service directly on the production host while it is restarting.
+# The public reverse proxy can legitimately return 502 during that short window;
+# the workflow performs the public URL convergence check after this succeeds.
+DEPLOY_SMOKE_URL=http://127.0.0.1:18100 "$DEPLOY_SCRIPT" "$ARTIFACT"
