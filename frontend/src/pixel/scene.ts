@@ -83,6 +83,9 @@ export interface SceneModel {
 
 export function deviceStatus(device: Device): StatusKind {
   if (device.ssh_available) return 'ready'
+  // Runtime Host is an independent, usable control path. Treat a healthy or
+  // degraded Host as ready in the room view just like an SSH-backed device.
+  if (device.runtime?.state === 'online' || device.runtime?.state === 'degraded') return 'ready'
   if (device.frp_online) return 'partial'
   return 'offline'
 }
@@ -155,7 +158,9 @@ export function buildScene(
             : runtime.state === 'starting' || runtime.state === 'requested' ? 'thinking'
               : runtime.state === 'ready' ? 'idle' : null
         : null
-      const runtimeActive = runtime ? !['stopped', 'failed', 'lost'].includes(runtime.state) : false
+      const runtimeActive = runtime
+        ? ['requested', 'starting', 'ready', 'running', 'waiting', 'stopping'].includes(runtime.state)
+        : false
       const runState = {
         lifecycle: execution?.lifecycle ?? runtimeLifecycle,
         activity: execution?.activity ?? runtimeActivity,

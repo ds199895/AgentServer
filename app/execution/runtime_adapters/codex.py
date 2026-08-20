@@ -161,6 +161,27 @@ def _display_delta(value: object) -> str | None:
     return text[:16_384]
 
 
+def _completed_item_text(value: object) -> str | None:
+    """Extract final assistant text from Codex item/completed payloads.
+
+    Codex has emitted both a plain ``text`` field and structured ``content``
+    parts across app-server releases. Keep this projection deliberately
+    narrow: only text-like fields are exposed to the durable runtime log.
+    """
+    if isinstance(value, str):
+        return _display_delta(value)
+    if isinstance(value, Mapping):
+        for key in ("text", "message", "content", "parts"):
+            candidate = _completed_item_text(value.get(key))
+            if candidate:
+                return candidate
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        fragments = [part for item in value if (part := _completed_item_text(item))]
+        return "".join(fragments)[:16_384] if fragments else None
+    return None
+
+
 def _unsafe_environment_name(value: str) -> bool:
     name = value.upper()
     return name in _FORBIDDEN_ENVIRONMENT_NAMES or any(
@@ -1530,6 +1551,17 @@ class CodexRuntimeAdapter(RuntimeAdapter):
             return
         item_type = _canonical_item_type(item.get("type"))
         if item_type == "unknown":
+            return
+        if method == "item/completed" and item_type == "assistant_message":
+            text = _completed_item_text(item)
+            if text:
+                await self._emit(
+                    session,
+                    "message.completed",
+                    {"text": text, "role": "assistant", "final": True, "streaming": False},
+                    turn_id=turn_id,
+                    item_id=item_id,
+                )
             return
         activity = _item_activity(item_type)
         body: dict[str, Any] = {"item_type": item_type, "activity": activity}

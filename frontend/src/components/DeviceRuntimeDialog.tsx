@@ -91,6 +91,49 @@ export type RuntimeTranscriptBlock = {
   count: number
 }
 
+export type RuntimeConversationMessage = {
+  key: string
+  role: 'user' | 'assistant'
+  text: string
+  streaming: boolean
+  event: RuntimeEvent
+}
+
+/** Reduce durable Runtime events into the same message projection used by the
+ * t3code timeline: prompts and assistant messages are first-class rows, while
+ * tool/reasoning activity remains an independent work log. */
+export function deriveRuntimeConversation(events: RuntimeEvent[]): RuntimeConversationMessage[] {
+  const result: RuntimeConversationMessage[] = []
+  const assistantByKey = new Map<string, RuntimeConversationMessage>()
+  for (const event of events) {
+    if (event.type === 'turn.input') {
+      const text = eventText(event)
+      if (text) result.push({ key: event.event_id, role: 'user', text, streaming: false, event })
+      continue
+    }
+    if (!['message.delta', 'message.completed'].includes(event.type)) continue
+    const key = String(event.item_id || event.payload.item_id || event.turn_id || event.event_id)
+    const current = assistantByKey.get(key)
+    const text = eventText(event)
+    if (!current) {
+      const message = { key, role: 'assistant' as const, text, streaming: event.type === 'message.delta', event }
+      assistantByKey.set(key, message)
+      result.push(message)
+      continue
+    }
+    if (event.type === 'message.completed') {
+      // A completed item may repeat the streamed text. Prefer the durable
+      // final projection, but do not append it a second time.
+      if (text && !current.text.endsWith(text)) current.text = text
+      current.streaming = false
+    } else {
+      current.text += text
+    }
+    current.event = event
+  }
+  return result.filter((message) => message.text)
+}
+
 /** Join adjacent provider deltas so a streamed answer reads like a transcript. */
 export function coalesceRuntimeEvents(events: RuntimeEvent[]): RuntimeTranscriptBlock[] {
   const blocks: RuntimeTranscriptBlock[] = []
@@ -203,6 +246,11 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
     ))
   }, [activeInteraction])
   const transcript = useMemo(() => coalesceRuntimeEvents(events), [events])
+  const conversation = useMemo(() => deriveRuntimeConversation(events), [events])
+  const workTranscript = useMemo(
+    () => transcript.filter(({ event }) => !['turn.input', 'message.delta', 'message.completed'].includes(event.type)),
+    [transcript],
+  )
 
   useEffect(() => {
     const pending = pendingTurnRef.current
@@ -837,13 +885,21 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
               {eventsError && <p role="status" className="m-0 text-[10px] text-[#ffadb5]">{eventsError}</p>}
               <div className="flex items-center justify-between gap-3 border-t border-[#293641] pt-3 text-[10px] text-[#71808c]">
                 <span className="flex items-center gap-1.5"><Radio className={`size-3 ${socketState === 'live' ? 'text-primary' : socketState === 'reconnecting' ? 'text-[#e9bd68]' : 'text-[#71808c]'}`} />{socketState === 'live' ? '实时连接' : socketState === 'fallback' ? 'HTTP 兜底' : socketState === 'reconnecting' ? '正在重连' : '正在连接'}</span>
-                <span>{transcript.length} 个工作块</span>
+                <span>{conversation.length} 条消息 · {workTranscript.length} 个工作块</span>
               </div>
-              <div className="grid max-h-[min(560px,48dvh)] gap-2 overflow-y-auto border-t border-[#293641] pt-3">
-                <strong className="mb-1 text-[10px] tracking-wide text-[#71808c]">实时工作流</strong>
-                {transcript.map((block) => {
+              <div className="grid max-h-[min(560px,48dvh)] gap-3 overflow-y-auto border-t border-[#293641] pt-3">
+                <strong className="text-[10px] tracking-wide text-[#71808c]">会话消息</strong>
+                {conversation.map((message) => (
+                  <div key={message.key} className={`rounded-md border px-3 py-2 text-xs ${message.role === 'user' ? 'ml-auto max-w-[88%] bg-primary/15 border-primary/30' : 'mr-auto max-w-[92%] bg-[#0b1117] border-[#293641]'}`}>
+                    <div className="mb-1 flex items-center justify-between gap-3 text-[10px] text-[#71808c]"><span>{message.role === 'user' ? '你' : 'Codex'}{message.streaming ? ' · 生成中' : ''}</span><time className="font-mono text-[#596672]">{eventTime(message.event)}</time></div>
+                    <div className="whitespace-pre-wrap break-words leading-relaxed text-[#dce6ed]">{message.text}</div>
+                  </div>
+                ))}
+                {!conversation.length && <span className="text-[10px] text-[#596672]">尚无会话消息</span>}
+                <strong className="mt-2 text-[10px] tracking-wide text-[#71808c]">实时工作流</strong>
+                {workTranscript.map((block) => {
                   const { event, text } = block
-                  const role = event.type === 'turn.input' ? 'ml-auto max-w-[88%] bg-primary/15 border-primary/30' : 'mr-auto max-w-[92%] bg-[#0b1117] border-[#293641]'
+                  const role = 'mr-auto max-w-[92%] bg-[#0b1117] border-[#293641]'
                   return (
                     <div key={block.key} className={`rounded-md border px-3 py-2 text-xs ${role}`}>
                       <div className="mb-1 flex items-center justify-between gap-3 text-[10px] text-[#71808c]">
