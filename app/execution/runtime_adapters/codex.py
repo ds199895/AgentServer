@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -126,6 +127,38 @@ _DELTA_METHODS = frozenset(
         "rawResponse/completed",
     }
 )
+
+_DISPLAY_DELTA_TYPES = {
+    "item/agentMessage/delta": ("message.delta", "assistant"),
+    "item/reasoning/summaryTextDelta": ("reasoning.delta", "reasoning_summary"),
+    "item/reasoning/textDelta": ("reasoning.delta", "reasoning_summary"),
+    "item/commandExecution/outputDelta": ("tool.output.delta", "tool"),
+    "item/fileChange/outputDelta": ("file.output.delta", "file"),
+}
+
+_PUBLIC_SECRET_MARKER = re.compile(r"\b(?:LEAK|SECRET|TOKEN|PASSWORD|CREDENTIAL)_[A-Z0-9_]+\b")
+_PUBLIC_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|credential)\b\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _display_delta(value: object) -> str | None:
+    """Extract only provider display text; never forward the raw RPC object."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, Mapping):
+        text = _text(value.get("delta") or value.get("text")) or ""
+    else:
+        text = ""
+    if not text:
+        return None
+    # Runtime events are bounded by the envelope limit. Keep one provider
+    # fragment bounded too so a malformed provider cannot monopolize the spool.
+    # Provider output is user-visible, but it is still untrusted text. Remove
+    # obvious secret markers/assignments before placing it in the durable spool.
+    text = _PUBLIC_SECRET_MARKER.sub("[redacted]", text)
+    text = _PUBLIC_SECRET_ASSIGNMENT.sub(r"\1=[redacted]", text)
+    return text[:16_384]
 
 
 def _unsafe_environment_name(value: str) -> bool:
@@ -1324,7 +1357,29 @@ class CodexRuntimeAdapter(RuntimeAdapter):
     async def _handle_notification(
         self, session: _CodexSessionState, method: str, params: object
     ) -> None:
+        display_delta = _DISPLAY_DELTA_TYPES.get(method)
+        if display_delta is not None:
+            payload = _mapping(params)
+            text = _display_delta(payload.get("delta") if payload else None)
+            if text is not None:
+                turn_id = _text(payload.get("turnId")) if payload else None
+                item_id = _text(
+                    (payload or {}).get("itemId") or (payload or {}).get("item_id")
+                )
+                if turn_id is None and payload:
+                    turn = _mapping(payload.get("turn"))
+                    turn_id = _text(turn.get("id")) if turn else None
+                await self._emit(
+                    session,
+                    display_delta[0],
+                    {"text": text, "channel": display_delta[1]},
+                    turn_id=turn_id,
+                    item_id=item_id,
+                )
+            return
         if method in _DELTA_METHODS or method.endswith("/delta"):
+            # Unknown deltas stay private until an explicit display projection
+            # is defined for the provider method.
             return
         payload = _mapping(params)
         if method == "thread/started":

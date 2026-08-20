@@ -90,6 +90,19 @@ test('runtime scope guards reject cross-device sessions and events', () => {
   assert.equal(runtime.isRuntimeEventForSession(event, 'device-a', 'session-b'), false)
 })
 
+test('runtime socket URL uses the current secure origin and normalizes its cursor', () => {
+  const originalWindow = globalThis.window
+  globalThis.window = { location: { protocol: 'https:', host: 'agentserver.test' } }
+  try {
+    assert.equal(
+      runtime.runtimeSessionSocketUrl('session/a', -12),
+      'wss://agentserver.test/ws/runtime-sessions/session%2Fa?after_sequence=0',
+    )
+  } finally {
+    globalThis.window = originalWindow
+  }
+})
+
 test('runtime request ids are unique UUIDs and AbortError detection is cross-realm safe', () => {
   const first = runtime.newRuntimeRequestId()
   const second = runtime.newRuntimeRequestId()
@@ -120,6 +133,9 @@ test('runtime dialog does not persist or log secrets and tears down asynchronous
   assert.doesNotMatch(dialog, /setInterval\(/)
   assert.match(dialog, /pendingSessionCreateRef\.current = runtimeRequestIdentityFor/)
   assert.match(dialog, /runtimeRequestIdentityFor\(pendingTurnRef\.current/)
+  assert.match(dialog, /runtimeSessionSocketUrl\(sessionId\)/)
+  assert.match(dialog, /coalesceRuntimeEvents/)
+  assert.match(dialog, /socketState === 'live'/)
   assert.doesNotMatch(dialog, /--runtime-user.*device\.ssh_user/)
   assert.doesNotMatch(downloads, /--runtime-user/)
   assert.match(downloads, /完整 Runtime bootstrap 由持有 Codex 登录态的 Linux 普通用户运行/)

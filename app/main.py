@@ -1192,7 +1192,9 @@ app.include_router(
         cookie_name=COOKIE_NAME,
     )
 )
-app.include_router(build_device_runtime_router(current_user))
+app.include_router(
+    build_device_runtime_router(current_user, browser_cookie_name=COOKIE_NAME)
+)
 
 
 async def bind_terminal_workspace(application: FastAPI, session):

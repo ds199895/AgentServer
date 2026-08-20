@@ -997,6 +997,10 @@ export default function App() {
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
               onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
               onRuntime={setRuntimeDevice}
+              onSelectRuntime={(_sessionId, deviceId) => {
+                const device = devices.find((item) => item.id === deviceId)
+                if (device) setRuntimeDevice(device)
+              }}
             />
           )}
         </div>

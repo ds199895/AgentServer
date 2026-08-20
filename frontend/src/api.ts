@@ -121,6 +121,7 @@ export type RuntimeEvent = {
   session_id: string | null
   type: string
   turn_id?: string | null
+  item_id?: string | null
   interaction_id?: string | null
   payload: Record<string, unknown>
   occurred_at: number | null
@@ -129,6 +130,11 @@ export type RuntimeEvent = {
 
 export type RuntimeRequestOptions = {
   signal?: AbortSignal
+}
+
+export function runtimeSessionSocketUrl(sessionId: string, afterSequence = 0): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/ws/runtime-sessions/${encodeURIComponent(sessionId)}?after_sequence=${Math.max(0, afterSequence)}`
 }
 
 /** Keep UI state pinned to the device selected by the authenticated owner. */

@@ -1,7 +1,7 @@
 // Pure scene-layout model for the pixel device world.
 // All variety is derived from hash(device.id) so re-renders never jump around.
 
-import type { Device, TerminalSession } from '../api'
+import type { Device, RuntimeSession, TerminalSession } from '../api'
 import type { RunActivity, RunLifecycle, WaitReason } from '../execution-state'
 import { hashString, type StatusKind } from './sprites'
 
@@ -15,6 +15,8 @@ export type DecorKind = 'lamp' | 'shelf' | 'ac'
 
 export interface CharSlot {
   sessionId: string
+  kind: 'terminal' | 'runtime'
+  name: string
   active: boolean
   pose: 'sit' | 'stand'
   x: number // relative to room origin
@@ -44,6 +46,11 @@ export type TerminalExecutionVisual = {
   eventKey: string | null
   eventText: string | null
   eventTone: 'think' | 'work' | 'test' | 'wait' | 'ok' | 'bad' | 'mute' | undefined
+}
+
+export type RuntimeRoomSession = Pick<RuntimeSession, 'id' | 'device_id' | 'provider' | 'state' | 'cwd' | 'updated_at'> & {
+  last_event_type?: string | null
+  last_event_text?: string | null
 }
 
 export interface RoomModel {
@@ -97,6 +104,7 @@ export function buildScene(
   sessions: TerminalSession[],
   aspect: number,
   executionByTerminal: ReadonlyMap<string, TerminalExecutionVisual> = new Map(),
+  runtimeSessions: RuntimeRoomSession[] = [],
 ): SceneModel {
   const count = devices.length
   const safeAspect = Math.min(2.4, Math.max(0.6, aspect || 1.6))
@@ -123,29 +131,50 @@ export function buildScene(
     const deskX = deskLeft ? 20 : 156
 
     const deviceSessions = sessionsByDevice.get(device.id) || []
-    const chars: CharSlot[] = deviceSessions.slice(0, STAND_SLOTS.length + 1).map((session, slot) => {
+    const deviceRuntimeSessions = runtimeSessions.filter((session) => session.device_id === device.id)
+    const occupants: Array<{ kind: 'terminal' | 'runtime'; session: TerminalSession | RuntimeRoomSession }> = [
+      ...deviceSessions.map((session) => ({ kind: 'terminal' as const, session })),
+      ...deviceRuntimeSessions.map((session) => ({ kind: 'runtime' as const, session })),
+    ]
+    const chars: CharSlot[] = occupants.slice(0, STAND_SLOTS.length + 1).map(({ kind, session }, slot) => {
       const variant = hashString(session.id)
-      const execution = executionByTerminal.get(session.id)
-      const agent = execution?.agentKind ?? session.agent?.kind ?? null
+      const terminal = kind === 'terminal' ? session as TerminalSession : null
+      const runtime = kind === 'runtime' ? session as RuntimeRoomSession : null
+      const execution = terminal ? executionByTerminal.get(terminal.id) : undefined
+      const agent = execution?.agentKind ?? terminal?.agent?.kind ?? (runtime ? runtime.provider : null)
+      const runtimeLifecycle: RunLifecycle | null = runtime
+        ? ['failed', 'lost'].includes(runtime.state) ? 'failed'
+          : runtime.state === 'stopped' ? 'succeeded'
+            : ['starting', 'requested'].includes(runtime.state) ? 'starting'
+              : runtime.state === 'running' || runtime.state === 'waiting' ? 'running'
+                : null
+        : null
+      const runtimeActivity: RunActivity | null = runtime
+        ? runtime.state === 'waiting' ? 'waiting'
+          : runtime.state === 'running' ? 'tooling'
+            : runtime.state === 'starting' || runtime.state === 'requested' ? 'thinking'
+              : runtime.state === 'ready' ? 'idle' : null
+        : null
+      const runtimeActive = runtime ? !['stopped', 'failed', 'lost'].includes(runtime.state) : false
       const runState = {
-        lifecycle: execution?.lifecycle ?? null,
-        activity: execution?.activity ?? null,
+        lifecycle: execution?.lifecycle ?? runtimeLifecycle,
+        activity: execution?.activity ?? runtimeActivity,
         waitReason: execution?.waitReason ?? null,
         stale: execution?.stale ?? false,
-        agentCwd: execution?.agentCwd ?? session.agent?.cwd ?? '',
-        runLabel: execution?.runLabel ?? null,
-        eventKey: execution?.eventKey ?? null,
-        eventText: execution?.eventText ?? null,
-        eventTone: execution?.eventTone,
+        agentCwd: execution?.agentCwd ?? terminal?.agent?.cwd ?? runtime?.cwd ?? '',
+        runLabel: execution?.runLabel ?? (runtime ? runtime.state : null),
+        eventKey: execution?.eventKey ?? (runtime?.last_event_type ?? null),
+        eventText: execution?.eventText ?? (runtime?.last_event_text ?? null),
+        eventTone: execution?.eventTone ?? (runtime?.state === 'failed' || runtime?.state === 'lost' ? 'bad' : runtime?.state === 'waiting' ? 'wait' : runtime?.state === 'ready' ? 'ok' : 'work'),
       }
       if (slot === 0) {
         // Seated at the desk, back to the viewer; the sprite includes the
         // chair and is anchored so the hands land on the keyboard (desk-local
         // x 18-30, y 26-31) and the feet stay clear of the y+64 nameplate.
-        return { sessionId: session.id, active: session.active, pose: 'sit', x: deskX + 15, y: 28, variant, agent, ...runState }
+        return { sessionId: session.id, kind, name: terminal?.name || `Runtime ${session.id.slice(0, 8)}`, active: terminal?.active ?? runtimeActive, pose: 'sit', x: deskX + 15, y: 28, variant, agent, ...runState }
       }
       const spot = STAND_SLOTS[(slot - 1) % STAND_SLOTS.length]
-      return { sessionId: session.id, active: session.active, pose: 'stand', x: spot.x, y: spot.y, variant, agent, ...runState }
+      return { sessionId: session.id, kind, name: terminal?.name || `Runtime ${session.id.slice(0, 8)}`, active: terminal?.active ?? runtimeActive, pose: 'stand', x: spot.x, y: spot.y, variant, agent, ...runState }
     })
 
     const decorRoll = (hash >>> 3) % 3

@@ -1,7 +1,8 @@
-import { lazy, Suspense, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { Activity, Cpu, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
-import type { Device, TerminalSession } from '@/api'
+import { api, type Device, type RuntimeSession, type TerminalSession } from '@/api'
+import type { RuntimeRoomSession } from '@/pixel/scene'
 import { DeviceIcon, StateBadge } from '@/components/device-bits'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -39,12 +40,14 @@ type Props = {
   onSync: () => void
   onAdd: () => void
   onSelectTerminal: (sessionId: string) => void
+  onSelectRuntime: (sessionId: string, deviceId: string) => void
   onPreview: (device?: Device) => void
   onRuntime: (device: Device) => void
 }
 
-export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onPreview, onRuntime }: Props) {
+export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onSelectRuntime, onPreview, onRuntime }: Props) {
   const [view, setView] = useState<'world' | 'list'>('world')
+  const [runtimeSessions, setRuntimeSessions] = useState<RuntimeRoomSession[]>([])
   const sessionsByDevice = useMemo(() => {
     const result = new Map<string, TerminalSession[]>()
     for (const session of sessions) {
@@ -64,6 +67,27 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
     ['SSH 可用', sshReady],
     ['Runtime 在线', runtimeReady],
   ]
+  useEffect(() => {
+    let disposed = false
+    let timer: number | undefined
+    const refresh = async () => {
+      const values = await Promise.all(devices.map(async (device) => {
+        try {
+          const result = await api.runtimeSessions(device.id)
+          return result.sessions as RuntimeSession[]
+        } catch {
+          return []
+        }
+      }))
+      if (!disposed) setRuntimeSessions(values.flat())
+      if (!disposed) timer = window.setTimeout(() => void refresh(), 5000)
+    }
+    void refresh()
+    return () => {
+      disposed = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [devices])
   return (
     <section className="flex min-h-full flex-col bg-[#090d12] bg-[radial-gradient(circle_at_90%_0,#15302655,transparent_30%)] px-[clamp(18px,4vw,58px)] pt-5 pb-[34px] max-md:px-3 max-md:pt-6 max-md:pb-[50px]">
       <div className="mb-3.5 flex items-center justify-end gap-6">
@@ -113,7 +137,10 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
             正在生成像素基地…
           </div>
         }>
-          <DeviceWorld devices={devices} sessions={sessions} busyId={busyId} onOpen={onOpen} onProbe={onProbe} onEdit={onEdit} onSelectTerminal={onSelectTerminal} />
+          <DeviceWorld devices={devices} sessions={sessions} runtimeSessions={runtimeSessions} busyId={busyId} onOpen={onOpen} onProbe={onProbe} onEdit={onEdit} onSelectTerminal={onSelectTerminal} onSelectRuntime={(sessionId) => {
+            const runtime = runtimeSessions.find((item) => item.id === sessionId)
+            if (runtime) onSelectRuntime(sessionId, runtime.device_id)
+          }} />
         </Suspense>
       ) : (
         <div className="overflow-auto rounded-[11px] border border-[#202b35] bg-[#0d1319] shadow-[0_18px_45px_#0004]">

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUpRight, LayoutGrid, XIcon } from 'lucide-react'
 import type { Device, TerminalSession } from './api'
-import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type SceneModel, type TerminalExecutionVisual } from './pixel/scene'
+import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type RuntimeRoomSession, type SceneModel, type TerminalExecutionVisual } from './pixel/scene'
 import { BubbleTracker, bubbleAlpha, bubblePop, drawBubble } from './pixel/bubbles'
 import { eventBubbleForTerminal } from './pixel/execution-bubbles'
 import { AGENT_OUTFITS, CHAR_DIMS, getAtlas, getCharacter, getScreen, makeFloorLabel, RACK_LEDS, STATUS_COLOR } from './pixel/sprites'
@@ -23,11 +23,13 @@ import { cn } from '@/lib/utils'
 type Props = {
   devices: Device[]
   sessions: TerminalSession[]
+  runtimeSessions?: RuntimeRoomSession[]
   busyId: string | null
   onOpen: (device: Device) => void
   onProbe: (device: Device) => void
   onEdit: (device: Device) => void
   onSelectTerminal: (sessionId: string) => void
+  onSelectRuntime?: (sessionId: string) => void
   compact?: boolean
   // Terminal page only: the session whose tab is currently active gets a
   // highlight ring in the canvas. Omitted on the device-list page.
@@ -60,7 +62,7 @@ function quantizeScale(scale: number): number {
   return Math.max(0.5, Math.round(scale * 4) / 4)
 }
 
-export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe, onEdit, onSelectTerminal, compact = false, activeSessionId = null }: Props) {
+export default function DeviceWorld({ devices, sessions, runtimeSessions = [], busyId, onOpen, onProbe, onEdit, onSelectTerminal, onSelectRuntime = () => undefined, compact = false, activeSessionId = null }: Props) {
   const execution = useExecutionContext()
   const hostRef = useRef<HTMLDivElement>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -124,10 +126,10 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   const scene = useMemo<SceneModel>(() => {
     const host = hostRef.current
     const aspect = host ? host.clientWidth / Math.max(1, host.clientHeight) : 1.6
-    return buildScene(devices, sessions, aspect, executionByTerminal)
+    return buildScene(devices, sessions, aspect, executionByTerminal, runtimeSessions)
     // sceneVersion captures every input that affects layout
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sceneVersion])
+  }, [runtimeSessions, sceneVersion])
 
   // Latest values the render loop needs without re-running the effect.
   const busyIdRef = useRef(busyId)
@@ -157,7 +159,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
 
   useEffect(() => {
     const host = hostRef.current
-    bubbleTrackerRef.current.prune(new Set(sessions.map((session) => session.id)))
+    bubbleTrackerRef.current.prune(new Set([...sessions.map((session) => session.id), ...runtimeSessions.map((session) => session.id)]))
     if (!host || !scene.rooms.length) return
 
     const atlas = getAtlas()
@@ -271,7 +273,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
     const updateHover = (event: PointerEvent) => {
       const person = pickCharacter(event.clientX, event.clientY)
       if (person) {
-        const session = sessions.find((item) => item.id === person.char.sessionId)
+        const session = person.char.kind === 'terminal'
+          ? sessions.find((item) => item.id === person.char.sessionId)
+          : runtimeSessions.find((item) => item.id === person.char.sessionId)
         const popoverWidth = Math.min(260, Math.max(220, cssW - 18))
         const spriteWidth = CHAR_DIMS[person.char.pose].w
         const anchor = canvasPoint(
@@ -283,7 +287,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
         setHoveredName('')
         const nextHoveredPerson = {
           sessionId: person.char.sessionId,
-          sessionName: session?.name || `终端 ${person.char.sessionId.slice(0, 8)}`,
+          sessionName: person.char.name || (person.char.kind === 'runtime' ? `Runtime ${person.char.sessionId.slice(0, 8)}` : `终端 ${person.char.sessionId.slice(0, 8)}`),
           deviceName: person.room.device.name,
           active: person.char.active,
           agentName: person.char.agent ? agentDisplayName(person.char.agent) : null,
@@ -416,8 +420,11 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
       if (dragStart && !dragging) {
         const person = pickCharacter(event.clientX, event.clientY)
         if (person) {
-          setSelectedSessionId(person.char.sessionId)
-          setSelectedId(null)
+          if (person.char.kind === 'runtime') onSelectRuntime(person.char.sessionId)
+          else {
+            setSelectedSessionId(person.char.sessionId)
+            setSelectedId(null)
+          }
         } else {
           const room = pickRoom(event.clientX, event.clientY)
           if (room) {
@@ -927,10 +934,15 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
             )}
           </div>
           <button
-            onClick={() => { clearPersonHover(); onSelectTerminal(hoveredPerson.sessionId) }}
+            onClick={() => {
+              clearPersonHover()
+              const person = scene.rooms.flatMap((room) => room.chars).find((char) => char.sessionId === hoveredPerson.sessionId)
+              if (person?.kind === 'runtime') onSelectRuntime(hoveredPerson.sessionId)
+              else onSelectTerminal(hoveredPerson.sessionId)
+            }}
             className="relative z-[1] flex cursor-pointer items-center gap-1 rounded-md border border-[#467b63] bg-primary px-[9px] py-[7px] text-[9px] font-bold whitespace-nowrap text-[#07120d] hover:bg-[#a2ffd0] hover:shadow-[0_6px_18px_#77f2b42b]"
           >
-            打开终端
+            {scene.rooms.flatMap((room) => room.chars).find((char) => char.sessionId === hoveredPerson.sessionId)?.kind === 'runtime' ? '打开 Runtime' : '打开终端'}
             <ArrowUpRight className="size-3" />
           </button>
         </div>

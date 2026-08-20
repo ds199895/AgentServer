@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket
+from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 
 from .device_runtime import (
@@ -307,6 +309,8 @@ def _event_for_ingest(
 
 def build_device_runtime_router(
     browser_user_dependency: Callable[..., str],
+    *,
+    browser_cookie_name: str = "agentserver_session",
 ) -> APIRouter:
     router = APIRouter()
 
@@ -559,6 +563,90 @@ def build_device_runtime_router(
             return {"events": [item.as_dict() for item in events]}
         except (DeviceRuntimeError, ExecutionError, ValueError) as error:
             raise _http_error(error) from error
+
+    @router.websocket("/ws/runtime-sessions/{session_id}")
+    async def runtime_session_socket(
+        websocket: WebSocket,
+        session_id: str,
+    ) -> None:
+        """Replay then tail one owner-scoped Runtime session without polling."""
+        try:
+            parameters = inspect.signature(browser_user_dependency).parameters
+            username = (
+                browser_user_dependency(websocket.cookies.get(browser_cookie_name))
+                if parameters
+                else browser_user_dependency()
+            )
+            if inspect.isawaitable(username):
+                username = await username
+        except Exception:
+            await websocket.accept()
+            await websocket.close(code=4401)
+            return
+        if not username:
+            await websocket.accept()
+            await websocket.close(code=4401)
+            return
+        service = _service(websocket)
+        try:
+            await asyncio.to_thread(
+                service.get_session, owner_id=username, session_id=session_id
+            )
+        except (DeviceRuntimeError, ExecutionError, ValueError):
+            await websocket.accept()
+            await websocket.close(code=4404)
+            return
+        try:
+            after_sequence = max(
+                0, int(websocket.query_params.get("after_sequence", "0"))
+            )
+        except ValueError:
+            await websocket.accept()
+            await websocket.close(code=4400)
+            return
+
+        await websocket.accept()
+        cursor = after_sequence
+
+        async def send_events() -> None:
+            nonlocal cursor
+            while True:
+                events = await asyncio.to_thread(
+                    service.session_events,
+                    owner_id=username,
+                    session_id=session_id,
+                    after_sequence=cursor,
+                    limit=200,
+                )
+                for event in events:
+                    if event.sequence <= cursor:
+                        continue
+                    cursor = event.sequence
+                    await websocket.send_json({
+                        "type": "event",
+                        "cursor": cursor,
+                        "event": event.as_dict(),
+                    })
+                await asyncio.sleep(0.25)
+
+        async def receive_until_disconnect() -> None:
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+
+        sender = asyncio.create_task(send_events())
+        receiver = asyncio.create_task(receive_until_disconnect())
+        try:
+            done, pending = await asyncio.wait(
+                {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
+        finally:
+            sender.cancel()
+            receiver.cancel()
 
     @router.post("/api/device-runtime/v1/enroll", status_code=201)
     async def device_enroll(request: Request, response: Response) -> dict[str, Any]:

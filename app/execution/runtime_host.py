@@ -7,6 +7,7 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
 import sqlite3
 import stat
@@ -47,6 +48,18 @@ MAX_DEVICE_EVENT_BATCH_BYTES = 224 * 1024
 MAX_DEVICE_EVENT_SPOOL = 10_000
 MAX_DEVICE_EVENT_DEAD_LETTERS = 10_000
 DEFAULT_CREDENTIAL_ROTATION_WINDOW = 7 * 24 * 60 * 60
+
+_PUBLIC_SECRET_MARKER = re.compile(r"\b(?:LEAK|SECRET|TOKEN|PASSWORD|CREDENTIAL)_[A-Z0-9_]+\b")
+_PUBLIC_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|credential)\b\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _public_text(value: object, *, limit: int = 16_384) -> str:
+    text = str(value or "")
+    text = _PUBLIC_SECRET_MARKER.sub("[redacted]", text)
+    text = _PUBLIC_SECRET_ASSIGNMENT.sub(r"\1=[redacted]", text)
+    return text[:limit]
 
 SUPPORTED_COMMAND_TYPES = frozenset(
     {
@@ -2456,10 +2469,34 @@ class DeviceRuntimeHost:
     async def _turn_session(self, payload: Mapping[str, Any]) -> object:
         async with self._session_lock:
             handle = await self._session_handle(payload)
+            turn_input = self._turn_input(payload)
+            # Typed adapters expose the normalized event stream used by the
+            # Runtime workspace. Legacy adapters retain their historical event
+            # contract and do not receive a new durable prompt event.
+            if handle.typed and handle.provider == "codex":
+                turn_id_value = payload.get("turn_id")
+                turn_id = (
+                    _require_text(turn_id_value, "turn_id")
+                    if turn_id_value is not None and turn_id_value != ""
+                    else None
+                )
+                turn_payload: dict[str, Any] = {
+                    "text": _public_text(turn_input.text or ""),
+                    "attachment_count": len(turn_input.attachments),
+                }
+                if turn_id is not None:
+                    turn_payload["turn_id"] = turn_id
+                await self._emit_adapter_event(
+                    RuntimeEvent(
+                        type="turn.input",
+                        payload=turn_payload,
+                    ),
+                    default_session_id=handle.session_id,
+                )
             if handle.typed:
                 return await handle.adapter.send_turn(
                     handle.session_id,
-                    self._turn_input(payload),
+                    turn_input,
                 )
             return await self._adapter_call(handle.adapter, "start_turn", payload)
 

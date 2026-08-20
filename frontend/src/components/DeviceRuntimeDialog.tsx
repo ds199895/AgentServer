@@ -6,6 +6,7 @@ import {
   isAbortError,
   isRuntimeEventForSession,
   isRuntimeSessionForDevice,
+  runtimeSessionSocketUrl,
   runtimeRequestIdentityFor,
   type Device,
   type DeviceRuntimeEnrollment,
@@ -65,6 +66,54 @@ function errorMessage(reason: unknown, fallback: string): string {
   return reason instanceof Error && reason.message ? reason.message : fallback
 }
 
+function eventText(event: RuntimeEvent): string {
+  const value = event.payload.text
+  return typeof value === 'string' ? value : ''
+}
+
+function eventLabel(type: string): string {
+  return {
+    'turn.input': '你',
+    'message.delta': 'Codex',
+    'reasoning.delta': '思路摘要',
+    'tool.output.delta': '工具输出',
+    'file.output.delta': '文件变更',
+    'turn.started': '开始执行',
+    'turn.completed': '完成',
+    'turn.failed': '失败',
+  }[type] || type
+}
+
+export type RuntimeTranscriptBlock = {
+  key: string
+  event: RuntimeEvent
+  text: string
+  count: number
+}
+
+/** Join adjacent provider deltas so a streamed answer reads like a transcript. */
+export function coalesceRuntimeEvents(events: RuntimeEvent[]): RuntimeTranscriptBlock[] {
+  const blocks: RuntimeTranscriptBlock[] = []
+  for (const event of events) {
+    const text = eventText(event)
+    const delta = ['message.delta', 'reasoning.delta', 'tool.output.delta', 'file.output.delta'].includes(event.type)
+    const previous = blocks.at(-1)
+    const sameStream = delta && previous
+      && previous.event.type === event.type
+      && previous.event.turn_id === event.turn_id
+      && previous.event.payload.item_id === event.payload.item_id
+    if (sameStream) {
+      previous.text += text
+      previous.count += 1
+      previous.event = event
+      continue
+    }
+    const display = Boolean(text) || ['turn.input', 'turn.started', 'turn.completed', 'turn.failed', 'item.started', 'item.completed'].includes(event.type)
+    if (display) blocks.push({ key: event.event_id, event, text, count: 1 })
+  }
+  return blocks
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
@@ -83,6 +132,7 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
   const [error, setError] = useState('')
   const [sessionsError, setSessionsError] = useState('')
   const [eventsError, setEventsError] = useState('')
+  const [socketState, setSocketState] = useState<'connecting' | 'live' | 'reconnecting' | 'fallback'>('connecting')
   const [copied, setCopied] = useState(false)
   const mountedRef = useRef(true)
   const deviceIdRef = useRef(device.id)
@@ -152,6 +202,7 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
       Boolean(question) && typeof question === 'object' && typeof (question as RuntimeQuestion).id === 'string'
     ))
   }, [activeInteraction])
+  const transcript = useMemo(() => coalesceRuntimeEvents(events), [events])
 
   useEffect(() => {
     const pending = pendingTurnRef.current
@@ -238,7 +289,6 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
     const expectedDeviceId = device.id
     const sessionId = selectedSession?.id
     let cursor = 0
-    let history: RuntimeEvent[] = []
     setEvents([])
     setAnswers({})
     setEventsError('')
@@ -259,10 +309,12 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
           ? ''
           : '服务器返回了不属于当前会话的事件，已安全忽略。')
         if (scoped.length) {
-          const seen = new Set(history.map((event) => event.event_id))
-          history = [...history, ...scoped.filter((event) => !seen.has(event.event_id))].slice(-200)
           cursor = Math.max(cursor, ...scoped.map((event) => event.sequence))
-          setEvents(history)
+          setEvents((current) => {
+            const byId = new Map(current.map((event) => [event.event_id, event]))
+            for (const event of scoped) byId.set(event.event_id, event)
+            return [...byId.values()].sort((a, b) => a.sequence - b.sequence).slice(-400)
+          })
         }
       } catch (reason) {
         if (isCurrentRequest(controller, expectedDeviceId) && !isAbortError(reason)) {
@@ -281,6 +333,50 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
       endRequest(controller)
     }
   }, [beginRequest, device.id, endRequest, isCurrentRequest, selectedSession?.id])
+
+  useEffect(() => {
+    const expectedDeviceId = device.id
+    const sessionId = selectedSession?.id
+    if (!sessionId) return
+    let disposed = false
+    let socket: WebSocket | null = null
+    let reconnectTimer: number | null = null
+    let attempt = 0
+    const connect = () => {
+      if (disposed) return
+      setSocketState(attempt ? 'reconnecting' : 'connecting')
+      socket = new WebSocket(runtimeSessionSocketUrl(sessionId))
+      socket.onopen = () => { attempt = 0; setSocketState('live') }
+      socket.onmessage = (message) => {
+        if (disposed || deviceIdRef.current !== expectedDeviceId) return
+        try {
+          const body = JSON.parse(String(message.data)) as { type?: string; event?: RuntimeEvent }
+          const event = body.event
+          if (!event || body.type !== 'event' || !isRuntimeEventForSession(event, expectedDeviceId, sessionId)) return
+          setEvents((current) => {
+            if (current.some((item) => item.event_id === event.event_id)) return current
+            return [...current, event].sort((a, b) => a.sequence - b.sequence).slice(-400)
+          })
+        } catch {
+          // Ignore malformed frames; the HTTP fallback remains active.
+        }
+      }
+      socket.onclose = (event) => {
+        if (disposed) return
+        if (event.code === 4401 || event.code === 4404) { setSocketState('fallback'); return }
+        setSocketState('reconnecting')
+        reconnectTimer = window.setTimeout(connect, Math.min(1000 * 2 ** attempt++, 8000))
+      }
+      socket.onerror = () => socket?.close()
+    }
+    connect()
+    return () => {
+      disposed = true
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      socket?.close(1000)
+      setSocketState('connecting')
+    }
+  }, [device.id, selectedSession?.id])
 
   const closeDialog = () => {
     mountedRef.current = false
@@ -739,14 +835,24 @@ export function DeviceRuntimeDialog({ device, onClose, onChanged }: Props) {
 
               {selectedSession.last_error && <p className="m-0 text-xs text-[#ffadb5]">{selectedSession.last_error}</p>}
               {eventsError && <p role="status" className="m-0 text-[10px] text-[#ffadb5]">{eventsError}</p>}
-              <div className="grid max-h-48 gap-1 overflow-y-auto border-t border-[#293641] pt-3">
-                <strong className="mb-1 text-[10px] tracking-wide text-[#71808c]">事件时间线</strong>
-                {[...events].reverse().slice(0, 20).map((event) => (
-                  <div key={event.event_id} className="grid grid-cols-[70px_1fr] gap-2 rounded bg-[#0b1117] px-2 py-1.5 text-[10px]">
-                    <time className="font-mono text-[#596672]">{eventTime(event)}</time>
-                    <span className="min-w-0 truncate font-mono text-[#aebac3]">{event.type}</span>
-                  </div>
-                ))}
+              <div className="flex items-center justify-between gap-3 border-t border-[#293641] pt-3 text-[10px] text-[#71808c]">
+                <span className="flex items-center gap-1.5"><Radio className={`size-3 ${socketState === 'live' ? 'text-primary' : socketState === 'reconnecting' ? 'text-[#e9bd68]' : 'text-[#71808c]'}`} />{socketState === 'live' ? '实时连接' : socketState === 'fallback' ? 'HTTP 兜底' : socketState === 'reconnecting' ? '正在重连' : '正在连接'}</span>
+                <span>{transcript.length} 个工作块</span>
+              </div>
+              <div className="grid max-h-[min(560px,48dvh)] gap-2 overflow-y-auto border-t border-[#293641] pt-3">
+                <strong className="mb-1 text-[10px] tracking-wide text-[#71808c]">实时工作流</strong>
+                {transcript.map((block) => {
+                  const { event, text } = block
+                  const role = event.type === 'turn.input' ? 'ml-auto max-w-[88%] bg-primary/15 border-primary/30' : 'mr-auto max-w-[92%] bg-[#0b1117] border-[#293641]'
+                  return (
+                    <div key={block.key} className={`rounded-md border px-3 py-2 text-xs ${role}`}>
+                      <div className="mb-1 flex items-center justify-between gap-3 text-[10px] text-[#71808c]">
+                        <span>{eventLabel(event.type)}</span><time className="font-mono text-[#596672]">{eventTime(event)}</time>
+                      </div>
+                      {text ? <div className="whitespace-pre-wrap break-words leading-relaxed text-[#dce6ed]">{text}</div> : <div className="font-mono text-[10px] text-[#9eacb6]">{eventLabel(event.type)}</div>}
+                    </div>
+                  )
+                })}
                 {!events.length && <span className="text-[10px] text-[#596672]">尚无 Runtime 事件</span>}
               </div>
             </section>
