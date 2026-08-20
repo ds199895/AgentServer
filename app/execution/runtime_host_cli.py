@@ -66,6 +66,7 @@ def _default_adapter_registry(
     # authoritative check and a provider is never allowed to fall back bare.
     create_codex.transport = "app-server"  # type: ignore[attr-defined]
     probe_adapter = create_codex()
+    create_codex.validate_session = probe_adapter.validate_session  # type: ignore[attr-defined]
     create_codex.available = probe_adapter.probe_sync().available  # type: ignore[attr-defined]
     create_codex.version = ""  # type: ignore[attr-defined]
     create_codex.capabilities = CodexRuntimeAdapter.capabilities  # type: ignore[attr-defined]

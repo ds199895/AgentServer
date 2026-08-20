@@ -130,6 +130,8 @@ class AgentRuntimeDeviceConnectorTests(unittest.IsolatedAsyncioTestCase):
         second_page = self.poll("device-b")
         self.assertEqual([item.payload["session_id"] for item in first_page.commands], ["agent-a"])
         self.assertEqual([item.payload["session_id"] for item in second_page.commands], ["agent-b"])
+        self.assertIsNone(first_page.commands[0].payload["options"]["resume_cursor"])
+        self.assertIsNone(second_page.commands[0].payload["options"]["resume_cursor"])
         self.ack("device-a", first_page.commands[0].id, "ack-start-a")
         self.ack("device-b", second_page.commands[0].id, "ack-start-b")
         self.events(
@@ -196,6 +198,34 @@ class AgentRuntimeDeviceConnectorTests(unittest.IsolatedAsyncioTestCase):
                 cwd="/workspace",
             )
         self.assertEqual(self.poll("device-a").commands, ())
+
+    async def test_rejected_start_transitions_agent_session_to_failed(self) -> None:
+        session = await self.service.create(
+            owner_id="alice",
+            device_id="device-a",
+            provider="codex",
+            cwd="/workspace",
+            session_id="rejected-agent",
+        )
+        page = self.poll("device-a")
+        command = page.commands[0]
+        claims, runtime_session_id = self.hosts["device-a"]
+        self.runtime.ack_command(
+            claims,
+            runtime_session_id=runtime_session_id,
+            generation=1,
+            command_id=command.id,
+            status=CommandStatus.REJECTED,
+            ack_id="ack-rejected-start",
+            payload={"error": "provider rejected startup"},
+        )
+
+        async def failed():
+            current = await self.service.get("alice", session.id)
+            return current if current and current.state == "failed" else None
+
+        current = await self.wait_for(failed)
+        self.assertEqual(current.last_error, "provider rejected startup")
 
 
 if __name__ == "__main__":

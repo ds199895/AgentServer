@@ -462,6 +462,12 @@ class FakeTypedAdapterFactory:
 
     def __init__(self) -> None:
         self.adapters: list[FakeTypedAdapter] = []
+        self.validated_specs: list[RuntimeSessionSpec] = []
+
+    def validate_session(self, spec: RuntimeSessionSpec) -> None:
+        self.validated_specs.append(spec)
+        if spec.resume_cursor == {}:
+            raise ValueError("resume_cursor requires thread_id")
 
     def __call__(self) -> FakeTypedAdapter:
         adapter = FakeTypedAdapter()
@@ -1612,14 +1618,24 @@ class DeviceRuntimeHostTests(unittest.IsolatedAsyncioTestCase):
                     "workspace": str(self.root / "does-not-exist"),
                 },
             ),
+            command(
+                3,
+                "session.start",
+                {
+                    "session_id": "invalid-resume",
+                    "provider": "typed",
+                    "workspace": str(self.root),
+                    "options": {"resume_cursor": {}},
+                },
+            ),
         ]
         host = self.host(client, registry={"typed": factory})
         await host.poll_commands()
 
         self.assertEqual([], factory.adapters)
-        self.assertEqual(2, len(client.acknowledgements))
+        self.assertEqual(3, len(client.acknowledgements))
         for command_id, acknowledgement in client.acknowledgements:
-            self.assertIn(command_id, {"command-1", "command-2"})
+            self.assertIn(command_id, {"command-1", "command-2", "command-3"})
             self.assertEqual("rejected", acknowledgement["status"])
             self.assertEqual(
                 "invalid_command", acknowledgement["payload"]["error_code"]

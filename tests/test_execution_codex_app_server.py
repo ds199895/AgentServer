@@ -194,6 +194,26 @@ class CodexRuntimeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.adapters.append(missing)
         self.assertFalse((await missing.probe()).available)
 
+    async def test_session_preflight_distinguishes_new_and_resumed_threads(self) -> None:
+        adapter, _transcript = self.adapter()
+        adapter.validate_session(
+            RuntimeSessionSpec(
+                session_id="new-session",
+                cwd=self.root,
+                permission_mode=PermissionMode.WORKSPACE_WRITE,
+                resume_cursor=None,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "resume_cursor requires thread_id"):
+            adapter.validate_session(
+                RuntimeSessionSpec(
+                    session_id="invalid-resume",
+                    cwd=self.root,
+                    permission_mode=PermissionMode.WORKSPACE_WRITE,
+                    resume_cursor={},
+                )
+            )
+
     async def test_bubblewrap_command_is_fail_closed_and_state_mask_is_last(self) -> None:
         state_dir = self.root / "runtime-state"
         codex_home = self.root / "codex-home"

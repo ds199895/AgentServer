@@ -2206,6 +2206,9 @@ class DeviceRuntimeHost:
                     raise ValueError("session workspace cannot be resolved") from error
                 if not workspace.is_dir():
                     raise ValueError("session workspace must be an existing directory")
+                validator = getattr(factory, "validate_session", None)
+                if callable(validator):
+                    await _await_result(validator(spec))
             return payload
 
         if command_type == "session.stop":

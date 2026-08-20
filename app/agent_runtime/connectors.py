@@ -223,7 +223,11 @@ class DeviceRuntimeConnector(DeviceConnector):
                 options={
                     "permission_mode": spec.permission_mode,
                     "model": spec.model,
-                    "resume_cursor": dict(spec.resume_cursor or {}),
+                    "resume_cursor": (
+                        dict(spec.resume_cursor)
+                        if spec.resume_cursor is not None
+                        else None
+                    ),
                 },
             )
         else:
@@ -437,6 +441,7 @@ class DeviceRuntimeConnector(DeviceConnector):
             self._active_turns.setdefault(spec.session_id, spec.stable_turn_id)
         cursor = max(0, int(after_sequence))
         while not self._closed.is_set():
+            terminal_event_seen = False
             values = await asyncio.to_thread(
                 self.service.session_events,
                 owner_id=spec.owner_id,
@@ -448,7 +453,44 @@ class DeviceRuntimeConnector(DeviceConnector):
                 cursor = max(cursor, source.sequence)
                 normalized = self._normalize(source)
                 if normalized is not None:
+                    terminal_event_seen = terminal_event_seen or (
+                        normalized.type in {"session.stopped", "session.failed"}
+                    )
                     yield normalized
+            if terminal_event_seen:
+                return
+            current = await asyncio.to_thread(
+                self.service.get_session,
+                owner_id=spec.owner_id,
+                session_id=spec.session_id,
+            )
+            if current.lifecycle in {"stopped", "failed", "lost"}:
+                failed = current.lifecycle in {"failed", "lost"}
+                yield AgentEvent(
+                    0,
+                    (
+                        "device-runtime-lifecycle:"
+                        f"{current.session_id}:{current.runtime_session_id}:"
+                        f"{current.runtime_generation}:{current.revision}:"
+                        f"{current.lifecycle}"
+                    ),
+                    current.session_id,
+                    "session.failed" if failed else "session.stopped",
+                    {
+                        "error": (
+                            current.last_error
+                            or f"device provider session is {current.lifecycle}"
+                        )
+                        if failed
+                        else "",
+                        "device_id": current.device_id,
+                        "bridge_instance_id": current.runtime_session_id,
+                        "device_generation": current.runtime_generation,
+                        "runtime_lifecycle": current.lifecycle,
+                    },
+                    current.updated_at,
+                )
+                return
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._closed.wait(), timeout=self.poll_interval)
 

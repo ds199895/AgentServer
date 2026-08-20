@@ -448,6 +448,29 @@ class CodexRuntimeAdapter(RuntimeAdapter):
     async def probe(self) -> RuntimeProbe:
         return await asyncio.to_thread(self.probe_sync)
 
+    def validate_session(self, spec: RuntimeSessionSpec) -> None:
+        """Validate deterministic launch inputs before the command side-effect fence."""
+
+        session_id = _text(spec.session_id)
+        if session_id is None or len(session_id) > 255:
+            raise ValueError("runtime session_id must contain 1..255 characters")
+        _permission_mode(spec.permission_mode)
+        cwd_path = self._resolved_directory(spec.cwd, "Codex session cwd")
+        if (
+            spec.resume_cursor is not None
+            and _resume_thread_id(spec.resume_cursor) is None
+        ):
+            raise ValueError("Codex resume_cursor requires thread_id")
+        try:
+            self._resolved_executable(self._command[0])
+            if self.isolation_enabled:
+                if not sys.platform.startswith("linux"):
+                    raise ValueError("Codex process isolation requires Linux")
+                self._resolved_executable(self.bubblewrap_path)
+                self._isolation_paths(cwd_path)
+        except FileNotFoundError as error:
+            raise ValueError("Codex runtime dependency is unavailable") from error
+
     def probe_sync(self, *, cwd: str | Path | None = None) -> RuntimeProbe:
         """Probe the executable and, when enabled, the real sandbox boundary."""
 
