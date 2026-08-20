@@ -161,7 +161,7 @@ class BootstrapHttpTests(unittest.TestCase):
         getent.write_text(
             "#!/bin/sh\n"
             "if [ \"${1:-}\" = passwd ] && [ \"${2:-}\" = testuser ]; then\n"
-            f"  printf 'testuser:x:1000:1000::%s:/bin/sh\\n' {shlex_quote(str(self.home))}\n"
+            f"  printf 'testuser:x:{os.getuid()}:{os.getgid()}::%s:/bin/sh\\n' {shlex_quote(str(self.home))}\n"
             "  exit 0\n"
             "fi\n"
             "exec /usr/bin/getent \"$@\"\n",
