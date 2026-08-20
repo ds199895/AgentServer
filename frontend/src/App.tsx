@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { XIcon } from 'lucide-react'
 
 import { api, frontendBuildSha, normalizeTerminalSessions, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
+import { agentApi } from '@/agent/api'
+import { AgentSessionPane } from '@/agent/AgentSessionPane'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
-import { DeviceRuntimeDialog } from '@/components/DeviceRuntimeDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
 import { Eyebrow } from '@/components/Eyebrow'
 import { ExecutionStatusNotice } from '@/components/ExecutionStatusNotice'
@@ -44,7 +45,6 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { ExecutionProvider } from '@/execution-context'
 import { activeAgentForTerminal, evidenceFreshness, fieldEvidence } from '@/execution-state'
 import { cn } from '@/lib/utils'
-import { useExecutionStream } from '@/useExecutionStream'
 
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
 const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
@@ -158,7 +158,7 @@ export default function App() {
   const [missingTerminalId, setMissingTerminalId] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
-  const [runtimeDevice, setRuntimeDevice] = useState<Device | null>(null)
+  const [agentSessionId, setAgentSessionId] = useState<string | null>(null)
   const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
   const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -177,7 +177,17 @@ export default function App() {
   const [focusMode, setFocusMode] = useState(false)
   const [error, setError] = useState('')
   const [startupError, setStartupError] = useState('')
-  const execution = useExecutionStream(Boolean(username))
+  // Agent sessions now own their live projection. The legacy execution
+  // stream is intentionally disabled; terminal state comes from /api/terminals
+  // and agent state comes from /api/agent/sessions.
+  const execution = {
+    snapshot: null,
+    status: 'disabled' as const,
+    error: '',
+    available: false,
+    freshness_now: Date.now(),
+    refresh: () => undefined,
+  }
   const activeIdRef = useRef<string | null>(routeFromLocation().terminalId)
   const lastTerminalIdRef = useRef<string | null>(routeFromLocation().terminalId || storedTerminalId())
   const activePreviewRef = useRef<{ preview: Preview; url: string } | null>(null)
@@ -778,7 +788,7 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); invalidateSnapshots(); setUsername(null); setRuntimeDevice(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
+  const logout = async () => { await api.logout(); invalidateSnapshots(); setUsername(null); setAgentSessionId(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
   const stopPreview = async (preview: Preview) => {
     try {
       await api.deletePreview(preview.id)
@@ -1000,10 +1010,17 @@ export default function App() {
               onAdd={() => setDeviceDialog('new')}
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
               onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
-              onRuntime={setRuntimeDevice}
-              onSelectRuntime={(_sessionId, deviceId) => {
-                const device = devices.find((item) => item.id === deviceId)
-                if (device) setRuntimeDevice(device)
+              onStartAgent={(device) => void (async () => {
+                try {
+                  const value = await agentApi.create({ provider: 'generic', device_id: device.id, cwd: '.' , permission_mode: 'workspace-write', model: null })
+                  setAgentSessionId(value.session.id)
+                } catch (reason) {
+                  setError(reason instanceof Error ? reason.message : 'Agent session creation failed')
+                }
+              })()}
+              onSelectAgent={(_sessionId, deviceId) => {
+                void deviceId
+                setAgentSessionId(_sessionId)
               }}
             />
           )}
@@ -1058,13 +1075,10 @@ export default function App() {
           onSaved={() => void load()}
         />
       )}
-      {runtimeDevice && (
-        <DeviceRuntimeDialog
-          key={runtimeDevice.id}
-          device={devices.find((device) => device.id === runtimeDevice.id) || runtimeDevice}
-          onClose={() => setRuntimeDevice(null)}
-          onChanged={() => void load()}
-        />
+      {agentSessionId && (
+        <div className="fixed inset-y-0 right-0 z-40 flex w-[min(680px,100vw)] border-l border-[#26343e] shadow-[-20px_0_60px_#0008]">
+          <AgentSessionPane sessionId={agentSessionId} onClose={() => setAgentSessionId(null)} />
+        </div>
       )}
       {previewTarget && (
         <PreviewDialog

@@ -1,8 +1,9 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
-import { Activity, Cpu, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
+import { Activity, Bot, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
-import { api, type Device, type RuntimeSession, type TerminalSession } from '@/api'
-import type { RuntimeRoomSession } from '@/pixel/scene'
+import { api, type Device, type TerminalSession } from '@/api'
+import { agentApi } from '@/agent/api'
+import type { AgentRoomSession } from '@/pixel/scene'
 import { DeviceIcon, StateBadge } from '@/components/device-bits'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -40,14 +41,14 @@ type Props = {
   onSync: () => void
   onAdd: () => void
   onSelectTerminal: (sessionId: string) => void
-  onSelectRuntime: (sessionId: string, deviceId: string) => void
+  onSelectAgent: (sessionId: string, deviceId: string) => void
   onPreview: (device?: Device) => void
-  onRuntime: (device: Device) => void
+  onStartAgent: (device: Device) => void
 }
 
-export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onSelectRuntime, onPreview, onRuntime }: Props) {
+export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onSelectAgent, onPreview, onStartAgent }: Props) {
   const [view, setView] = useState<'world' | 'list'>('world')
-  const [runtimeSessions, setRuntimeSessions] = useState<RuntimeRoomSession[]>([])
+  const [agentSessions, setAgentSessions] = useState<AgentRoomSession[]>([])
   const sessionsByDevice = useMemo(() => {
     const result = new Map<string, TerminalSession[]>()
     for (const session of sessions) {
@@ -71,15 +72,12 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
     let disposed = false
     let timer: number | undefined
     const refresh = async () => {
-      const values = await Promise.all(devices.map(async (device) => {
-        try {
-          const result = await api.runtimeSessions(device.id)
-          return result.sessions as RuntimeSession[]
-        } catch {
-          return []
-        }
-      }))
-      if (!disposed) setRuntimeSessions(values.flat())
+      try {
+        const result = await agentApi.sessions()
+        if (!disposed) setAgentSessions(result.sessions)
+      } catch {
+        if (!disposed) setAgentSessions([])
+      }
       if (!disposed) timer = window.setTimeout(() => void refresh(), 5000)
     }
     void refresh()
@@ -137,9 +135,9 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
             正在生成像素基地…
           </div>
         }>
-          <DeviceWorld devices={devices} sessions={sessions} runtimeSessions={runtimeSessions} busyId={busyId} onOpen={onOpen} onProbe={onProbe} onEdit={onEdit} onSelectTerminal={onSelectTerminal} onSelectRuntime={(sessionId) => {
-            const runtime = runtimeSessions.find((item) => item.id === sessionId)
-            if (runtime) onSelectRuntime(sessionId, runtime.device_id)
+          <DeviceWorld devices={devices} sessions={sessions} agentSessions={agentSessions} busyId={busyId} onOpen={onOpen} onProbe={onProbe} onEdit={onEdit} onSelectTerminal={onSelectTerminal} onSelectAgent={(sessionId) => {
+            const agent = agentSessions.find((item) => item.id === sessionId)
+            if (agent) onSelectAgent(sessionId, agent.device_id || '')
           }} />
         </Suspense>
       ) : (
@@ -220,13 +218,12 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                         <MonitorPlay />
                         <span className="max-md:hidden">预览</span>
                       </Button>
+                      <Button variant="outline" size="xs" aria-label={`在 ${device.name} 启动 Agent 会话`} title="启动 Agent 会话" className="max-md:size-7 max-md:rounded-md max-md:px-0" disabled={!device.ssh_available} onClick={() => onStartAgent(device)}>
+                        <Bot /><span className="max-md:hidden">Agent</span>
+                      </Button>
                       <Button variant="outline" size="xs" aria-label={`检测 ${device.name}`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onProbe(device)}>
                         <Activity />
                         <span className="max-md:hidden">检测</span>
-                      </Button>
-                      <Button variant="outline" size="xs" aria-label={`管理 ${device.name} 的 Agent Runtime`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onRuntime(device)}>
-                        <Cpu />
-                        <span className="max-md:hidden">Runtime</span>
                       </Button>
                       <Button variant="outline" size="xs" aria-label={`编辑 ${device.name}`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onEdit(device)}>
                         <Pencil />

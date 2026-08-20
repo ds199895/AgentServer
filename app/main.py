@@ -38,10 +38,13 @@ from .artifacts import (
     build_openai_responses_image_content,
     build_read_image_result,
 )
+from .agent_runtime.api import build_agent_router
+from .agent_runtime.service import AgentSessionService
+from .agent_runtime.store import AgentEventStore
+from .agent_runtime.providers import CodexProviderBridge
 from .auth import SessionSigner, UserStore, load_or_create_secret
 from .devices import DeviceStore, FrpMonitor, probe_ssh
 from .execution import EntityKind, ExecutionError, ExecutionStore, new_id
-from .execution.api import build_execution_router
 from .execution.control import ExecutionControlBroker, read_linux_process_identity
 from .execution.device_runtime import DeviceRuntimeService, DeviceRuntimeStore
 from .execution.device_runtime_api import (
@@ -214,7 +217,7 @@ def managed_terminal_environment(
     return result
 
 
-class TerminalExecutionLifecycle:
+class TerminalLifecycle:
     """Serialize TerminalManager lifecycle evidence into durable projections."""
 
     _PRE_READY = frozenset({"requested", "provisioning", "connecting"})
@@ -516,9 +519,17 @@ async def resolve_execution_artifact_scope(
     return result
 
 
+# Kept only for terminal lifecycle test/import compatibility. This is not an
+# AgentSession or provider runtime model and has no session API fallback.
+TerminalExecutionLifecycle = TerminalLifecycle
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     artifact_events = ArtifactEventStore(DATA_DIR / "agent_server.db")
+    agent_sessions = AgentSessionService(AgentEventStore(DATA_DIR / "agent_server.db"))
+    agent_sessions.registry.register("codex", CodexProviderBridge, replace=True)
+    app.state.agent_sessions = agent_sessions
 
     def publish_runtime_artifact(event) -> None:
         path = event.payload.get("path")
@@ -613,7 +624,7 @@ async def lifespan(app: FastAPI):
     )
     observation_ingest_stats = {"dropped": 0, "failed": 0, "accepted": 0}
     server_loop = asyncio.get_running_loop()
-    terminal_execution_lifecycle = TerminalExecutionLifecycle(
+    terminal_lifecycle = TerminalLifecycle(
         execution,
         server_loop,
         ready_grace=float(os.getenv("TERMINAL_PTY_READY_GRACE", "0.25")),
@@ -797,7 +808,8 @@ async def lifespan(app: FastAPI):
     app.state.artifact_ingest_stats = artifact_ingest_stats
     app.state.artifact_rate_windows = artifact_rate_windows
     app.state.execution_artifact_scope = execution_artifact_scope
-    app.state.terminal_execution_lifecycle = terminal_execution_lifecycle
+    app.state.terminal_lifecycle = terminal_lifecycle
+    app.state.terminal_execution_lifecycle = terminal_lifecycle
     app.state.workspaces = WorkspaceService(
         grant_ttl=float(os.getenv("FILE_GRANT_TTL", "120")),
         max_file_bytes=int(
@@ -828,7 +840,7 @@ async def lifespan(app: FastAPI):
         launch_id = new_id()
         session: TerminalSession | None = None
         try:
-            await terminal_execution_lifecycle.register_connecting(
+            await terminal_lifecycle.register_connecting(
                 owner_id=owner_id,
                 terminal_id=terminal_id,
                 launch_id=launch_id,
@@ -892,9 +904,9 @@ async def lifespan(app: FastAPI):
         for session in tuple(app.state.terminals.sessions.values()):
             if not session.owner or not session.managed or not session.launch_id:
                 continue
-            terminal_execution_lifecycle.remember_recovered(session)
+            terminal_lifecycle.remember_recovered(session)
             try:
-                await terminal_execution_lifecycle.register_connecting(
+                await terminal_lifecycle.register_connecting(
                     owner_id=session.owner,
                     terminal_id=session.id,
                     launch_id=session.launch_id,
@@ -902,7 +914,7 @@ async def lifespan(app: FastAPI):
                     attributes={"intended_agent_kind": session.agent_hint},
                 )
                 if not session.active:
-                    await terminal_execution_lifecycle.mark_unavailable(
+                    await terminal_lifecycle.mark_unavailable(
                         session,
                         return_code=session.return_code,
                     )
@@ -965,7 +977,7 @@ async def lifespan(app: FastAPI):
         with contextlib.suppress(BaseException):
             await asyncio.sleep(0)
         with contextlib.suppress(BaseException):
-            await terminal_execution_lifecycle.close()
+            await terminal_lifecycle.close()
 
         if observation_ingest_task is not None:
             with contextlib.suppress(BaseException):
@@ -982,6 +994,8 @@ async def lifespan(app: FastAPI):
                 await preview_manager.close()
         with contextlib.suppress(BaseException):
             await asyncio.to_thread(app.state.workspaces.close)
+        with contextlib.suppress(BaseException):
+            await agent_sessions.close()
 
     app.state.frp_monitor = None
     app.state.frp_monitor_task = None
@@ -1010,11 +1024,11 @@ async def lifespan(app: FastAPI):
             default_owner=ADMIN_USERNAME,
             artifact_callback=record_terminal_artifact,
             agent_observation_callback=record_agent_observation,
-            terminal_lifecycle_callback=terminal_execution_lifecycle.callback,
+            terminal_lifecycle_callback=terminal_lifecycle.callback,
             control_binding_callback=bind_execution_control_launch,
         )
         app.state.terminals = terminal_manager_instance
-        terminal_execution_lifecycle.bind_manager(terminal_manager_instance)
+        terminal_lifecycle.bind_manager(terminal_manager_instance)
         await recover_managed_terminals()
 
         artifact_ingest_task = asyncio.create_task(artifact_ingest_worker())
@@ -1062,6 +1076,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AgentServer Terminal", lifespan=lifespan)
+app.state.signer = signer
+app.state.cookie_name = COOKIE_NAME
 
 
 @app.middleware("http")
@@ -1186,15 +1202,9 @@ def workspace_service(request: Request) -> WorkspaceService:
 
 
 app.include_router(
-    build_execution_router(
-        current_user,
-        signer.verify,
-        cookie_name=COOKIE_NAME,
-    )
-)
-app.include_router(
     build_device_runtime_router(current_user, browser_cookie_name=COOKIE_NAME)
 )
+app.include_router(build_agent_router(current_user))
 
 
 async def bind_terminal_workspace(application: FastAPI, session):
@@ -1789,8 +1799,8 @@ async def reconcile_execution_state(
     manager: TerminalManager = app.state.terminals
     service: ExecutionService = app.state.execution
     store: ExecutionStore = app.state.execution_store
-    lifecycle: TerminalExecutionLifecycle = (
-        app.state.terminal_execution_lifecycle
+    lifecycle: TerminalLifecycle = getattr(
+        app.state, "terminal_lifecycle", app.state.terminal_execution_lifecycle
     )
     orphan_timeout = max(
         1.0, float(os.getenv("TERMINAL_LAUNCH_ORPHAN_TIMEOUT", "30"))
@@ -2110,8 +2120,8 @@ async def create_terminal(
         terminal_id = new_id()
         launch_id = new_id()
         execution: ExecutionService = request.app.state.execution
-        lifecycle: TerminalExecutionLifecycle = (
-            request.app.state.terminal_execution_lifecycle
+        lifecycle: TerminalLifecycle = getattr(
+            request.app.state, "terminal_lifecycle", request.app.state.terminal_execution_lifecycle
         )
         session: TerminalSession | None = None
         try:
@@ -2185,7 +2195,10 @@ async def delete_terminal(
     await asyncio.to_thread(request.app.state.workspaces.unbind, username, session_id)
     if not await manager.delete(session_id):
         raise HTTPException(status_code=404, detail="Terminal not found")
-    await request.app.state.terminal_execution_lifecycle.mark_unavailable(
+    lifecycle = getattr(
+        request.app.state, "terminal_lifecycle", request.app.state.terminal_execution_lifecycle
+    )
+    await lifecycle.mark_unavailable(
         session,
         return_code=session.return_code,
     )
@@ -3113,6 +3126,8 @@ if FRONTEND_DIST.is_dir():
 
     @app.get("/{path:path}", include_in_schema=False)
     async def frontend(path: str) -> FileResponse:
+        if path == "api" or path.startswith("api/") or path == "ws" or path.startswith("ws/"):
+            raise HTTPException(status_code=404, detail="Not Found")
         requested = (FRONTEND_DIST / path).resolve()
         if path and requested.is_file() and FRONTEND_DIST in requested.parents:
             # index.html 不带内容哈希，禁止启发式缓存；/assets 下的文件带哈希可缓存

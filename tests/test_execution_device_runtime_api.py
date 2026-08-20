@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,11 +8,8 @@ from unittest import mock
 
 import httpx
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from app.execution.device_runtime import (
-    DeviceCredentialClaims,
     DeviceRuntimeService,
     DeviceRuntimeStore,
 )
@@ -225,28 +221,6 @@ class DeviceRuntimeAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(404, response.status_code)
 
-
-    async def test_browser_session_create_replays_a_client_session_id(self) -> None:
-        _enrollment, credential = await self.enroll()
-        heartbeat = await self.heartbeat(credential)
-        self.assertEqual(200, heartbeat.status_code, heartbeat.text)
-        body = {
-            "session_id": "stable-browser-session",
-            "provider": "codex",
-            "cwd": "/workspace",
-            "permission_mode": "workspace-write",
-        }
-        first = await self.client.post(
-            "/api/devices/device-1/runtime/sessions", json=body
-        )
-        replay = await self.client.post(
-            "/api/devices/device-1/runtime/sessions", json=body
-        )
-        self.assertEqual(201, first.status_code, first.text)
-        self.assertEqual(201, replay.status_code, replay.text)
-        self.assertEqual("stable-browser-session", first.json()["session"]["id"])
-        self.assertEqual(first.json()["session"], replay.json()["session"])
-        self.assertEqual(first.json()["command"], replay.json()["command"])
 
     async def test_device_command_ack_requires_a_stable_ack_id(self) -> None:
         _enrollment, credential = await self.enroll()
@@ -673,134 +647,6 @@ class DeviceRuntimeAPITests(unittest.IsolatedAsyncioTestCase):
             stale_event_generation,
         ):
             self.assertNotIn("results", request_error.json())
-
-class DeviceRuntimeWebSocketTests(unittest.TestCase):
-    """The Runtime transcript socket has the same owner fence as HTTP APIs."""
-
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        database = Path(self.temporary.name) / "agentserver.db"
-        self.runtime_store = DeviceRuntimeStore(database)
-        self.service = DeviceRuntimeService(
-            self.runtime_store,
-            ExecutionStore(database),
-            device_exists=lambda owner_id, device_id: (owner_id, device_id)
-            in {("alice", "device-1")},
-        )
-        self.application = FastAPI()
-        self.application.state.device_runtime = self.service
-
-        def current_user(session: str | None = None) -> str | None:
-            return "alice" if session == "valid-session" else None
-
-        self.application.include_router(
-            build_device_runtime_router(
-                current_user, browser_cookie_name="session"
-            )
-        )
-        self.runtime_store.create_session(
-            owner_id="alice",
-            device_id="device-1",
-            provider="codex",
-            workspace="/workspace",
-            runtime_session_id="host-session-1",
-            runtime_generation=1,
-            attributes={},
-            session_id="runtime-session-1",
-            start_command_id="start-command",
-        )
-        self.claims = DeviceCredentialClaims(
-            credential_id="credential",
-            owner_id="alice",
-            device_id="device-1",
-            issued_at=1,
-            expires_at=time.time() + 3600,
-        )
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
-    def append(self, sequence: int, text: str) -> None:
-        with mock.patch.object(
-            self.runtime_store, "require_authenticated_host_on", return_value=None
-        ), mock.patch.object(
-            self.runtime_store, "reconcile_session_commands_on", return_value=None
-        ):
-            self.runtime_store.append_session_events(
-                claims=self.claims,
-                session_id="runtime-session-1",
-                runtime_session_id="host-session-1",
-                runtime_generation=1,
-                events=[
-                    {
-                        "event_id": f"event-{sequence}",
-                        "producer_seq": sequence,
-                    "type": "message.delta",
-                    "payload": {"text": text},
-                    }
-                ],
-            )
-
-    def append_started(self) -> None:
-        with mock.patch.object(
-            self.runtime_store, "require_authenticated_host_on", return_value=None
-        ), mock.patch.object(
-            self.runtime_store, "reconcile_session_commands_on", return_value=None
-        ):
-            self.runtime_store.append_session_events(
-                claims=self.claims,
-                session_id="runtime-session-1",
-                runtime_session_id="host-session-1",
-                runtime_generation=1,
-                events=[
-                    {
-                        "event_id": "event-started",
-                        "producer_seq": 1,
-                        "type": "session.started",
-                        "payload": {},
-                    }
-                ],
-            )
-
-    def test_auth_scope_cursor_replay_and_live_delivery(self) -> None:
-        self.append_started()
-        self.append(2, "replayed")
-        client = TestClient(self.application)
-        with client.websocket_connect(
-            "/ws/runtime-sessions/runtime-session-1?after_sequence=0",
-            cookies={"session": "valid-session"},
-        ) as socket:
-            self.assertEqual("session.started", socket.receive_json()["event"]["type"])
-            replay = socket.receive_json()
-            self.assertEqual("event", replay["type"])
-            self.assertEqual("replayed", replay["event"]["payload"]["text"])
-
-            worker = threading.Thread(target=self.append, args=(3, "live"))
-            worker.start()
-            live = socket.receive_json()
-            worker.join(timeout=2)
-            self.assertEqual("live", live["event"]["payload"]["text"])
-
-        with self.assertRaises(WebSocketDisconnect) as unauthorized:
-            with client.websocket_connect("/ws/runtime-sessions/runtime-session-1") as socket:
-                socket.receive_json()
-        self.assertEqual(4401, unauthorized.exception.code)
-
-        with self.assertRaises(WebSocketDisconnect) as wrong_scope:
-            with client.websocket_connect(
-                "/ws/runtime-sessions/missing", cookies={"session": "valid-session"}
-            ) as socket:
-                socket.receive_json()
-        self.assertEqual(4404, wrong_scope.exception.code)
-
-        with self.assertRaises(WebSocketDisconnect) as bad_cursor:
-            with client.websocket_connect(
-                "/ws/runtime-sessions/runtime-session-1?after_sequence=nope",
-                cookies={"session": "valid-session"},
-            ) as socket:
-                socket.receive_json()
-        self.assertEqual(4400, bad_cursor.exception.code)
-
 
 if __name__ == "__main__":
     unittest.main()

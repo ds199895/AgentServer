@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket
-from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 
 from .device_runtime import (
@@ -21,14 +19,12 @@ from .device_runtime import (
     DeviceRuntimeFenceError,
     DeviceRuntimeNotFound,
     DeviceRuntimeService,
-    RuntimeSession,
 )
 from .errors import CommandConflict, ExecutionError, ValidationError
 from .models import CommandStatus
 
 
 MAX_DEVICE_BODY_BYTES = 64 * 1024
-MAX_BROWSER_BODY_BYTES = 64 * 1024
 MAX_CREDENTIAL_BYTES = 4096
 
 
@@ -84,30 +80,6 @@ class DeviceEventBatchBody(BaseModel):
     runtime_session_id: str = Field(min_length=1, max_length=255)
     generation: int = Field(ge=1, le=MAX_SQLITE_INTEGER)
     events: list[dict[str, Any]] = Field(min_length=1, max_length=MAX_EVENT_BATCH_SIZE)
-
-
-class RuntimeSessionCreateBody(BaseModel):
-    session_id: str | None = Field(default=None, min_length=1, max_length=255)
-    provider: str = Field(default="codex", min_length=1, max_length=64)
-    cwd: str = Field(default=".", min_length=1, max_length=4096)
-    permission_mode: Literal[
-        "approval-required", "workspace-write", "full-access", "auto"
-    ] = "workspace-write"
-    model: str | None = Field(default=None, max_length=255)
-    service_tier: str | None = Field(default=None, max_length=100)
-    resume_cursor: dict[str, Any] | None = None
-
-
-class RuntimeTurnBody(BaseModel):
-    input: str = Field(min_length=1, max_length=49_152)
-    turn_id: str | None = Field(default=None, max_length=255)
-    # Model selection is session-scoped in v1. It remains accepted here so an
-    # older/newer UI can call the same endpoint without leaking it into text.
-    model: str | None = Field(default=None, max_length=255)
-
-
-class RuntimeInterruptBody(BaseModel):
-    turn_id: str | None = Field(default=None, max_length=255)
 
 
 def _service(request: Request) -> DeviceRuntimeService:
@@ -199,28 +171,6 @@ def public_runtime_status(value: Mapping[str, Any]) -> dict[str, Any]:
         "last_seen_at": value.get("last_seen_at"),
         "online_until": value.get("online_until"),
         "lease_expires_at": value.get("online_until"),
-    }
-
-
-def public_runtime_session(session: RuntimeSession) -> dict[str, Any]:
-    value = session.as_dict()
-    attributes = value.get("attributes")
-    options = attributes.get("options") if isinstance(attributes, Mapping) else None
-    if not isinstance(options, Mapping):
-        options = {}
-    return {
-        **value,
-        "id": session.session_id,
-        "state": session.lifecycle,
-        "cwd": session.workspace,
-        "permission_mode": str(options.get("permission_mode") or "workspace-write"),
-        "model": str(options["model"]) if options.get("model") else None,
-        "resume_cursor": options.get("resume_cursor"),
-        "active_turn_id": (
-            str(attributes["active_turn_id"])
-            if isinstance(attributes, Mapping) and attributes.get("active_turn_id")
-            else None
-        ),
     }
 
 
@@ -392,261 +342,6 @@ def build_device_runtime_router(
             return {"command": command.as_dict()}
         except (DeviceRuntimeError, ExecutionError, ValueError) as error:
             raise _http_error(error) from error
-
-    @router.get("/api/devices/{device_id}/runtime/sessions")
-    async def list_runtime_sessions(
-        device_id: str,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-        limit: int = Query(default=200, ge=1, le=1000),
-    ) -> dict[str, Any]:
-        try:
-            # Do not let an arbitrary device id become an owner-side filter
-            # oracle; require the inventory device before listing.
-            await asyncio.to_thread(
-                _service(request).runtime_status,
-                owner_id=username,
-                device_id=device_id,
-            )
-            sessions = await asyncio.to_thread(
-                _service(request).list_sessions,
-                owner_id=username,
-                device_id=device_id,
-                limit=limit,
-            )
-            return {"sessions": [public_runtime_session(item) for item in sessions]}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.post("/api/devices/{device_id}/runtime/sessions", status_code=201)
-    async def create_runtime_session(
-        device_id: str,
-        body: RuntimeSessionCreateBody,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        try:
-            session = await asyncio.to_thread(
-                _service(request).create_session,
-                owner_id=username,
-                device_id=device_id,
-                provider=body.provider,
-                workspace=body.cwd,
-                session_id=body.session_id,
-                options={
-                    "permission_mode": body.permission_mode,
-                    "model": body.model,
-                    "service_tier": body.service_tier,
-                    "resume_cursor": body.resume_cursor,
-                },
-            )
-            command = await asyncio.to_thread(
-                _service(request).execution_store.command_queue.get,
-                owner_id=username,
-                command_id=session.start_command_id,
-            )
-            return {
-                "session": public_runtime_session(session),
-                "command": command.as_dict() if command is not None else None,
-            }
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.get("/api/runtime-sessions/{session_id}")
-    async def get_runtime_session(
-        session_id: str,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        try:
-            session = await asyncio.to_thread(
-                _service(request).get_session,
-                owner_id=username,
-                session_id=session_id,
-            )
-            return {"session": public_runtime_session(session)}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.post("/api/runtime-sessions/{session_id}/turns", status_code=202)
-    async def start_runtime_turn(
-        session_id: str,
-        body: RuntimeTurnBody,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        try:
-            command = await asyncio.to_thread(
-                _service(request).send_turn,
-                owner_id=username,
-                session_id=session_id,
-                input=body.input,
-                turn_id=body.turn_id,
-            )
-            return {"command": command.as_dict()}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.post("/api/runtime-sessions/{session_id}/interrupt", status_code=202)
-    async def interrupt_runtime_turn(
-        session_id: str,
-        body: RuntimeInterruptBody,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        try:
-            command = await asyncio.to_thread(
-                _service(request).interrupt_session,
-                owner_id=username,
-                session_id=session_id,
-                turn_id=body.turn_id,
-            )
-            return {"command": command.as_dict()}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.post(
-        "/api/runtime-sessions/{session_id}/interactions/{interaction_id}/respond",
-        status_code=202,
-    )
-    async def respond_runtime_interaction(
-        session_id: str,
-        interaction_id: str,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        value = await _bounded_json(request, maximum=MAX_BROWSER_BODY_BYTES)
-        try:
-            command = await asyncio.to_thread(
-                _service(request).respond_to_request,
-                owner_id=username,
-                session_id=session_id,
-                request_id=interaction_id,
-                response=value,
-            )
-            return {"command": command.as_dict()}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.delete("/api/runtime-sessions/{session_id}", status_code=202)
-    async def stop_runtime_session(
-        session_id: str,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-    ) -> dict[str, Any]:
-        try:
-            command = await asyncio.to_thread(
-                _service(request).stop_session,
-                owner_id=username,
-                session_id=session_id,
-            )
-            return {"command": command.as_dict()}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.get("/api/runtime-sessions/{session_id}/events")
-    async def runtime_session_events(
-        session_id: str,
-        request: Request,
-        username: str = Depends(browser_user_dependency),
-        after_sequence: int = Query(default=0, ge=0, le=MAX_SQLITE_INTEGER),
-        limit: int = Query(default=200, ge=1, le=1000),
-    ) -> dict[str, Any]:
-        try:
-            events = await asyncio.to_thread(
-                _service(request).session_events,
-                owner_id=username,
-                session_id=session_id,
-                after_sequence=after_sequence,
-                limit=limit,
-            )
-            return {"events": [item.as_dict() for item in events]}
-        except (DeviceRuntimeError, ExecutionError, ValueError) as error:
-            raise _http_error(error) from error
-
-    @router.websocket("/ws/runtime-sessions/{session_id}")
-    async def runtime_session_socket(
-        websocket: WebSocket,
-        session_id: str,
-    ) -> None:
-        """Replay then tail one owner-scoped Runtime session without polling."""
-        try:
-            parameters = inspect.signature(browser_user_dependency).parameters
-            username = (
-                browser_user_dependency(websocket.cookies.get(browser_cookie_name))
-                if parameters
-                else browser_user_dependency()
-            )
-            if inspect.isawaitable(username):
-                username = await username
-        except Exception:
-            await websocket.accept()
-            await websocket.close(code=4401)
-            return
-        if not username:
-            await websocket.accept()
-            await websocket.close(code=4401)
-            return
-        service = _service(websocket)
-        try:
-            await asyncio.to_thread(
-                service.get_session, owner_id=username, session_id=session_id
-            )
-        except (DeviceRuntimeError, ExecutionError, ValueError):
-            await websocket.accept()
-            await websocket.close(code=4404)
-            return
-        try:
-            after_sequence = max(
-                0, int(websocket.query_params.get("after_sequence", "0"))
-            )
-        except ValueError:
-            await websocket.accept()
-            await websocket.close(code=4400)
-            return
-
-        await websocket.accept()
-        cursor = after_sequence
-
-        async def send_events() -> None:
-            nonlocal cursor
-            while True:
-                events = await asyncio.to_thread(
-                    service.session_events,
-                    owner_id=username,
-                    session_id=session_id,
-                    after_sequence=cursor,
-                    limit=200,
-                )
-                for event in events:
-                    if event.sequence <= cursor:
-                        continue
-                    cursor = event.sequence
-                    await websocket.send_json({
-                        "type": "event",
-                        "cursor": cursor,
-                        "event": event.as_dict(),
-                    })
-                await asyncio.sleep(0.25)
-
-        async def receive_until_disconnect() -> None:
-            while True:
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    raise WebSocketDisconnect(message.get("code", 1000))
-
-        sender = asyncio.create_task(send_events())
-        receiver = asyncio.create_task(receive_until_disconnect())
-        try:
-            done, pending = await asyncio.wait(
-                {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, *pending, return_exceptions=True)
-        finally:
-            sender.cancel()
-            receiver.cancel()
 
     @router.post("/api/device-runtime/v1/enroll", status_code=201)
     async def device_enroll(request: Request, response: Response) -> dict[str, Any]:
