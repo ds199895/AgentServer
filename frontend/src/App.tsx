@@ -357,7 +357,11 @@ export default function App() {
           setStartupError(`${reason.message}。部署已被安全拦截，请刷新或回滚版本。`)
           return
         }
-        setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+        if (frontendBuildSha === 'development') {
+          setStartupError('无法连接本地 AgentServer 后端，请先启动 18088 端口服务后刷新页面。')
+        } else {
+          setStartupError('无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。')
+        }
         return
       }
 

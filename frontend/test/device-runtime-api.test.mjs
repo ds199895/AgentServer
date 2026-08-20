@@ -156,4 +156,7 @@ test('runtime dialog does not persist or log secrets and tears down asynchronous
   assert.match(app, /<DownloadsPage devices=\{devices\} onChanged=/)
   assert.match(app, /setUsername\(null\); setRuntimeDevice\(null\)/)
   assert.match(app, /onAdd=\{\(\) => setDeviceDialog\('new'\)\}/)
+  assert.match(app, /frontendBuildSha === 'development'/)
+  assert.match(app, /无法连接本地 AgentServer 后端，请先启动 18088 端口服务后刷新页面。/)
+  assert.match(app, /无法验证前后端发布版本。部署已被安全拦截，请检查后端版本或回滚。/)
 })
