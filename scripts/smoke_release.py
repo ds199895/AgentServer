@@ -88,7 +88,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:18100")
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--attempts", type=int, default=20)
+    # Production startup restores durable terminal state before binding the
+    # HTTP listener. Busy hosts can legitimately need more than 20 seconds.
+    parser.add_argument("--attempts", type=int, default=60)
     parser.add_argument("--env-file", type=Path)
     args = parser.parse_args()
     base_url = args.base_url.rstrip("/")
