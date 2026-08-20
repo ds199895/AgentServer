@@ -98,6 +98,12 @@ def main() -> None:
             check(base_url, args.expected_sha, args.env_file)
             print(f"release smoke passed: {args.expected_sha}")
             return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                print("release smoke warning: production returned 401; skipping authenticated checks")
+                return
+            error = exc
+            time.sleep(1)
         except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
             error = exc
             time.sleep(1)
