@@ -2,7 +2,8 @@
 
 Agent Runtime Protocol v1 把“终端是否存在”“Agent 是否在线”“任务执行到哪个阶段”拆成独立、
 可恢复的事实。当前代码已经包含事件账本、状态机、受管终端身份、主动上报、被动观测、Lease、
-命令、前端实时视图和 Codex Provider Adapter；不会读取或保存隐藏思考内容。
+命令、前端实时视图、常驻多设备 Runtime Host 和 Codex app-server Adapter；不会读取或保存隐藏
+思考内容。
 
 [![Agent Runtime v1 架构图](../deploy/agent-runtime-framework.visual-check.1440x900.light.png)](../deploy/agent-runtime-framework.html)
 
@@ -20,6 +21,7 @@ Agent Runtime Protocol v1 把“终端是否存在”“Agent 是否在线”“
 | Phase 5 | 核心完成 | cancel/input/retry、Lease fence、命令 ACK journal、父子 Run DAG 与预算/深度限制 |
 | Phase 6 | 已完成 | 浏览器状态、时间线、Run 树、断线 resync 和 projection 驱动的像素动画 |
 | Phase 7 | 部分完成 | CloudEvents、OTel、A2A、MCP 的隐私安全映射；尚未启用外部 exporter |
+| Phase 8 | 核心完成 | 设备 enrollment、长期凭据、Host generation fence、Runtime session 与 Codex app-server 原生控制 |
 
 v1 以单个 AgentServer API 进程和 SQLite 为部署单元。启动时会锁定 `DATA_DIR`；第二个 API
 worker 会失败关闭，避免重复接管 PTY、探针、reconcile 和本地控制 socket。
@@ -325,9 +327,98 @@ Named Pipe DACL、客户端 PID/creation time 和祖先校验，不能仅依赖�
 - handler 副作用后状态不确定时进入 `uncertain`，默认不自动重放。只有显式声明 handler 幂等，
   或用相同 `command_id` 选择 `retry_idempotent` 恢复，才会重试。
 
-Bridge 目前没有设备级 enrollment、自动安装器或 Windows 安全 transport。启动时仍需显式提供
-AgentServer URL、socket 地址、launch root PID，以及管理 API 为当前 Run 签发的 report/command
-Token 文件；不要把 Token 放入 argv、`.env`、终端环境、仓库或日志。
+Bridge 仍是 per-Run 原语，不复用设备长期凭据。启动时需显式提供 AgentServer URL、socket 地址、
+launch root PID，以及管理 API 为当前 Run 签发的 report/command Token 文件；不要把 Token 放入
+argv、`.env`、终端环境、仓库或日志。
+
+### 多设备 Runtime Host
+
+受 t3code 的 provider driver / adapter 边界启发，AgentServer 另提供每台设备一个、只出站连接的
+`DeviceRuntimeHost`。每台设备仅需安装并配对这一个 Host，不再为每个项目或 Provider 复制设备
+credential 和控制协议。浏览器和中心服务只发送统一的 session/turn/interrupt/respond/stop 命令；
+真正访问工作区、Provider 登录态和启动 CLI 子进程的是目标设备上的 Host。Provider 差异收敛在
+`RuntimeAdapter` registry，一个 Host 可注册多个 Provider adapter；目前首个内建实现是 Codex
+`app-server` 双向 JSON-RPC adapter。增加 Provider 时不需要修改设备命令队列或浏览器协议。
+
+这里的“一次”是每台设备各做一次 bootstrap，并不是免除设备注册。设备配对完成后，受控 Runtime
+才不需要为每个 Provider 或项目重复配置 Hook；外部自行启动且没有主动 Adapter 的进程仍走 fallback。
+
+这条链路不要求给每个 Codex 项目配置 Hook。它只覆盖由 AgentServer 创建的原生 Runtime Session；
+用户在外部终端自行启动的 Claude/Kimi/Codex 不会被 daemon 注入或劫持，仍使用前面的 Hook、
+JSONL wrapper 或被动观测。
+
+首次接入一台 Linux 设备：
+
+1. 在“安装客户端”页填写设备 ID、FRP 端口与 SSH 用户，注册中心端设备记录并生成一次性
+   enrollment token。代理名固定为 `${DEVICE_ID}.ssh`；页面只在内存中显示 token，且不会把它拼入命令。
+2. 目标设备需能通过 HTTPS 出站访问 AgentServer，具备 `python3`、`curl` 或 `wget`，并已安装
+   `bubblewrap`、启用非特权 user namespace，以及安装和登录 `codex` 及其 Node.js 运行时；
+   `CODEX_HOME` 必须是现存目录。
+   把 token 写入权限为 `0600` 的临时文件，不要放进命令行或环境变量。Codex Provider 的
+   bubblewrap preflight 失败时会报告 unavailable，且不会回退为未隔离进程。安装器会在 enrollment
+   前用实际 namespace/mount 参数运行 `/bin/true`，并把解析后的绝对路径固化为 unit 的
+   `--bubblewrap-binary`，避免 service 启动时重新依赖可变的 `PATH`。
+3. 目标设备不需要 AgentServer checkout；以拥有 Codex 登录态的普通用户下载并执行 bootstrap：
+
+   ```bash
+   curl --fail --silent --show-error --proto '=https' --proto-redir '=https' \
+     -o install-agentserver-device.sh https://agentserver.example/device-bootstrap/install.sh
+   bash install-agentserver-device.sh \
+     --device-id DEVICE_ID \
+     --base-url https://agentserver.example \
+     --remote-port 20001 \
+     --ssh-user operator \
+     --runtime-user operator \
+     --runtime-bundle-url https://agentserver.example
+   ```
+
+完整安装器隐藏读取 FRP/enrollment token，先以 Runtime 用户做 fail-fast preflight，再安装系统级
+SSH/FRP、启用 linger，最后写入并验证该用户的 `agentserver-runtime.service`。已有隧道使用
+`--runtime-only`；已有其他 frpc 使用 `--merge-existing /path/to/frpc.toml`；非交互场景使用两个
+mode-0600 token 文件。普通重跑复用匹配的受管 FRP token 并保留 Runtime credential，显式
+`--reenroll` 才换证。匹配的受管 FRP token 只有在显式传入 `--rotate-frp-token` 时才会替换；没有
+user-systemd 时完整安装会失败；底层 Runtime 安装器仍可单独写 unit 并
+打印前台命令。长期 credential、Host generation、ACK journal 和事件 spool 仅保存在 owner-private
+state 目录；服务端数据库只保存 credential hash。
+
+运行边界如下：
+
+- heartbeat 报告 Provider capability 和平台状态，在线判断只采用服务端时间；FRP/SSH 在线与
+  Runtime 在线是三个独立信号；
+- Host 以 HTTPS 短轮询拉取命令（默认 1 秒一次），错误时指数退避；当前没有服务端
+  挂起的长轮询或设备入站连接；
+- 所有命令绑定 owner、device、`runtime_session_id` 和单调 generation；新 Host 接管后旧命令、
+  旧 Session 和迟到事件全部失败关闭；
+- 命令 ACK 和事件使用本地 SQLite 持久重试；非幂等命令若在副作用后崩溃会进入 `uncertain`，
+  不自动重复执行。新 generation 会把旧 fence 的活跃 journal 工作和未结算 ACK 原子标为
+  `quarantined`，使其退出重放和 causal barrier，同时保留 settled history 与 server cursor。事件仅在
+  当前 generation 内 at-least-once；Host 重启会生成新 fence，并把已不可能通过旧 fence 的 spool
+  原子移入 bounded durable dead-letter。dead-letter 保留原 envelope/fence、原因与隔离时间并按
+  最旧优先裁剪，不把旧事件伪装成已送达，也不静默丢弃；
+- 服务端按 `(event_id, producer_seq)` 逐条返回 accepted、duplicate 或 rejected。permanent NACK
+  在 Host 端原子转入 durable dead-letter；retryable NACK 与缺失结果保留在 live spool。未知、重复或
+  畸形结果使整批 settlement 失败且本地不变；网络/HTTP 失败同样不删除事件。保留配额耗尽或 Session
+  生命周期/状态分歧不会降级成 accepted，而是失败关闭并给出逐事件 permanent rejection。跨 Session
+  delivery 共用一个服务端事务，envelope fence 必须与请求 fence 完全一致；Host 以逐项 `results` 为
+  唯一结算依据，并在事件前先结算 causal command ACK，uncertain side effect 会显式阻塞 spool；
+- stop 命令入队和 Session 的 `stopping` 投影在同一 SQLite 事务内提交。只吸收仍与原
+  start/turn/interaction identity 匹配的在途生命周期事件，且不退出 `stopping`；stop 过期、拒绝、
+  缺失或完成后没有终态事件时会 reconcile 到 `failed`，不会留下永久悬挂的 Session；
+- typed Adapter 的 event pump 异常或提前 EOF 会先 durable spool `session.failed`，再移除 handle 和
+  关闭 Adapter；spool 满时先 flush，仍失败则保留 handle 并显式重试。已写入 Provider 终态后 EOF
+  只回收，不重复合成失败事件；
+- enrollment 逻辑上只消费一次；若成功响应丢失，从首次消费起固定 5 分钟内重试
+  同一 token 会取回同一 credential。轮换在 Host 端持久化 `request_id + 原 fence`，响应丢失后
+  使用同一 request 幂等恢复，直到 replacement 过期或被管理员撤销；轮换没有固定 5 分钟恢复
+  窗口。长期 credential 也可从管理端撤销，删除设备会先撤销凭据；
+- Codex 子进程只读挂载主机根目录，只对 workspace 与 `CODEX_HOME` 开放写入，并在最后用 tmpfs
+  遮蔽 Host state dir；网络保持可用，但 Provider 无法读取同 UID Host 的 credential/SQLite。UI
+  的 `full-access` 只关闭边界内的 Codex 审批，不会取消这层挂载隔离或授予整机写权限。该边界
+  仍可读根文件系统并访问网络；Host 文件的 `0700`/`0600` 也不防范 bubblewrap 之外的恶意
+  同 UID 进程，这类工作负载必须用独立 UID 或容器隔离。
+
+完整协议、Codex RPC 映射、安装命令与恢复语义见
+[`device-runtime-host.md`](device-runtime-host.md)。
 
 ## 7. Token、命令与委派边界
 
@@ -393,6 +484,10 @@ GET  /api/runtime/v1/commands
 POST /api/runtime/v1/commands/{command_id}/ack
 ```
 
+设备 Host 使用独立长期 credential 与 `/api/device-runtime/v1/*`；浏览器侧另有配对、Runtime
+session、turn、interrupt 和 interaction API。Device credential 与 Reporter Token 双向不可混用，
+详细端点见 [`device-runtime-host.md`](device-runtime-host.md#4-控制协议)。
+
 快照包含 tasks、assignments、runs、agents、terminals、`terminal_bindings`、relations 和未归属
 observation。前端严格通过 `terminal_bindings[].active_run_id` 选择 Run，并以
 `(revision, view_sequence)` 合并 evidence；不会拿不同 Run 的 revision 比“最近”。时间线在 Run
@@ -434,6 +529,12 @@ pseudonym；默认也不外发内部 global sequence。完整 payload 是需要�
 | `OBSERVATION_INGEST_QUEUE_SIZE` | `1024` | 被动 observation 入口队列 |
 | `EXECUTION_MAX_PARENT_DEPTH` | `16` | 父子 Run 最大深度 |
 | `EXECUTION_MAX_CHILD_RUNS` | `8` | 每个父 Run 默认最大 Child Run 数 |
+| `DEVICE_RUNTIME_OFFLINE_AFTER` | `30` 秒 | 独立判断常驻 Device Runtime Host offline 的服务端 TTL |
+| `DEVICE_RUNTIME_MAX_SESSIONS` | `8` | 每 owner/设备的非终态 Runtime Session 上限，允许 1–64 |
+
+Device Runtime 还有固定边界：单事件 64 KiB，批次 100 条/256 KiB（Host 以 224 KiB
+字节预算分批），每 Session 最多保留 100,000 条或 64 MiB，每设备最多 500,000 条或
+256 MiB，Host 本地 spool 最多 10,000 条。保留量任一达限会拒绝新事件，不会沉默删除旧事件。
 
 本地样例见 [`.env.example`](../.env.example)，生产样例见
 [`deploy/agentserver.env.example`](../deploy/agentserver.env.example)。
@@ -441,6 +542,9 @@ pseudonym；默认也不外发内部 global sequence。完整 payload 是需要�
 ## 12. 验证与当前限制
 
 ```bash
+./.venv/bin/python -m unittest \
+  tests.test_execution_device_runtime_api \
+  tests.test_install_agentserver_runtime -v
 ./.venv/bin/python -m unittest discover -s tests -v
 npm --prefix frontend test
 npm --prefix frontend run build
@@ -451,17 +555,19 @@ git diff --check
 
 仍需明确保留的边界：
 
-- Device Bridge 尚无设备长期凭据换取、安装/升级服务和真实 Windows 安全实现；当前生产链路仅
-  支持 Linux，并要求外部启动器安全交付 per-Run Token 文件。
+- Device Runtime Host 已有一次性 enrollment、长期凭据和 Linux user-systemd 安装器，但还没有
+  Windows service 安装器和自动升级通道；per-Run Device Bridge 仍要求安全交付短期 Token 文件。
 - 持久 tmux 的 `local-broker-path-compat` 以同一系统 UID 为信任边界；不受信任的本地 Agent 必须
   通过独立 UID/容器和稳定的系统级 Broker identity 隔离。
-- Bridge 不内置具体 Agent 的 cancel/input 副作用；adapter 必须提供以 `command_id` 幂等的 handler，
-  或显式处理 `uncertain` 恢复。
-- Provider Adapter 只兼容文档化并由脱敏夹具覆盖的事件形状；Provider 升级引入的未知形状会
-  单行失败开放并留下有限诊断，不会猜测字段语义或中断后续 JSONL。
+- Legacy Bridge 不内置具体 Agent 的 cancel/input 副作用；常驻 Host 的 Codex Adapter 使用原生
+  turn/interrupt/interaction RPC。所有非幂等 handler 仍必须显式处理 `uncertain` 恢复。
+- Hook/stream-json Adapter 对未知 telemetry 单行失败开放；主动 app-server 协议对畸形或不可路由
+  JSON 失败关闭，避免在控制通道损坏时猜测语义。
 - Codex 内建 subagent 当前是审计 observation，不等同于跨设备 Child Run。跨设备委派必须先由
   AgentServer 控制面创建 Child Task / Assignment / Run。
-- 外部 OTel/CloudEvents/A2A/MCP exporter、设备级 enrollment 和多 API worker 横向扩展尚未实现。
+- Runtime Adapter 当前只内建 Codex app-server；Claude、Kimi、Cursor/OpenCode 等仍走既有
+  Hook/JSONL 路径，直到各自有稳定、可双向控制的 adapter。
+- 外部 OTel/CloudEvents/A2A/MCP exporter 和多 API worker 横向扩展尚未实现。
 - 被动 observation 无法可靠区分隐藏的 thinking/coding；证据不足时系统会刻意显示 unknown，
   而不是猜测。
 - Windows Terminal/探针与 Bridge 安全边界仍需真实 Windows 主机回归；真实 tmux 环境也应在发布

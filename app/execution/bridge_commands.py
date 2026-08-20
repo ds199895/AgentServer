@@ -15,7 +15,9 @@ from typing import Any
 
 MAX_COMMAND_BYTES = 64 * 1024
 ACK_STATUSES = frozenset({"accepted", "rejected", "completed"})
-TERMINAL_STATUSES = frozenset({"rejected", "completed", "expired"})
+TERMINAL_STATUSES = frozenset(
+    {"rejected", "completed", "expired", "quarantined"}
+)
 SERVER_STATUSES = frozenset(
     {"queued", "delivered", "accepted", "rejected", "completed", "expired"}
 )
@@ -93,6 +95,8 @@ class BridgeCommandJournal:
                     last_handler_at REAL,
                     uncertain_reason TEXT,
                     recovery_count INTEGER NOT NULL DEFAULT 0,
+                    quarantine_reason TEXT,
+                    quarantined_at REAL,
                     received_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -131,6 +135,14 @@ class BridgeCommandJournal:
                 connection.execute(
                     "ALTER TABLE bridge_commands ADD COLUMN "
                     "recovery_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "quarantine_reason" not in columns:
+                connection.execute(
+                    "ALTER TABLE bridge_commands ADD COLUMN quarantine_reason TEXT"
+                )
+            if "quarantined_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE bridge_commands ADD COLUMN quarantined_at REAL"
                 )
             # An executing row has crossed the side-effect boundary but never
             # recorded a result.  Reopening must quarantine it rather than
@@ -300,6 +312,120 @@ class BridgeCommandJournal:
             ).fetchone()
         return int(row["value"]) if row else 0
 
+    def quarantine_stale_runtime_fence(
+        self,
+        *,
+        device_id: str,
+        runtime_session_id: str,
+        generation: int,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Durably retire journal work owned by an earlier Host generation.
+
+        A restarted Runtime Host allocates a new generation before it talks to
+        the control plane.  ACKs from the previous fence can no longer pass the
+        server's active-Host guard, and uncertain handlers from that fence must
+        not block events produced by the new generation forever.  Preserve the
+        records for diagnosis while removing them from dispatch, ACK replay,
+        and causal-barrier queries.
+        """
+
+        resolved_device = self._text(device_id, "device_id")
+        resolved_session = self._text(
+            runtime_session_id, "runtime_session_id"
+        )
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 1 <= generation < 2**63
+        ):
+            raise BridgeCommandJournalError(
+                "runtime generation must be a positive int64"
+            )
+        timestamp = self.clock() if now is None else float(now)
+        if not math.isfinite(timestamp):
+            raise BridgeCommandJournalError(
+                "quarantine timestamp must be finite"
+            )
+        stale_ids: list[str] = []
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT c.command_id, c.command_json
+                FROM bridge_commands AS c
+                WHERE c.quarantined_at IS NULL
+                  AND (
+                        c.status IN ('pending', 'executing', 'uncertain', 'accepted')
+                        OR EXISTS (
+                            SELECT 1 FROM bridge_command_acks AS a
+                            WHERE a.command_id = c.command_id
+                              AND a.delivery_state IN ('pending', 'abandoned')
+                        )
+                  )
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    command = json.loads(str(row["command_json"]))
+                except (TypeError, ValueError):
+                    command = None
+                payload = (
+                    command.get("payload")
+                    if isinstance(command, Mapping)
+                    else None
+                )
+                command_generation = (
+                    payload.get("runtime_generation")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                matches = (
+                    isinstance(command, Mapping)
+                    and str(command.get("target_kind") or "") == "device"
+                    and str(command.get("target_id") or "") == resolved_device
+                    and isinstance(payload, Mapping)
+                    and str(payload.get("device_id") or "") == resolved_device
+                    and str(payload.get("runtime_session_id") or "")
+                    == resolved_session
+                    and isinstance(command_generation, int)
+                    and not isinstance(command_generation, bool)
+                    and command_generation == generation
+                )
+                if not matches:
+                    stale_ids.append(str(row["command_id"]))
+            if not stale_ids:
+                return {"commands": 0, "acks": 0}
+            placeholders = ",".join("?" for _ in stale_ids)
+            command_cursor = connection.execute(
+                f"""
+                UPDATE bridge_commands
+                SET status = CASE
+                        WHEN status IN ('pending', 'executing', 'uncertain', 'accepted')
+                        THEN 'quarantined'
+                        ELSE status
+                    END,
+                    quarantine_reason = 'stale_runtime_generation',
+                    quarantined_at = ?, updated_at = ?
+                WHERE command_id IN ({placeholders})
+                  AND quarantined_at IS NULL
+                """,
+                (timestamp, timestamp, *stale_ids),
+            )
+            ack_cursor = connection.execute(
+                f"""
+                UPDATE bridge_command_acks
+                SET delivery_state = 'quarantined', updated_at = ?
+                WHERE command_id IN ({placeholders})
+                  AND delivery_state IN ('pending', 'abandoned')
+                """,
+                (timestamp, *stale_ids),
+            )
+        return {
+            "commands": int(command_cursor.rowcount),
+            "acks": int(ack_cursor.rowcount),
+        }
+
     def record_server_commands(
         self,
         commands: Iterable[Mapping[str, Any]],
@@ -395,6 +521,16 @@ class BridgeCommandJournal:
                 else None
             ),
             recovery_count=int(row["recovery_count"]),
+            quarantine_reason=(
+                str(row["quarantine_reason"])
+                if row["quarantine_reason"] is not None
+                else None
+            ),
+            quarantined_at=(
+                float(row["quarantined_at"])
+                if row["quarantined_at"] is not None
+                else None
+            ),
         )
         return command
 
@@ -695,6 +831,91 @@ class BridgeCommandJournal:
             ).fetchall()
         return [self._ack_from_row(row) for row in rows]
 
+    def replayable_acks(self, *, now: float | None = None) -> list[BridgeCommandAck]:
+        """Return ACKs a runtime Host may safely replay by stable ``ack_id``.
+
+        Pending ACKs are always replayable.  An ACK abandoned at local TTL is
+        replayable only after a handler attempt: its request may already have
+        committed remotely before the response was lost, and the server's ACK
+        idempotency record is the authority that can resolve that ambiguity.
+        """
+
+        timestamp = self.clock() if now is None else float(now)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_due(connection, timestamp)
+            rows = connection.execute(
+                """
+                SELECT a.*
+                FROM bridge_command_acks AS a
+                JOIN bridge_commands AS c
+                  ON c.command_id = a.command_id
+                WHERE a.delivery_state = 'pending'
+                   OR (
+                       a.delivery_state = 'abandoned'
+                       AND c.handler_attempts > 0
+                   )
+                ORDER BY a.sequence
+                """
+            ).fetchall()
+        return [self._ack_from_row(row) for row in rows]
+
+    def causal_barriers(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Return side-effecting commands whose ACK is not durably settled.
+
+        A handler may persist an event before it can persist its ACK result.  It
+        is therefore unsafe for the Host to infer "no barrier" solely from an
+        empty pending-ACK query: the command may be executing/uncertain, or its
+        pending ACK may have become abandoned when the command TTL elapsed.
+        Preflight rejections have no handler attempt and cannot have emitted a
+        causally dependent event, so an abandoned preflight ACK is excluded.
+        """
+
+        timestamp = self.clock() if now is None else float(now)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_due(connection, timestamp)
+            rows = connection.execute(
+                """
+                SELECT c.server_sequence, c.command_id, c.status,
+                       c.handler_attempts, c.uncertain_reason,
+                       a.ack_id, a.delivery_state
+                FROM bridge_commands AS c
+                LEFT JOIN bridge_command_acks AS a
+                  ON a.command_id = c.command_id
+                WHERE c.status IN ('executing', 'uncertain')
+                   OR (
+                       c.handler_attempts > 0
+                       AND a.delivery_state IN ('pending', 'abandoned')
+                   )
+                ORDER BY c.server_sequence, a.sequence
+                """
+            ).fetchall()
+        return [
+            {
+                "sequence": int(row["server_sequence"]),
+                "command_id": str(row["command_id"]),
+                "status": str(row["status"]),
+                "handler_attempts": int(row["handler_attempts"]),
+                "uncertain_reason": (
+                    str(row["uncertain_reason"])
+                    if row["uncertain_reason"] is not None
+                    else None
+                ),
+                "ack_id": (
+                    str(row["ack_id"])
+                    if row["ack_id"] is not None
+                    else None
+                ),
+                "delivery_state": (
+                    str(row["delivery_state"])
+                    if row["delivery_state"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
     def acknowledgement(
         self, *, command_id: str, status: str
     ) -> BridgeCommandAck | None:
@@ -735,9 +956,9 @@ class BridgeCommandJournal:
                         "acknowledged command response cannot change"
                     )
                 return self._ack_from_row(row)
-            if row["delivery_state"] != "pending":
+            if row["delivery_state"] not in {"pending", "abandoned"}:
                 raise BridgeCommandJournalError(
-                    "expired command ACK cannot be acknowledged"
+                    "command ACK cannot be acknowledged from its current state"
                 )
             connection.execute(
                 """

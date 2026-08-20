@@ -43,6 +43,11 @@ from .devices import DeviceStore, FrpMonitor, probe_ssh
 from .execution import EntityKind, ExecutionError, ExecutionStore, new_id
 from .execution.api import build_execution_router
 from .execution.control import ExecutionControlBroker, read_linux_process_identity
+from .execution.device_runtime import DeviceRuntimeService, DeviceRuntimeStore
+from .execution.device_runtime_api import (
+    build_device_runtime_router,
+    public_runtime_status,
+)
 from .execution.observations import ObservationPublisher
 from .execution.runtime_lock import RuntimeInstanceLock
 from .execution.security import (
@@ -62,6 +67,7 @@ from .preview import (
     rewrite_set_cookie,
     upstream_cookie,
 )
+from .runtime_distribution import load_runtime_distribution
 from .terminal import (
     AGENT_RECORD_MARKER,
     AGENT_SCAN_MARKER,
@@ -101,6 +107,7 @@ from .workspace import (
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data")).expanduser()
+RUNTIME_DIST = Path(os.getenv("RUNTIME_DIST", ROOT / "runtime_dist")).expanduser()
 COOKIE_NAME = "agentserver_session"
 BUILD_SHA = resolve_build_sha(ROOT)
 
@@ -146,6 +153,14 @@ async def event_loop_lag_monitor() -> None:
 
 
 DOWNLOAD_FILES = {
+    "bootstrap-agentserver-device.sh": (
+        ROOT / "scripts" / "bootstrap_agentserver_device.sh",
+        "text/x-shellscript",
+    ),
+    "install-agentserver-device.sh": (
+        ROOT / "scripts" / "bootstrap_agentserver_device.sh",
+        "text/x-shellscript",
+    ),
     "install-frpc-ssh.sh": (ROOT / "scripts" / "install_frpc_ssh.sh", "text/x-shellscript"),
     "install-frpc-ssh.ps1": (ROOT / "scripts" / "install_frpc_ssh.ps1", "text/plain"),
     "frpc.example.toml": (ROOT / "frpc.example.toml", "application/toml"),
@@ -564,6 +579,16 @@ async def lifespan(app: FastAPI):
         lost_grace=float(os.getenv("AGENT_LOST_GRACE", "90")),
         max_child_runs=int(os.getenv("EXECUTION_MAX_CHILD_RUNS", "8")),
     )
+    device_runtime_store = DeviceRuntimeStore(DATA_DIR / "agent_server.db")
+    device_runtime = DeviceRuntimeService(
+        device_runtime_store,
+        execution_store,
+        device_exists=lambda owner_id, device_id: (
+            owner_id == ADMIN_USERNAME and devices.get(device_id) is not None
+        ),
+        offline_after=float(os.getenv("DEVICE_RUNTIME_OFFLINE_AFTER", "30")),
+        max_active_sessions=int(os.getenv("DEVICE_RUNTIME_MAX_SESSIONS", "8")),
+    )
     observation_publisher = ObservationPublisher(execution.record_observation)
     observation_translator = TerminalObservationTranslator(
         default_owner=ADMIN_USERNAME,
@@ -761,6 +786,8 @@ async def lifespan(app: FastAPI):
     app.state.artifacts = artifact_events
     app.state.execution_store = execution_store
     app.state.execution = execution
+    app.state.device_runtime_store = device_runtime_store
+    app.state.device_runtime = device_runtime
     app.state.reporter_tokens = reporter_tokens
     app.state.execution_control = execution_control
     app.state.observation_ingest_queue = observation_ingest_queue
@@ -1165,6 +1192,7 @@ app.include_router(
         cookie_name=COOKIE_NAME,
     )
 )
+app.include_router(build_device_runtime_router(current_user))
 
 
 async def bind_terminal_workspace(application: FastAPI, session):
@@ -1333,6 +1361,58 @@ async def download_client_file(
     return FileResponse(path, filename=filename, media_type=media_type)
 
 
+def current_runtime_distribution():
+    expected_build = BUILD_SHA if BUILD_SHA != "development" else None
+    try:
+        return load_runtime_distribution(
+            RUNTIME_DIST,
+            expected_build_sha=expected_build,
+        )
+    except (OSError, ValueError) as exc:
+        performance_logger.error("runtime_distribution_unavailable reason=%s", exc)
+        raise HTTPException(status_code=503, detail="Runtime bootstrap artifact unavailable") from exc
+
+
+@app.get("/device-bootstrap/install.sh", include_in_schema=False)
+async def download_device_bootstrap() -> FileResponse:
+    path = ROOT / "scripts" / "bootstrap_agentserver_device.sh"
+    if not path.is_file():
+        raise HTTPException(status_code=503, detail="Device bootstrap installer unavailable")
+    return FileResponse(
+        path,
+        filename="install-agentserver-device.sh",
+        media_type="text/x-shellscript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/device-bootstrap/manifest.json", include_in_schema=False)
+async def download_runtime_manifest() -> Response:
+    distribution = current_runtime_distribution()
+    return Response(
+        content=distribution.manifest_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": "no-cache", "ETag": f'"{distribution.sha256}"'},
+    )
+
+
+@app.get("/device-bootstrap/artifacts/{filename}", include_in_schema=False)
+async def download_runtime_artifact(filename: str) -> FileResponse:
+    distribution = current_runtime_distribution()
+    if filename != distribution.artifact_name:
+        raise HTTPException(status_code=404, detail="Runtime bootstrap artifact not found")
+    return FileResponse(
+        distribution.artifact_path,
+        filename=distribution.artifact_name,
+        media_type="application/gzip",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": f'"{distribution.sha256}"',
+            "X-Checksum-SHA256": distribution.sha256,
+        },
+    )
+
+
 @app.get("/api/terminals")
 async def list_terminals(
     manager: TerminalManager = Depends(terminal_manager),
@@ -1343,9 +1423,30 @@ async def list_terminals(
 
 @app.get("/api/devices")
 async def list_devices(
-    _username: str = Depends(current_user),
+    request: Request,
+    username: str = Depends(current_user),
 ) -> list[dict[str, object]]:
-    return await asyncio.to_thread(devices.list)
+    result = await asyncio.to_thread(devices.list)
+    runtime: DeviceRuntimeService | None = getattr(
+        request.app.state, "device_runtime", None
+    )
+    if runtime is None:
+        return result
+    for device in result:
+        try:
+            status = await asyncio.to_thread(
+                runtime.runtime_status,
+                owner_id=username,
+                device_id=str(device["id"]),
+            )
+            device["runtime"] = public_runtime_status(status)
+        except ExecutionError:
+            # Runtime inventory is additive. A legacy/non-admin device listing
+            # must remain available even when it has no runtime owner scope.
+            device["runtime"] = public_runtime_status(
+                {"device_id": str(device["id"]), "state": "unregistered"}
+            )
+    return result
 
 
 @app.post("/api/devices", status_code=201)
@@ -1402,12 +1503,21 @@ async def delete_device(
     device_id: str,
     request: Request,
     manager: TerminalManager = Depends(terminal_manager),
-    _username: str = Depends(current_user),
+    username: str = Depends(current_user),
 ) -> dict[str, bool]:
     for session in tuple(manager.sessions.values()):
         if session.device_id == device_id:
             await manager.delete(session.id)
     await request.app.state.previews.delete_for_device(device_id)
+    runtime: DeviceRuntimeService | None = getattr(
+        request.app.state, "device_runtime", None
+    )
+    if runtime is not None:
+        await asyncio.to_thread(
+            runtime.revoke_device,
+            owner_id=username,
+            device_id=device_id,
+        )
     if not await asyncio.to_thread(devices.delete, device_id):
         raise HTTPException(status_code=404, detail="设备不存在")
     return {"ok": True}

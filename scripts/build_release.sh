@@ -32,6 +32,17 @@ mv "$SOURCE_DIR/frontend/dist" "$SOURCE_DIR/web_dist"
 printf '{"build_sha":"%s"}\n' "$BUILD_SHA" > "$SOURCE_DIR/web_dist/build.json"
 rm -rf "$SOURCE_DIR/frontend/node_modules"
 
+RUNTIME_WHEELHOUSE="$TEMP_DIR/runtime-wheelhouse"
+mkdir -p "$RUNTIME_WHEELHOUSE"
+python3 -m pip download --disable-pip-version-check --only-binary=:all: \
+  --dest "$RUNTIME_WHEELHOUSE" \
+  --requirement "$SOURCE_DIR/requirements-runtime.lock"
+python3 "$SOURCE_DIR/scripts/build_runtime_bundle.py" \
+  --source "$SOURCE_DIR" \
+  --output-dir "$SOURCE_DIR/runtime_dist" \
+  --build-sha "$BUILD_SHA" \
+  --wheelhouse "$RUNTIME_WHEELHOUSE"
+
 if [ "${BUNDLE_PYTHON_WHEELS:-0}" = "1" ]; then
   python3 -m pip download --disable-pip-version-check \
     --dest "$SOURCE_DIR/wheelhouse" \

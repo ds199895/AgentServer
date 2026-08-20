@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .errors import CommandConflict, ValidationError
 from .events import new_id
@@ -128,6 +128,7 @@ class CommandQueue:
         expires_at: float | None = None,
         expected_revision: int | None = None,
         created_at: float | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> Command:
         owner_id = self._require(owner_id, "owner_id")
         target_kind = self._require(enum_value(target_kind), "target_kind")
@@ -141,9 +142,6 @@ class CommandQueue:
             or expected_revision < 0
         ):
             raise ValidationError("expected_revision must be non-negative")
-        timestamp = time.time() if created_at is None else float(created_at)
-        if expires_at is not None and float(expires_at) <= timestamp:
-            raise ValidationError("expires_at must be later than created_at")
         values = {
             "command_id": command_id,
             "owner_id": owner_id,
@@ -155,47 +153,57 @@ class CommandQueue:
             "expected_revision": expected_revision,
         }
         fingerprint = self._fingerprint(values)
-        with self._lock:
-            with self._connect() as connection:
-                existing = connection.execute(
-                    "SELECT * FROM execution_commands WHERE command_id = ?",
-                    (command_id,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["fingerprint"] != fingerprint:
-                        raise CommandConflict(
-                            "command_id was reused for different command contents"
-                        )
-                    return self._from_row(existing)
-                cursor = connection.execute(
-                    """
-                    INSERT INTO execution_commands(
-                        command_id, fingerprint, owner_id, target_kind, target_id,
-                        command_type, payload_json, status, expected_revision,
-                        created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        command_id,
-                        fingerprint,
-                        owner_id,
-                        target_kind,
-                        target_id,
-                        command_type,
-                        json.dumps(body, separators=(",", ":"), sort_keys=True),
-                        CommandStatus.QUEUED.value,
-                        expected_revision,
-                        timestamp,
-                        expires_at,
-                    ),
-                )
-                row = connection.execute(
-                    "SELECT * FROM execution_commands WHERE sequence = ?",
-                    (cursor.lastrowid,),
-                ).fetchone()
+
+        def persist(connection: sqlite3.Connection) -> Command:
+            timestamp = time.time() if created_at is None else float(created_at)
+            if expires_at is not None and float(expires_at) <= timestamp:
+                raise ValidationError("expires_at must be later than created_at")
+            existing = connection.execute(
+                "SELECT * FROM execution_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    raise CommandConflict(
+                        "command_id was reused for different command contents"
+                    )
+                return self._from_row(existing)
+            cursor = connection.execute(
+                """
+                INSERT INTO execution_commands(
+                    command_id, fingerprint, owner_id, target_kind, target_id,
+                    command_type, payload_json, status, expected_revision,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command_id,
+                    fingerprint,
+                    owner_id,
+                    target_kind,
+                    target_id,
+                    command_type,
+                    json.dumps(body, separators=(",", ":"), sort_keys=True),
+                    CommandStatus.QUEUED.value,
+                    expected_revision,
+                    timestamp,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM execution_commands WHERE sequence = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
             if row is None:  # pragma: no cover - SQLite insert contract
                 raise CommandConflict("command insert did not return a row")
             return self._from_row(row)
+
+        if _connection is not None:
+            if not _connection.in_transaction:
+                raise RuntimeError("external command connection requires a transaction")
+            return persist(_connection)
+        with self._lock, self._connect() as connection:
+            return persist(connection)
 
     @staticmethod
     def _expire_due(connection: sqlite3.Connection, now: float) -> None:
@@ -255,6 +263,107 @@ class CommandQueue:
                 rows = connection.execute(query, parameters).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def poll_and_mark_delivered(
+        self,
+        *,
+        owner_id: str,
+        target_kind: str,
+        target_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+        now: float | None = None,
+        clock: Callable[[], float] | None = None,
+        transaction_guard: Callable[[sqlite3.Connection, float], None] | None = None,
+        after_expire: Callable[[sqlite3.Connection, float], None] | None = None,
+        command_filter: Callable[[Command], bool] | None = None,
+    ) -> tuple[list[Command], int]:
+        """Atomically authorize, page, and mark a command page delivered.
+
+        The guard runs after ``BEGIN IMMEDIATE`` on the same SQLite connection.
+        This lets callers bind authorization state stored in the same database to
+        every delivery mutation without a check/use race across processes.
+        """
+
+        if after_sequence < 0:
+            raise ValidationError("after_sequence must be non-negative")
+        if limit <= 0 or limit > 1000:
+            raise ValidationError("limit must be between 1 and 1000")
+        if now is not None and clock is not None:
+            raise ValueError("now and clock are mutually exclusive")
+        owner_id = self._require(owner_id, "owner_id")
+        target_kind = self._require(enum_value(target_kind), "target_kind")
+        target_id = self._require(target_id, "target_id")
+        terminal_values = tuple(status.value for status in TERMINAL_COMMAND_STATUSES)
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                timestamp = (
+                    float(clock())
+                    if clock is not None
+                    else time.time() if now is None else float(now)
+                )
+                if transaction_guard is not None:
+                    transaction_guard(connection, timestamp)
+                self._expire_due(connection, timestamp)
+                if after_expire is not None:
+                    after_expire(connection, timestamp)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM execution_commands
+                    WHERE owner_id = ? AND target_kind = ? AND target_id = ?
+                      AND sequence > ? AND status NOT IN (?, ?, ?)
+                    ORDER BY sequence LIMIT ?
+                    """,
+                    (
+                        owner_id,
+                        target_kind,
+                        target_id,
+                        after_sequence,
+                        *terminal_values,
+                        limit,
+                    ),
+                ).fetchall()
+                next_sequence = after_sequence
+                delivered: list[Command] = []
+                for row in rows:
+                    command = self._from_row(row)
+                    next_sequence = max(next_sequence, command.sequence)
+                    if command_filter is not None and not command_filter(command):
+                        continue
+                    if command.status is CommandStatus.QUEUED:
+                        connection.execute(
+                            """
+                            UPDATE execution_commands
+                            SET status = ?, delivered_at = ?
+                            WHERE owner_id = ? AND command_id = ? AND status = ?
+                            """,
+                            (
+                                CommandStatus.DELIVERED.value,
+                                timestamp,
+                                owner_id,
+                                command.id,
+                                CommandStatus.QUEUED.value,
+                            ),
+                        )
+                    elif command.status not in {
+                        CommandStatus.DELIVERED,
+                        CommandStatus.ACCEPTED,
+                    }:
+                        raise CommandConflict(
+                            f"cannot deliver a {command.status.value} command"
+                        )
+                    result = connection.execute(
+                        """
+                        SELECT * FROM execution_commands
+                        WHERE owner_id = ? AND command_id = ?
+                        """,
+                        (owner_id, command.id),
+                    ).fetchone()
+                    if result is None:  # pragma: no cover - held write transaction
+                        raise CommandConflict("command disappeared during delivery")
+                    delivered.append(self._from_row(result))
+        return delivered, next_sequence
+
     def get(self, *, owner_id: str, command_id: str, now: float | None = None) -> Command | None:
         timestamp = time.time() if now is None else float(now)
         with self._lock:
@@ -309,6 +418,14 @@ class CommandQueue:
         ack_id: str | None = None,
         payload: Mapping[str, Any] | None = None,
         now: float | None = None,
+        clock: Callable[[], float] | None = None,
+        transaction_guard: Callable[[sqlite3.Connection, float], None] | None = None,
+        after_expire: Callable[[sqlite3.Connection, float], None] | None = None,
+        command_guard: Callable[[Command], None] | None = None,
+        after_ack: Callable[
+            [sqlite3.Connection, Command, Command, CommandStatus, float], None
+        ]
+        | None = None,
     ) -> Command:
         try:
             target = status if isinstance(status, CommandStatus) else CommandStatus(status)
@@ -323,10 +440,31 @@ class CommandQueue:
         ack_id = self._require(ack_id or new_id(), "ack_id")
         body = json_object(payload, field_name="command ACK payload")
         body_json = json.dumps(body, separators=(",", ":"), sort_keys=True)
-        timestamp = time.time() if now is None else float(now)
+        if now is not None and clock is not None:
+            raise ValueError("now and clock are mutually exclusive")
         with self._lock:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                timestamp = (
+                    float(clock())
+                    if clock is not None
+                    else time.time() if now is None else float(now)
+                )
+                if transaction_guard is not None:
+                    transaction_guard(connection, timestamp)
                 self._expire_due(connection, timestamp)
+                if after_expire is not None:
+                    after_expire(connection, timestamp)
+                row = connection.execute(
+                    "SELECT * FROM execution_commands "
+                    "WHERE owner_id = ? AND command_id = ?",
+                    (owner_id, command_id),
+                ).fetchone()
+                if row is None:
+                    raise CommandConflict("command does not exist in owner scope")
+                command = self._from_row(row)
+                if command_guard is not None:
+                    command_guard(command)
                 duplicate = connection.execute(
                     "SELECT * FROM execution_command_acks WHERE ack_id = ?",
                     (ack_id,),
@@ -338,19 +476,16 @@ class CommandQueue:
                         or duplicate["payload_json"] != body_json
                     ):
                         raise CommandConflict("ack_id was reused for different ACK contents")
-                    row = connection.execute(
-                        "SELECT * FROM execution_commands WHERE owner_id = ? AND command_id = ?",
-                        (owner_id, command_id),
-                    ).fetchone()
-                    if row is None:
-                        raise CommandConflict("ACK is outside the owner scope")
-                    return self._from_row(row)
-                row = connection.execute(
-                    "SELECT * FROM execution_commands WHERE owner_id = ? AND command_id = ?",
-                    (owner_id, command_id),
-                ).fetchone()
-                if row is None:
-                    raise CommandConflict("command does not exist in owner scope")
+                    acknowledged = self._from_row(row)
+                    if after_ack is not None:
+                        after_ack(
+                            connection,
+                            command,
+                            acknowledged,
+                            target,
+                            timestamp,
+                        )
+                    return acknowledged
                 current = CommandStatus(row["status"])
                 allowed = {
                     CommandStatus.QUEUED: {
@@ -398,4 +533,15 @@ class CommandQueue:
                     "SELECT * FROM execution_commands WHERE command_id = ?",
                     (command_id,),
                 ).fetchone()
-        return self._from_row(result)
+                if result is None:  # pragma: no cover - held write transaction
+                    raise CommandConflict("command disappeared during acknowledgement")
+                acknowledged = self._from_row(result)
+                if after_ack is not None:
+                    after_ack(
+                        connection,
+                        command,
+                        acknowledged,
+                        target,
+                        timestamp,
+                    )
+        return acknowledged

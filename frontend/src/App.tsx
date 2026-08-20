@@ -4,6 +4,7 @@ import { XIcon } from 'lucide-react'
 import { api, frontendBuildSha, normalizeTerminalSessions, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
+import { DeviceRuntimeDialog } from '@/components/DeviceRuntimeDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
 import { Eyebrow } from '@/components/Eyebrow'
 import { ExecutionStatusNotice } from '@/components/ExecutionStatusNotice'
@@ -47,6 +48,7 @@ import { useExecutionStream } from '@/useExecutionStream'
 
 const LAST_TERMINAL_KEY = 'agentserver:last-terminal-id'
 const LAYOUT_KEY = 'agentserver:terminal-layout-v1'
+const SINGLE_PANE_MEDIA_QUERY = '(max-width: 767px), (pointer: coarse) and (orientation: portrait)'
 
 type ShowTerminalOptions = {
   replace?: boolean
@@ -71,7 +73,7 @@ function initialLayout(): { layout: LayoutNode | null; focusedLeafId: string | n
 }
 
 function isCoarseLayout(): boolean {
-  return window.matchMedia('(max-width: 767px), (pointer: coarse)').matches
+  return window.matchMedia(SINGLE_PANE_MEDIA_QUERY).matches
 }
 
 // 与 pixel/sprites.ts 的 AGENT_OUTFITS 名称保持一致;这里用小表避免把
@@ -156,6 +158,7 @@ export default function App() {
   const [missingTerminalId, setMissingTerminalId] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
+  const [runtimeDevice, setRuntimeDevice] = useState<Device | null>(null)
   const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
   const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -457,7 +460,7 @@ export default function App() {
     }
   }, [load, username])
   useEffect(() => {
-    const media = window.matchMedia('(max-width: 767px), (pointer: coarse)')
+    const media = window.matchMedia(SINGLE_PANE_MEDIA_QUERY)
     const onChange = () => setForceSingle(media.matches)
     media.addEventListener('change', onChange)
     return () => media.removeEventListener('change', onChange)
@@ -771,7 +774,7 @@ export default function App() {
   const sync = async () => { setError(''); try { await api.syncDevices(); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '同步失败') } }
   const probe = async (device: Device) => { setBusyId(device.id); try { await api.probeDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '检测失败') } finally { setBusyId(null) } }
   const remove = async (device: Device) => { if (!window.confirm(`删除设备 ${device.name}？`)) return; try { await api.deleteDevice(device.id); await load() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败') } }
-  const logout = async () => { await api.logout(); invalidateSnapshots(); setUsername(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
+  const logout = async () => { await api.logout(); invalidateSnapshots(); setUsername(null); setRuntimeDevice(null); setDevices([]); setSessions([]); setPreviews([]); setWorkspaceSessionId(null); activePreviewRef.current = null; setActivePreview(null) }
   const stopPreview = async (preview: Preview) => {
     try {
       await api.deletePreview(preview.id)
@@ -979,7 +982,7 @@ export default function App() {
               />
             )
           ) : page === 'setup' ? (
-            <DownloadsPage devices={devices} />
+            <DownloadsPage devices={devices} onChanged={() => void load()} />
           ) : (
             <DeviceDashboard
               devices={devices}
@@ -990,9 +993,10 @@ export default function App() {
               onDelete={(device) => void remove(device)}
               onProbe={(device) => void probe(device)}
               onSync={() => void sync()}
-              onAdd={() => navigate('setup')}
+              onAdd={() => setDeviceDialog('new')}
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
               onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
+              onRuntime={setRuntimeDevice}
             />
           )}
         </div>
@@ -1044,6 +1048,14 @@ export default function App() {
           device={deviceDialog === 'new' ? undefined : deviceDialog}
           onClose={() => setDeviceDialog(null)}
           onSaved={() => void load()}
+        />
+      )}
+      {runtimeDevice && (
+        <DeviceRuntimeDialog
+          key={runtimeDevice.id}
+          device={devices.find((device) => device.id === runtimeDevice.id) || runtimeDevice}
+          onClose={() => setRuntimeDevice(null)}
+          onChanged={() => void load()}
         />
       )}
       {previewTarget && (

@@ -24,6 +24,8 @@ AgentServer 所在服务器。
 - 自动识别设备上的 Vite、Next.js、Storybook 等开发服务，并通过 SSH 隧道安全预览。
 - 2D 像素游戏风设备房间：终端会话映射为可交互小人，编码 Agent 自动换上品牌服装。
 - 提供 Agent 任务、Run、阶段、等待、进度、时间线和父子委派关系的统一状态视图。
+- 提供常驻出站的 Runtime Host，每台设备只需安装并配对一个；可从中心页面启动和控制
+  Codex app-server Session，无需逐项目配置 Hook，其他 Provider 可扩展 adapter 或保留 Hook fallback。
 - 提供 Linux/macOS、Windows 设备安装器，以及 systemd、frpc/frps 和 Nginx 配置示例。
 - 通过 GitHub Actions 构建不可变发布制品、原子部署、线上校验和失败回滚。
 
@@ -85,6 +87,27 @@ Reporter 凭据由已登录的管理端按 Run 短期签发，绑定 owner、设
 能力，并由持久 registry 校验失效状态。它不是浏览器 Cookie，也不应写进 `.env`、终端启动
 环境、命令历史或仓库。本地控制 socket 和远端 Bridge 的协议只用于公开运行阶段与结果，
 不应上报隐藏推理内容。
+
+需要从一个控制面直接管理多台设备上的 Agent 时，可在“安装客户端”页注册设备并生成一次性 enrollment，
+再用 [设备一键安装器](scripts/install_agentserver_device.sh) 完成 SSH/FRP、用户 linger 和 Runtime
+Host 配对。Host 通过
+HTTPS 主动短轮询中心服务，并在设备本地持有 Provider 登录态、工作区和进程；一个 Host 可注册
+多个 adapter，当前首个原生实现为 Codex app-server。外部自行启动或尚无主动 adapter 的 Agent 仍走
+Hook/JSONL/PTY fallback。每台新设备仍需完成这一次 bootstrap；完成后，受控 Runtime 不需要再为
+每个 Provider 或项目单独安装 Hook。
+
+Codex Host 当前只支持 Linux；设备需安装 Python 依赖、已登录的 Codex CLI/Node.js、
+`bubblewrap` 并允许非特权 user namespace。安装器会在消费 enrollment token 之前真实运行 sandbox
+preflight，并把解析后的绝对路径固化为 service 的 `--bubblewrap-binary`；隔离检查失败时不会配对，
+也不会裸跑。bubblewrap 会遮蔽 Host
+credential，但不防范 sandbox 外的恶意同 UID 进程；不受信任的本地工作负载应改用独立 UID 或
+容器。Host 事件仅在当前 generation 内 at-least-once；新 generation 会把旧 spool 原子移入有界的
+durable dead-letter，保留原 envelope/fence 供诊断，而不是清理或静默丢弃。服务端逐事件返回结果：
+permanent NACK 转入 Host dead-letter，retryable 或缺失结果继续留在 live spool；配额或 Session 状态
+分歧一律失败关闭。只有 enrollment 的同 token 响应恢复窗口固定为 5 分钟；credential rotation 的
+持久 `request_id` 可幂等恢复到 replacement 过期或被撤销为止。
+具体安装、fencing、配额和 Hook 共存边界见
+[多设备 Runtime Host](docs/agent-runtime-framework.md#多设备-runtime-host)。
 
 ## 参与贡献
 
@@ -247,6 +270,11 @@ sudo systemctl --no-pager --full status frps
 - Linux/macOS `--dry-run`：同样需要 Token，以便生成并验证完整配置。
 - Linux/macOS 非交互安装：无法显示输入提示，必须通过 `FRP_TOKEN` 环境变量提供。
 - Linux/macOS 使用 `--merge-existing`：复用现有 frpc 配置中的 Token，不再提示输入。
+- Linux/macOS 重跑相同的受管 AgentServer 配置：校验设备、服务端、端口和 SSH 用户完全一致后，
+  复用权限为 `0600` 的现有 Token；参数不一致时不会静默复用。
+- 如果确实要在设备侧替换匹配的受管 FRP Token，必须显式使用完整安装器的
+  `--rotate-frp-token`（底层脚本为 `--rotate-token`），并同步更新 frps；仅传入新的 token
+  文件不会悄悄覆盖现有配置。
 - Windows：未传入 `-FrpToken` 时，PowerShell 会通过安全输入框提示输入。
 
 安装器会把 Token 保存到受限文件：
@@ -274,6 +302,42 @@ sudo ./install-frpc-ssh.sh \
 ```
 
 运行到 `请输入 FRP token（输入不会显示）` 时，粘贴从 frps 服务器找到的 Token 并回车。
+
+需要同时启用原生 Codex Runtime 的新 Linux 设备，在“安装客户端”页填写上述参数并点击
+“注册设备并生成配对凭据”。页面会固定创建 `${DEVICE_ID}.ssh` 代理记录，随后显示只返回一次的
+enrollment token 和绑定服务端设备记录的一键命令。目标设备只需安装并登录 Codex CLI/Node.js、安装可用的
+`bubblewrap`，不必复制 AgentServer 仓库；以实际工作区用户运行管理页面提供的 bootstrap 命令：
+
+```bash
+curl --fail --silent --show-error --proto '=https' --proto-redir '=https' \
+  -o install-agentserver-device.sh https://agentserver.example.com/device-bootstrap/install.sh
+bash install-agentserver-device.sh \
+  --device-id device-001 \
+  --base-url https://agentserver.example.com \
+  --remote-port 20001 \
+  --ssh-user your-user \
+  --runtime-user your-user \
+  --runtime-bundle-url https://agentserver.example.com
+```
+
+Bootstrap 会按当前发布 `BUILD_SHA` 下载不可变 Runtime 制品，先验证压缩包摘要、内部文件清单、
+路径和权限，再在 `~/.local/lib/agentserver-runtime/releases/<BUILD_SHA>` 原子落盘；Runtime
+Python 虚拟环境按版本复用，credential/state 仍留在 `~/.local/state/agentserver-runtime`。
+因此下载目录可以删除，服务不会依赖临时脚本。脚本先以普通用户完成 Python/Codex/Node/bubblewrap
+preflight，再仅对 SSH/FRP 和 linger 步骤调用 `sudo`，最后回到该用户安装 Runtime service。
+复制的一键命令不包含 enrollment token；以实际工作区普通用户执行后，在隐藏提示中粘贴 FRP token
+和页面显示的 enrollment token。自动化可改用权限恰好为 `0600` 的
+`--frp-token-file` 与 `--enrollment-token-file`。已有可用隧道时增加 `--runtime-only`。普通重跑
+会复用匹配的受管 FRP token 和长期 Runtime credential；只有明确传入 `--reenroll` 才消费新
+enrollment token 并替换凭据。已有其他 frpc 时可在完整命令末尾直接增加
+`--merge-existing /path/to/frpc.toml`，无需拆成两次安装。
+
+FRP Token 轮换不是普通重跑的一部分：给已有匹配配置传入新的 `--frp-token-file` 或
+`FRP_TOKEN` 会失败关闭，避免把设备改成与 frps 不一致的状态。确认 frps 已准备好新 Token 后，
+在完整命令中同时增加 `--rotate-frp-token`；轮换过程中配置和 Token 文件仍保持 `0600`。
+
+受管 FRP 的“匹配”是保守判定：配置必须与安装器生成的规范模板完全一致，并通过 owner、权限和
+符号链接检查。手工增加字段或注释的配置请使用 `--merge-existing`；普通重跑会失败关闭而不会覆盖。
 
 Windows 请在管理员 PowerShell 中执行：
 
@@ -347,6 +411,9 @@ sudo systemctl enable --now frpc
 静态检查：
 
 ```bash
+./.venv/bin/python -m unittest \
+  tests.test_execution_device_runtime_api \
+  tests.test_install_agentserver_runtime -v
 ./.venv/bin/python -m unittest discover -s tests -v
 npm --prefix frontend ci
 npm --prefix frontend test
@@ -480,10 +547,13 @@ AgentServer 使用或受到以下开源项目启发，感谢所有维护者和�
 - [x] 接入 Codex、Claude、Kimi Hook/JSONL 原生事件和脱敏夹具，默认丢弃 prompt、命令参数、
   tool output 和 transcript，并保留非交互 Provider 的 stdout 与退出码。
 - [x] 提供 CloudEvents、OpenTelemetry、A2A、MCP 的脱敏映射库，并强制显式 key/sink 边界。
+- [x] 提供设备级一次性 enrollment、哈希长期凭据、轮换/撤销、常驻 Runtime Host、Codex
+  app-server adapter，以及带 generation fence 的多设备 Session/Turn 控制和事件回传。
 
 ### TODO
 
-- [ ] 为远端 Bridge 增加设备级 enrollment、长期凭据换取、自动安装/升级和 Windows 安全管道。
+- [ ] 为 Device Runtime Host 增加自动升级、Windows service 安装器，以及 Claude/Kimi 等双向
+  Provider adapter；per-Run Bridge 继续使用最小权限短期凭据。
 - [ ] 增加经过 tenant ACL、持久 pseudonym key 与背压保护的 OTel/CloudEvents/A2A/MCP exporter。
 - [ ] 需要横向扩展时迁移共享 EventStore / live transport；v1 会主动拒绝多个 API worker。
 - [ ] 支持自定义房间、工位、角色外观和场景主题。

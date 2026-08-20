@@ -31,6 +31,10 @@ if [ ! -d frontend/dist ]; then
   npm --prefix frontend run build
 fi
 
+./.venv/bin/python scripts/build_runtime_bundle.py \
+  --source . \
+  --output-dir runtime_dist
+
 if [ -x bin/frpc ]; then
   echo "启动 frpc…"
   ./bin/frpc -c frpc.toml &

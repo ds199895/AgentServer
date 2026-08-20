@@ -28,6 +28,9 @@ export interface CharSlot {
   stale: boolean
   agentCwd: string
   runLabel: string | null
+  eventKey: string | null
+  eventText: string | null
+  eventTone: 'think' | 'work' | 'test' | 'wait' | 'ok' | 'bad' | 'mute' | undefined
 }
 
 export type TerminalExecutionVisual = {
@@ -38,6 +41,9 @@ export type TerminalExecutionVisual = {
   stale: boolean
   agentCwd: string
   runLabel: string | null
+  eventKey: string | null
+  eventText: string | null
+  eventTone: 'think' | 'work' | 'test' | 'wait' | 'ok' | 'bad' | 'mute' | undefined
 }
 
 export interface RoomModel {
@@ -128,6 +134,9 @@ export function buildScene(
         stale: execution?.stale ?? false,
         agentCwd: execution?.agentCwd ?? session.agent?.cwd ?? '',
         runLabel: execution?.runLabel ?? null,
+        eventKey: execution?.eventKey ?? null,
+        eventText: execution?.eventText ?? null,
+        eventTone: execution?.eventTone,
       }
       if (slot === 0) {
         // Seated at the desk, back to the viewer; the sprite includes the

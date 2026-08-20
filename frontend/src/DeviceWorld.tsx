@@ -3,6 +3,7 @@ import { ArrowUpRight, LayoutGrid, XIcon } from 'lucide-react'
 import type { Device, TerminalSession } from './api'
 import { buildScene, PAD, roomLayout, ROOM_H, ROOM_W, WALL, type CharSlot, type RoomModel, type SceneModel, type TerminalExecutionVisual } from './pixel/scene'
 import { BubbleTracker, bubbleAlpha, bubblePop, drawBubble } from './pixel/bubbles'
+import { eventBubbleForTerminal } from './pixel/execution-bubbles'
 import { AGENT_OUTFITS, CHAR_DIMS, getAtlas, getCharacter, getScreen, makeFloorLabel, RACK_LEDS, STATUS_COLOR } from './pixel/sprites'
 import { DeviceIcon } from '@/components/device-bits'
 import { Eyebrow } from '@/components/Eyebrow'
@@ -82,6 +83,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
     for (const session of sessions) {
       const run = activeRunForTerminal(execution.snapshot, session.id)
       const agent = activeAgentForTerminal(execution.snapshot, session.id)
+      const event = eventBubbleForTerminal(execution.snapshot, session.id)
       if (!run && !agent) continue
       result.set(session.id, {
         agentKind: agent?.kind || run?.agent_kind || null,
@@ -95,6 +97,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
           : agent?.stale === true,
         agentCwd: agent?.cwd || '',
         runLabel: run ? runStatusLabel(run, execution.freshness_now) : null,
+        eventKey: event?.key ?? null,
+        eventText: event?.text ?? null,
+        eventTone: event?.tone,
       })
     }
     return result
@@ -131,7 +136,7 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
   const activeSessionIdRef = useRef(activeSessionId)
   const hoveredRoomIdRef = useRef<string | null>(null)
   const hoveredSessionIdRef = useRef<string | null>(null)
-  // Survives canvas rebuilds so a bubble pops on state *changes*, not on load.
+  // Survives canvas rebuilds so each execution event only pops once.
   const bubbleTrackerRef = useRef(new BubbleTracker())
   useEffect(() => { busyIdRef.current = busyId }, [busyId])
   useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
@@ -647,6 +652,9 @@ export default function DeviceWorld({ devices, sessions, busyId, onOpen, onProbe
             activity: char.activity,
             waitReason: char.waitReason,
             stale: char.stale,
+            eventKey: char.eventKey,
+            eventText: char.eventText,
+            eventTone: char.eventTone,
           }
           const bubble = bubbleTrackerRef.current.track(char.sessionId, bubbleState, wallTime)
           if (bubble) {

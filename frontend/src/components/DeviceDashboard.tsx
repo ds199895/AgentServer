@@ -1,5 +1,5 @@
 import { lazy, Suspense, useMemo, useState } from 'react'
-import { Activity, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
+import { Activity, Cpu, LayoutGrid, List, MonitorPlay, Pencil, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 
 import type { Device, TerminalSession } from '@/api'
 import { DeviceIcon, StateBadge } from '@/components/device-bits'
@@ -18,6 +18,16 @@ function relativeTime(timestamp: number | null): string {
   return `${Math.floor(seconds / 86400)} 天前`
 }
 
+function runtimeStateLabel(device: Device): string {
+  switch (device.runtime?.state) {
+    case 'online': return '在线'
+    case 'degraded': return '降级'
+    case 'offline': return '离线'
+    case 'revoked': return '已撤销'
+    default: return '未配对'
+  }
+}
+
 type Props = {
   devices: Device[]
   sessions: TerminalSession[]
@@ -30,9 +40,10 @@ type Props = {
   onAdd: () => void
   onSelectTerminal: (sessionId: string) => void
   onPreview: (device?: Device) => void
+  onRuntime: (device: Device) => void
 }
 
-export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onPreview }: Props) {
+export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onDelete, onProbe, onSync, onAdd, onSelectTerminal, onPreview, onRuntime }: Props) {
   const [view, setView] = useState<'world' | 'list'>('world')
   const sessionsByDevice = useMemo(() => {
     const result = new Map<string, TerminalSession[]>()
@@ -46,11 +57,12 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
   }, [sessions])
   const online = devices.filter((device) => device.frp_online).length
   const sshReady = devices.filter((device) => device.ssh_available).length
+  const runtimeReady = devices.filter((device) => device.runtime?.state === 'online').length
   const metrics: Array<[string, number]> = [
     ['注册设备', devices.length],
     ['隧道在线', online],
     ['SSH 可用', sshReady],
-    ['离线设备', devices.length - online],
+    ['Runtime 在线', runtimeReady],
   ]
   return (
     <section className="flex min-h-full flex-col bg-[#090d12] bg-[radial-gradient(circle_at_90%_0,#15302655,transparent_30%)] px-[clamp(18px,4vw,58px)] pt-5 pb-[34px] max-md:px-3 max-md:pt-6 max-md:pb-[50px]">
@@ -108,7 +120,7 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
           <Table className="min-w-[640px] max-md:min-w-0">
             <TableHeader>
               <TableRow>
-                <TableHead>设备</TableHead><TableHead>FRP</TableHead><TableHead>SSH</TableHead>
+                <TableHead>设备</TableHead><TableHead>FRP</TableHead><TableHead>SSH</TableHead><TableHead>Runtime</TableHead>
                 <TableHead className="max-md:hidden">入口</TableHead><TableHead className="max-md:hidden">最后在线</TableHead><TableHead className="max-lg:hidden">版本</TableHead><TableHead />
               </TableRow>
             </TableHeader>
@@ -134,6 +146,12 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                   </TableCell>
                   <TableCell title={device.last_error}>
                     <StateBadge online={device.ssh_available} label={device.ssh_available ? '可用' : '不可用'} />
+                  </TableCell>
+                  <TableCell>
+                    <StateBadge
+                      online={device.runtime?.state === 'online'}
+                      label={runtimeStateLabel(device)}
+                    />
                   </TableCell>
                   <TableCell className="max-md:hidden">
                     <code className="block font-mono text-[10px] text-[#b5c1cb]">127.0.0.1:{device.remote_port}</code>
@@ -179,6 +197,10 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
                         <Activity />
                         <span className="max-md:hidden">检测</span>
                       </Button>
+                      <Button variant="outline" size="xs" aria-label={`管理 ${device.name} 的 Agent Runtime`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onRuntime(device)}>
+                        <Cpu />
+                        <span className="max-md:hidden">Runtime</span>
+                      </Button>
                       <Button variant="outline" size="xs" aria-label={`编辑 ${device.name}`} className="max-md:size-7 max-md:rounded-md max-md:px-0" onClick={() => onEdit(device)}>
                         <Pencil />
                         <span className="max-md:hidden">编辑</span>
@@ -194,7 +216,7 @@ export function DeviceDashboard({ devices, sessions, busyId, onOpen, onEdit, onD
               })}
               {!devices.length && (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <div className="px-5 py-[60px] text-center text-[#596672]">尚未发现设备。部署 frpc 后同步，或手动注册设备。</div>
                   </TableCell>
                 </TableRow>

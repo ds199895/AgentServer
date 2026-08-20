@@ -63,6 +63,116 @@ export type Device = {
   client_ip: string
   wire_protocol: string
   first_connected_at: number | null
+  /** Device Runtime Host is independent from FRP and SSH availability. */
+  runtime?: DeviceRuntimeStatus
+}
+
+export type RuntimeProviderCapability = {
+  id: string
+  transport: string
+  available: boolean
+  version: string
+  features: string[]
+  detail_code?: string | null
+}
+
+export type DeviceRuntimeStatus = {
+  state: 'unregistered' | 'online' | 'degraded' | 'offline' | 'revoked'
+  last_seen_at: number | null
+  lease_expires_at?: number | null
+  host_version: string
+  protocol_version: number
+  instance_id: string
+  boot_id?: string
+  generation?: number
+  health?: string
+  platform?: Record<string, string>
+  providers: RuntimeProviderCapability[]
+}
+
+export type DeviceRuntimeEnrollment = {
+  device_id: string
+  enrollment_token: string
+  expires_at: number
+}
+
+export type RuntimeSession = {
+  id: string
+  device_id: string
+  provider: string
+  state: 'requested' | 'starting' | 'ready' | 'running' | 'waiting' | 'stopping' | 'stopped' | 'failed' | 'lost'
+  cwd: string
+  permission_mode: 'approval-required' | 'workspace-write' | 'full-access' | 'auto'
+  model: string | null
+  resume_cursor?: Record<string, unknown> | null
+  active_turn_id?: string | null
+  active_request_id?: string | null
+  last_error?: string | null
+  revision?: number
+  last_event_sequence?: number
+  created_at: number
+  updated_at: number
+}
+
+export type RuntimeEvent = {
+  sequence: number
+  event_id: string
+  device_id: string
+  session_id: string | null
+  type: string
+  turn_id?: string | null
+  interaction_id?: string | null
+  payload: Record<string, unknown>
+  occurred_at: number | null
+  recorded_at: number
+}
+
+export type RuntimeRequestOptions = {
+  signal?: AbortSignal
+}
+
+/** Keep UI state pinned to the device selected by the authenticated owner. */
+export function isRuntimeSessionForDevice(session: RuntimeSession, deviceId: string): boolean {
+  return Boolean(deviceId) && session.device_id === deviceId
+}
+
+/** Reject stale or cross-device event payloads before projecting them into a session view. */
+export function isRuntimeEventForSession(
+  event: RuntimeEvent,
+  deviceId: string,
+  sessionId: string,
+): boolean {
+  return Boolean(deviceId && sessionId)
+    && event.device_id === deviceId
+    && event.session_id === sessionId
+}
+
+export function isAbortError(reason: unknown): boolean {
+  return Boolean(reason && typeof reason === 'object' && 'name' in reason && reason.name === 'AbortError')
+}
+
+/** Browser-generated idempotency key reused after an ambiguous HTTP failure. */
+export function newRuntimeRequestId(): string {
+  const cryptoApi = globalThis.crypto
+  if (typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID()
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+export type RuntimeRequestIdentity = {
+  fingerprint: string
+  requestId: string
+}
+
+export function runtimeRequestIdentityFor(
+  current: RuntimeRequestIdentity | null,
+  fingerprint: string,
+): RuntimeRequestIdentity {
+  if (current?.fingerprint === fingerprint) return current
+  return { fingerprint, requestId: newRuntimeRequestId() }
 }
 
 export type DeviceInput = Pick<Device, 'name' | 'proxy_name' | 'remote_port' | 'ssh_user' | 'remote_shell' | 'notes'> & {
@@ -261,6 +371,86 @@ export const api = {
   syncDevices: () => request<{ last_sync_at: number }>('/api/devices/sync', { method: 'POST' }),
   probeDevice: (id: string) =>
     request<{ available: boolean; error: string }>(`/api/devices/${id}/probe`, { method: 'POST' }),
+  createRuntimeEnrollment: (id: string, options: RuntimeRequestOptions = {}) =>
+    request<DeviceRuntimeEnrollment>(`/api/devices/${encodeURIComponent(id)}/runtime/enrollment-tokens`, {
+      method: 'POST',
+      body: JSON.stringify({ ttl_seconds: 30 * 60 }),
+      cache: 'no-store',
+      signal: options.signal,
+    }),
+  probeDeviceRuntime: (id: string, options: RuntimeRequestOptions = {}) =>
+    request<{ command: Record<string, unknown> }>(`/api/devices/${encodeURIComponent(id)}/runtime/probe`, {
+      method: 'POST',
+      body: '{}',
+      signal: options.signal,
+    }),
+  revokeDeviceRuntime: (id: string, options: RuntimeRequestOptions = {}) =>
+    request<{ ok: boolean }>(`/api/devices/${encodeURIComponent(id)}/runtime/credential`, {
+      method: 'DELETE',
+      signal: options.signal,
+    }),
+  runtimeSessions: (deviceId: string, options: RuntimeRequestOptions = {}) =>
+    request<{ sessions: RuntimeSession[] }>(`/api/devices/${encodeURIComponent(deviceId)}/runtime/sessions`, {
+      signal: options.signal,
+    }),
+  createRuntimeSession: (
+    deviceId: string,
+    input: {
+      session_id?: string
+      provider: string
+      cwd: string
+      permission_mode: RuntimeSession['permission_mode']
+      model?: string | null
+      resume_cursor?: Record<string, unknown> | null
+    },
+    options: RuntimeRequestOptions = {},
+  ) => request<{ session: RuntimeSession; command: Record<string, unknown> | null }>(
+    `/api/devices/${encodeURIComponent(deviceId)}/runtime/sessions`,
+    { method: 'POST', body: JSON.stringify(input), signal: options.signal },
+  ),
+  runtimeSessionEvents: (
+    sessionId: string,
+    afterSequence = 0,
+    options: RuntimeRequestOptions = {},
+  ) =>
+    request<{ events: RuntimeEvent[] }>(
+      `/api/runtime-sessions/${encodeURIComponent(sessionId)}/events?after_sequence=${afterSequence}`,
+      { signal: options.signal },
+    ),
+  startRuntimeTurn: (
+    sessionId: string,
+    input: string,
+    model?: string | null,
+    turnId?: string | null,
+    options: RuntimeRequestOptions = {},
+  ) =>
+    request<{ command: Record<string, unknown> }>(
+      `/api/runtime-sessions/${encodeURIComponent(sessionId)}/turns`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ input, model: model || null, turn_id: turnId || null }),
+        signal: options.signal,
+      },
+    ),
+  interruptRuntimeTurn: (sessionId: string, options: RuntimeRequestOptions = {}) =>
+    request<{ command: Record<string, unknown> }>(
+      `/api/runtime-sessions/${encodeURIComponent(sessionId)}/interrupt`,
+      { method: 'POST', body: '{}', signal: options.signal },
+    ),
+  stopRuntimeSession: (sessionId: string, options: RuntimeRequestOptions = {}) =>
+    request<{ command: Record<string, unknown> }>(`/api/runtime-sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+      signal: options.signal,
+    }),
+  respondRuntimeInteraction: (
+    sessionId: string,
+    interactionId: string,
+    response: Record<string, unknown>,
+    options: RuntimeRequestOptions = {},
+  ) => request<{ command: Record<string, unknown> }>(
+    `/api/runtime-sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(interactionId)}/respond`,
+    { method: 'POST', body: JSON.stringify(response), signal: options.signal },
+  ),
   createDeviceTerminal: async (id: string, name?: string, workspaceRoot?: string) => {
     const session = await request<TerminalSessionPayload>(`/api/devices/${id}/terminals`, {
       method: 'POST',

@@ -9,6 +9,7 @@ e2e/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
 dist/
+runtime_dist/
 .e2e/
 .DS_Store
 frpc.toml

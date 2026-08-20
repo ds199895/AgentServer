@@ -206,6 +206,8 @@ export type ExecutionSnapshot = {
    * array is authoritative and deliberately distinct from undefined. */
   relations?: ExecutionRelation[]
   unattributed_observations?: ExecutionEvent[]
+  /** Client-side replay window used by the room to show hook/tool milestones. */
+  recent_events?: ExecutionEvent[]
 }
 
 export type ExecutionProjectionDelta = {
@@ -732,6 +734,7 @@ export function normalizeExecutionSnapshot(value: unknown): ExecutionSnapshot {
       ? normalizedItems(source.relations, (item) => normalizeRelation(item, ownerId, asOfSequence))
       : undefined,
     unattributed_observations: records<ExecutionEvent>(source.unattributed_observations),
+    recent_events: records<ExecutionEvent>(source.recent_events),
   }
 }
 
@@ -769,12 +772,16 @@ export function applyExecutionMessage(
   if (message.type === 'ready') return snapshot
   const sequence = Number(message.cursor)
   if (!Number.isFinite(sequence) || sequence <= snapshot.as_of_sequence) return snapshot
+  const recentEvents = [
+    ...(snapshot.recent_events ?? []),
+    message.event,
+  ].slice(-64)
   const projection = normalizeExecutionProjectionDelta(
     message.projection ?? message.event.normalized_state,
     snapshot.owner_id,
     sequence,
   )
-  if (!projection) return { ...snapshot, as_of_sequence: sequence }
+  if (!projection) return { ...snapshot, as_of_sequence: sequence, recent_events: recentEvents }
   const removed = projection.removed
   let relations = projection.relations === undefined
     ? snapshot.relations
@@ -787,6 +794,7 @@ export function applyExecutionMessage(
   return {
     ...snapshot,
     as_of_sequence: sequence,
+    recent_events: recentEvents,
     tasks: mergeByVersion(snapshot.tasks, projection.tasks, removed?.task_ids, (task) => task.task_id),
     assignments: mergeByVersion(
       snapshot.assignments,

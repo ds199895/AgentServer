@@ -74,6 +74,10 @@ if command -v git >/dev/null 2>&1 && git -C "$APP_DIR" rev-parse HEAD >/dev/null
   mv "$APP_DIR/frontend/dist" "$APP_DIR/web_dist"
   printf '%s\n' "$BUILD_SHA" > "$APP_DIR/BUILD_SHA"
   printf '{"build_sha":"%s"}\n' "$BUILD_SHA" > "$APP_DIR/web_dist/build.json"
+  "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/build_runtime_bundle.py" \
+    --source "$APP_DIR" \
+    --output-dir "$APP_DIR/runtime_dist" \
+    --build-sha "$BUILD_SHA"
 fi
 
 install -m 0644 deploy/agentserver.service /etc/systemd/system/agentserver.service

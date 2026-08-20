@@ -133,6 +133,27 @@ test('stream merge is cursor-monotonic and revision-monotonic per entity', () =>
   assert.equal(lowerRevision.terminal_bindings[0].active_run_id, 'run-1')
 })
 
+test('projectionless execution events remain available to transient room UI', () => {
+  const initial = snapshot()
+  const toolEvent = {
+    schema: 'agentserver.event/1',
+    event_id: 'event-span-1',
+    global_sequence: 5,
+    stream_version: 1,
+    type: 'span.started',
+    scope: { terminal_id: 'terminal-1', run_id: 'run-1', span_id: 'span-1' },
+    producer: { id: 'agent-1', epoch: 'epoch-1', seq: 1, mode: 'active' },
+    occurred_at: 5,
+    recorded_at: 5,
+    payload: { name: 'shell', kind: 'tool' },
+  }
+  const next = execution.applyExecutionMessage(initial, {
+    type: 'event', cursor: 5, event: toolEvent, projection: null,
+  })
+  assert.equal(next.as_of_sequence, 5)
+  assert.equal(next.recent_events[0], toolEvent)
+})
+
 test('same-revision projections merge only when view_sequence advances', () => {
   const initial = snapshot({
     runs: [run({ revision: 3, view_sequence: 8, activity: 'thinking' })],

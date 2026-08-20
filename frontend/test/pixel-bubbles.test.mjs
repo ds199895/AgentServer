@@ -26,11 +26,12 @@ function state(overrides = {}) {
   return { lifecycle: 'running', activity: 'thinking', waitReason: null, stale: false, ...overrides }
 }
 
-test('first sight of a session is a baseline and never pops a bubble', () => {
+test('first sight shows a meaningful active state once', () => {
   const tracker = new BubbleTracker()
-  assert.equal(tracker.track('s1', state(), 10), null)
-  // Same state on the next frame still has nothing to say.
-  assert.equal(tracker.track('s1', state(), 11), null)
+  const bubble = tracker.track('s1', state(), 10)
+  assert.equal(bubble.text, '思考中…')
+  // Same state on the next frame keeps the same timed bubble.
+  assert.equal(tracker.track('s1', state(), 11), bubble)
 })
 
 test('an activity change pops a bubble with the activity text', () => {
@@ -43,6 +44,22 @@ test('an activity change pops a bubble with the activity text', () => {
   assert.equal(bubble.shownAt, 12)
   // Stable state keeps returning the same bubble for the draw loop.
   assert.equal(tracker.track('s1', state({ activity: 'coding' }), 13), bubble)
+})
+
+test('a new execution event pops even when the projected activity is unchanged', () => {
+  const tracker = new BubbleTracker()
+  tracker.track('s1', state({ activity: 'tooling', eventKey: '10', eventText: '调用 shell', eventTone: 'work' }), 10)
+  const bubble = tracker.track('s1', state({ activity: 'tooling', eventKey: '11', eventText: '调用 apply_patch', eventTone: 'work' }), 11)
+  assert.equal(bubble.text, '调用 apply_patch')
+  assert.equal(bubble.eventKey, '11')
+})
+
+test('an old event does not mask a later state-only transition', () => {
+  const tracker = new BubbleTracker()
+  tracker.track('s1', state({ eventKey: '10', eventText: '调用 shell', eventTone: 'work' }), 10)
+  tracker.track('s1', state({ eventKey: '11', eventText: 'shell 完成', eventTone: 'ok' }), 11)
+  const stale = tracker.track('s1', state({ eventKey: '11', eventText: 'shell 完成', eventTone: 'ok', stale: true }), 20)
+  assert.equal(stale.text, '状态过期…')
 })
 
 test('transient bubbles fade out after their TTL', () => {
@@ -117,7 +134,7 @@ test('prune forgets removed sessions so re-adding is a fresh baseline', () => {
   const tracker = new BubbleTracker()
   tracker.track('s1', state(), 0)
   tracker.prune(new Set(['other']))
-  assert.equal(tracker.track('s1', state({ activity: 'coding' }), 5), null)
+  assert.equal(tracker.track('s1', state({ activity: 'coding' }), 5).text, '写代码…')
 })
 
 test('bubble keys cover lifecycle, activity, wait reason and staleness', () => {

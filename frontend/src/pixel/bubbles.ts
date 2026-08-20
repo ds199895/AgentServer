@@ -4,8 +4,8 @@
 // hook, provider event or reporter fact landed and moved the projection.
 // Transient states fade out after a few seconds; a run waiting on a person
 // (approval, input, …) keeps its bubble until the wait resolves. The first
-// sight of a session is a baseline, not an event, so page load never pops
-// bubbles for every character at once.
+// sight also shows a meaningful active state so a room never appears silent
+// while work is already in progress.
 
 import type { RunActivity, RunLifecycle, WaitReason } from '../execution-state'
 
@@ -16,12 +16,17 @@ export interface BubbleState {
   activity: RunActivity | null
   waitReason: WaitReason | null
   stale: boolean
+  /** A durable execution event can be more specific than the current run state. */
+  eventKey?: string | null
+  eventText?: string | null
+  eventTone?: BubbleTone
 }
 
 export interface Bubble {
   key: string
   text: string
   tone: BubbleTone
+  eventKey?: string | null
   /** rAF clock seconds when the bubble popped; -Infinity means "no bubble". */
   shownAt: number
 }
@@ -81,11 +86,16 @@ export function bubbleKey(state: BubbleState): string {
     state.activity ?? '',
     state.waitReason ?? '',
     state.stale ? 'stale' : '',
+    state.eventKey ?? '',
+    state.eventText ?? '',
   ].join('|')
 }
 
 /** Short status line for a state, or null when there is nothing worth saying. */
 export function bubbleContent(state: BubbleState): { text: string; tone: BubbleTone } | null {
+  if (state.eventText) {
+    return { text: state.eventText, tone: state.eventTone ?? 'mute' }
+  }
   switch (state.lifecycle) {
     case 'succeeded':
       return { text: '已完成', tone: 'ok' }
@@ -128,15 +138,25 @@ export class BubbleTracker {
     const key = bubbleKey(state)
     const current = this.bubbles.get(sessionId)
     if (!current) {
-      // Baseline: first sight never pops a bubble.
-      this.bubbles.set(sessionId, { key, text: '', tone: 'mute', shownAt: Number.NEGATIVE_INFINITY })
-      return null
+      const content = bubbleContent(state)
+      const initial: Bubble = {
+        key,
+        text: content?.text ?? '',
+        tone: content?.tone ?? 'mute',
+        eventKey: state.eventKey,
+        shownAt: content ? now : Number.NEGATIVE_INFINITY,
+      }
+      this.bubbles.set(sessionId, initial)
+      return content ? initial : null
     }
     if (current.key === key) return current.text ? current : null
-    const content = bubbleContent(state)
+    const eventChanged = Boolean(state.eventKey) && state.eventKey !== current.eventKey
+    const content = bubbleContent(eventChanged
+      ? state
+      : { ...state, eventText: null, eventTone: undefined })
     const next: Bubble = content
-      ? { key, text: content.text, tone: content.tone, shownAt: now }
-      : { key, text: '', tone: 'mute', shownAt: Number.NEGATIVE_INFINITY }
+      ? { key, text: content.text, tone: content.tone, eventKey: state.eventKey, shownAt: now }
+      : { key, text: '', tone: 'mute', eventKey: state.eventKey, shownAt: Number.NEGATIVE_INFINITY }
     this.bubbles.set(sessionId, next)
     return content ? next : null
   }
