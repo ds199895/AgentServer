@@ -28,7 +28,10 @@ EVENTS: list[tuple[str, dict]] = [
     ("message.delta", {"message_id": "msg-1", "role": "assistant", "text": "Two ", "turn_id": "turn-1"}),
     ("message.delta", {"message_id": "msg-1", "role": "assistant", "text": "files.", "turn_id": "turn-1"}),
     ("message.created", {"message_id": "msg-1", "role": "assistant", "text": "Two files.", "turn_id": "turn-1"}),
-    ("plan.updated", {"activity_id": "plan-1", "plan": [{"step": "look", "status": "completed"}], "turn_id": "turn-1"}),
+    ("plan.updated", {"activity_id": "plan-1", "plan": [{"step": "look", "status": "in_progress"}], "turn_id": "turn-1"}),
+    # A turn re-plans as it works; the second revision must replace the first
+    # rather than appending a second "Plan updated" card.
+    ("plan.updated", {"activity_id": "plan-1", "plan": [{"step": "look", "status": "completed"}, {"step": "report", "status": "pending"}], "turn_id": "turn-1"}),
     ("request.created", {"request_id": "req-1", "kind": "approval", "title": "Run command?", "options": [], "turn_id": "turn-1"}),
     ("request.resolved", {"request_id": "req-1", "resolution": {"decision": "approve_once"}}),
     ("turn.completed", {"turn_id": "turn-1"}),

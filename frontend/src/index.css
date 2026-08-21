@@ -129,3 +129,74 @@
       radial-gradient(circle at 50% 45%, transparent 65%, #02040888 100%);
   }
 }
+
+@layer components {
+  /* Markdown rendered inside agent messages. Scoped rather than global so it
+     cannot leak into terminal or workspace panes, and written against theme
+     tokens so it tracks the dark palette instead of hardcoding greys. */
+  .agent-markdown {
+    @apply text-sm leading-6 text-foreground;
+  }
+  .agent-markdown > :first-child {
+    margin-top: 0;
+  }
+  .agent-markdown > :last-child {
+    margin-bottom: 0;
+  }
+  .agent-markdown p {
+    @apply my-2;
+  }
+  .agent-markdown h1 {
+    @apply mt-4 mb-2 text-lg font-semibold;
+  }
+  .agent-markdown h2 {
+    @apply mt-4 mb-2 text-base font-semibold;
+  }
+  .agent-markdown h3,
+  .agent-markdown h4,
+  .agent-markdown h5,
+  .agent-markdown h6 {
+    @apply mt-3 mb-1.5 text-sm font-semibold;
+  }
+  .agent-markdown ul {
+    @apply my-2 list-disc pl-5;
+  }
+  .agent-markdown ol {
+    @apply my-2 list-decimal pl-5;
+  }
+  .agent-markdown li {
+    @apply my-0.5;
+  }
+  .agent-markdown a {
+    @apply text-primary underline underline-offset-2;
+  }
+  .agent-markdown strong {
+    @apply font-semibold text-foreground;
+  }
+  .agent-markdown blockquote {
+    @apply my-2 border-l-2 border-border pl-3 text-muted-foreground;
+  }
+  .agent-markdown hr {
+    @apply my-3 border-border;
+  }
+  /* Inline code only; fenced blocks are wrapped in <pre> and styled below. */
+  .agent-markdown :not(pre) > code {
+    @apply rounded bg-accent px-1.5 py-0.5 font-mono text-[0.85em];
+  }
+  .agent-markdown pre {
+    @apply my-2 overflow-x-auto rounded-lg border border-border bg-background p-3;
+  }
+  .agent-markdown pre code {
+    @apply font-mono text-xs leading-5;
+  }
+  .agent-markdown table {
+    @apply my-2 block w-full overflow-x-auto border-collapse text-xs;
+  }
+  .agent-markdown th,
+  .agent-markdown td {
+    @apply border border-border px-2 py-1 text-left;
+  }
+  .agent-markdown th {
+    @apply bg-secondary font-semibold;
+  }
+}

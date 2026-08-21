@@ -399,6 +399,10 @@ class DeviceRuntimeConnector(DeviceConnector):
         elif typ == "turn.plan.updated":
             target = "plan.updated"
             body["turn_id"] = local_turn_id
+            # One plan row per turn. Without a stable id every plan revision
+            # appends another "Plan updated" card instead of replacing the
+            # previous one, so a turn that re-plans five times shows five cards.
+            body["activity_id"] = f"plan-{local_turn_id or source.event_id}"
         elif typ in {
             "interaction.opened",
             "interaction.requested",

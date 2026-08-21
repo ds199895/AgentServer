@@ -251,17 +251,33 @@ function applyEventBody(session: AgentSession, value: AgentEvent): AgentSession 
       })
       return { ...session, state: session.active_turn_id ? 'running' : 'ready', requests }
     }
-    case 'plan.updated':
+    case 'plan.updated': {
+      // Upsert, mirroring the server: each revision replaces the turn's plan
+      // rather than appending another card.
+      const id = text(payload.activity_id) || value.event_id
+      const index = findLastIndex(session.activities, (activity) => activity.id === id)
+      if (index >= 0) {
+        const current = session.activities[index]
+        return {
+          ...session,
+          activities: replaceAt(session.activities, index, {
+            ...current,
+            input: payload.plan ?? null,
+            detail: text(payload.detail) || current.detail,
+            updated_at: value.occurred_at,
+          }),
+        }
+      }
       return {
         ...session,
         activities: [...session.activities, {
-          id: text(payload.activity_id) || value.event_id,
+          id,
           session_id: session.id,
           kind: 'plan',
           title: 'Plan updated',
           status: 'completed',
           detail: text(payload.detail),
-          input: payload.plan,
+          input: payload.plan ?? null,
           output: null,
           turn_id: (payload.turn_id as string | null | undefined) ?? null,
           item_id: null,
@@ -271,6 +287,7 @@ function applyEventBody(session: AgentSession, value: AgentEvent): AgentSession 
           sequence: value.sequence,
         }],
       }
+    }
     default:
       return session
   }

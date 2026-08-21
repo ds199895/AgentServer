@@ -7,24 +7,24 @@ function RootLayout() {
   return (
     <div className="h-screen flex flex-col">
       {/* Header with navigation tabs */}
-      <header className="border-b border-gray-200 bg-white px-6 py-3 flex items-center gap-6">
+      <header className="border-b border-border bg-card px-6 py-3 flex items-center gap-6">
         <div className="font-semibold text-lg">Agent Server</div>
         <nav className="flex gap-1">
           <a
             href="/devices"
-            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-gray-100 transition-colors"
+            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-accent transition-colors"
           >
             Devices
           </a>
           <a
             href="/sessions"
-            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-gray-100 transition-colors"
+            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-accent transition-colors"
           >
             Sessions
           </a>
           <a
             href="/settings"
-            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-gray-100 transition-colors"
+            className="px-4 py-2 rounded-md text-sm font-medium hover:bg-accent transition-colors"
           >
             Settings
           </a>
@@ -46,7 +46,7 @@ export const router = createBrowserRouter([
       { path: 'devices', element: <App /> },
       { path: 'sessions', element: <SessionsPage /> },
       { path: 'sessions/:sessionId', element: <SessionsPage /> },
-      { path: 'settings', element: <div className="p-6 text-gray-500">Settings page</div> },
+      { path: 'settings', element: <div className="p-6 text-muted-foreground">Settings page</div> },
     ],
   },
 ])

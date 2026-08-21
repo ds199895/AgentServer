@@ -292,7 +292,16 @@ class AgentSessionService:
                 req.resolved_at = value.occurred_at
             session.state = "running" if session.active_turn_id else "ready"
         elif typ == "plan.updated":
-            session.activities.append(AgentActivity(str(p.get("activity_id") or value.id), session.id, "plan", "Plan updated", status="completed", detail=str(p.get("detail") or ""), input=p.get("plan"), turn_id=p.get("turn_id"), created_at=value.occurred_at, updated_at=value.occurred_at, sequence=value.sequence))
+            # Upsert: a turn re-plans as it works, and each revision replaces the
+            # previous plan rather than stacking another card onto the timeline.
+            activity_id = str(p.get("activity_id") or value.id)
+            current = next((a for a in reversed(session.activities) if a.id == activity_id), None)
+            if current is not None:
+                current.input = p.get("plan")
+                current.detail = str(p.get("detail") or current.detail)
+                current.updated_at = value.occurred_at
+            else:
+                session.activities.append(AgentActivity(activity_id, session.id, "plan", "Plan updated", status="completed", detail=str(p.get("detail") or ""), input=p.get("plan"), turn_id=p.get("turn_id"), created_at=value.occurred_at, updated_at=value.occurred_at, sequence=value.sequence))
 
     async def get(self, owner_id: str, session_id: str) -> AgentSession | None:
         session = self._sessions.get(session_id)
