@@ -764,9 +764,25 @@ try {
   for (let index = 0; index < 6; index += 1) await page.keyboard.press('Backspace')
   await page.keyboard.type("right'")
   await page.keyboard.press('Enter')
+  // Switching tabs must not rebuild any renderer. addon-webgl shares one
+  // TextureAtlas across identically configured panes, so a rebuild here both
+  // burned through Chromium's active-context budget and wiped the glyph cache
+  // out from under every other mounted terminal, which then drew garbage.
+  await page.evaluate(() => {
+    window.__webglContexts = 0
+    const getContext = HTMLCanvasElement.prototype.getContext
+    HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+      if (typeof type === 'string' && type.startsWith('webgl')) window.__webglContexts += 1
+      return getContext.call(this, type, ...rest)
+    }
+  })
   for (let index = 0; index < 8; index += 1) {
     await activatePaneTab(page, 3, switchTerminalId)
     await activatePaneTab(page, 3, terminalId)
+  }
+  const rebuiltContexts = await page.evaluate(() => window.__webglContexts)
+  if (rebuiltContexts !== 0) {
+    fail(`16 terminal switches rebuilt ${rebuiltContexts} WebGL context(s)`)
   }
   const rendererMetrics = await primaryPane.evaluate((node) => {
     const host = node.querySelector('.terminal-host')

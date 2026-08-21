@@ -25,7 +25,7 @@ const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
 const textEncoder = new TextEncoder()
 
-type RestoreOptions = { rebuildAtlas?: boolean; recreateRenderer?: boolean }
+type RestoreOptions = { rebuildAtlas?: boolean }
 
 type TerminalContextMenu = {
   x: number
@@ -108,7 +108,6 @@ export default function TerminalPane({
   const focusedRef = useRef(focused)
   const virtualKeyboardOpenRef = useRef(false)
   const restoreRef = useRef<((options?: RestoreOptions) => void) | null>(null)
-  const suspendRendererRef = useRef<(() => void) | null>(null)
   const stopMomentumRef = useRef<(() => void) | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const noticeTimerRef = useRef<number | undefined>(undefined)
@@ -269,30 +268,35 @@ export default function TerminalPane({
     })
     const fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
-    let webglAddon: WebglAddon | null = null
-    const installWebglRenderer = () => {
-      if (webglAddon || disposed) return
-      try {
-        // preserveDrawingBuffer forces extra GPU synchronization on every
-        // frame. A fresh renderer on reveal is both cheaper and more reliable.
-        const addon = new WebglAddon()
-        addon.onContextLoss(() => {
-          addon.dispose()
-          if (webglAddon === addon) webglAddon = null
-          window.requestAnimationFrame(() => {
-            if (!disposed && visibleRef.current) terminal.refresh(0, terminal.rows - 1)
-          })
-        })
-        terminal.loadAddon(addon)
-        webglAddon = addon
-      } catch {
-        // xterm's DOM renderer remains active when WebGL is unavailable.
-        webglAddon = null
-      }
-    }
-    // Loading before open lets the addon install during xterm's onWillOpen.
+    // xterm 6 ships only the DOM renderer, which builds a span per style run
+    // per row. The WebGL addon registers itself during open()'s onWillOpen, so
+    // it has to be loaded first; if construction or context creation fails,
+    // xterm falls back to the DOM renderer on its own.
+    //
+    // One context per pane, held for the pane's whole lifetime. Disposing it on
+    // hide and rebuilding it on reveal churned through Chromium's active-context
+    // budget, which made the browser force-lose contexts belonging to panes the
+    // user had not touched.
     let disposed = false
-    installWebglRenderer()
+    let webglAddon: WebglAddon | null = null
+    try {
+      const addon = new WebglAddon()
+      addon.onContextLoss(() => {
+        addon.dispose()
+        if (webglAddon === addon) webglAddon = null
+        // Disposing the addon hands rendering back to xterm's DOM renderer.
+        // Repaint once so the pane does not keep the half-drawn frame the lost
+        // context left behind.
+        window.requestAnimationFrame(() => {
+          if (!disposed && visibleRef.current) terminal.refresh(0, terminal.rows - 1)
+        })
+      })
+      terminal.loadAddon(addon)
+      webglAddon = addon
+    } catch {
+      // xterm's DOM renderer remains active when WebGL is unavailable.
+      webglAddon = null
+    }
     terminal.open(hostRef.current)
     terminalRef.current = terminal
     terminal.attachCustomKeyEventHandler((event) => {
@@ -366,31 +370,25 @@ export default function TerminalPane({
       }
     }
 
-    const suspendRenderer = () => {
-      webglAddon?.dispose()
-      webglAddon = null
-    }
-    suspendRendererRef.current = suspendRenderer
-
-    const restore = ({
-      rebuildAtlas = false,
-      recreateRenderer = false,
-    }: RestoreOptions = {}) => {
+    const restore = ({ rebuildAtlas = false }: RestoreOptions = {}) => {
       window.cancelAnimationFrame(restoreFrame ?? 0)
       window.cancelAnimationFrame(refreshFrame ?? 0)
       restoreFrame = window.requestAnimationFrame(() => {
         fit()
         refreshFrame = window.requestAnimationFrame(() => {
           if (!visibleRef.current || disposed) return
-          if (recreateRenderer) {
-            suspendRenderer()
-            installWebglRenderer()
-          }
-          // The WebGL texture atlas can become invalid while Chromium occludes
-          // a hidden tab or after the OS resumes from sleep. Rebuild it only at
-          // those explicit recovery boundaries.
-          // clearTextureAtlas already requests a full refresh in xterm. Calling
-          // refresh as well would enqueue a second full-viewport paint.
+          // addon-webgl keys its TextureAtlas cache on the renderer config, and
+          // every pane here uses the same font/theme, so they all share one
+          // atlas. clearTextureAtlas() wipes that shared glyph cache but clears
+          // only *this* pane's render model: the other panes keep pointing at
+          // wiped atlas slots and draw garbage until something repaints them.
+          //
+          // Only the page-return path may pay that price. Every mounted pane
+          // installs its own visibilitychange/pageshow listener, so they all
+          // clear their model in the same turn and re-rasterize together. The
+          // WebGL atlas really can come back invalid after the OS resumes from
+          // sleep, so that path still needs the rebuild. Reveal and reconnect
+          // repaint this pane alone.
           if (rebuildAtlas) terminal.clearTextureAtlas()
           else terminal.refresh(0, terminal.rows - 1)
           // ResizeObserver、WS onopen 和 visibilitychange 都可能在用户已经
@@ -446,7 +444,7 @@ export default function TerminalPane({
             replayingSnapshot = false
             setRecovering(false)
             flushRecoveryInput()
-            restore({ rebuildAtlas: true })
+            restore()
           })
           return
         }
@@ -584,30 +582,29 @@ export default function TerminalPane({
     host.addEventListener('touchcancel', onTouchEnd)
     document.addEventListener('pointerdown', closeContextMenu)
     document.addEventListener('keydown', closeContextMenuOnEscape)
+    // fit() only. A size change already makes xterm reflow and repaint the
+    // affected rows, so the full restore() here just added one whole-viewport
+    // paint plus a focus-recovery check to every frame of a sash drag.
     const resizeObserver = new ResizeObserver(() => {
       window.cancelAnimationFrame(resizeFrame ?? 0)
       resizeFrame = window.requestAnimationFrame(() => {
-        if (visibleRef.current) restore()
+        if (visibleRef.current) fit()
       })
     })
-    // xterm has its own IntersectionObserver and pauses rendering while a tab
-    // uses display:none. Register after terminal.open(), so this callback runs
-    // after xterm observes the reveal and schedules a reliable recovery paint.
-    const revealObserver = new IntersectionObserver((entries) => {
-      const entry = entries[entries.length - 1]
-      if (entry?.isIntersecting && visibleRef.current) {
-        restore({ rebuildAtlas: true })
-      }
-    })
+    // Hidden panes use display:none, which drops them out of xterm's own
+    // IntersectionObserver and pauses its renderer. On reveal xterm flushes the
+    // resize it deferred and repaints every row itself, so reveal needs no
+    // observer of ours.
     const restoreWhenPageReturns = () => {
       if (document.visibilityState === 'visible' && visibleRef.current) {
         restore({ rebuildAtlas: true })
       }
     }
     resizeObserver.observe(hostRef.current)
-    revealObserver.observe(hostRef.current)
     document.addEventListener('visibilitychange', restoreWhenPageReturns)
-    window.addEventListener('focus', restoreWhenPageReturns)
+    // No window 'focus' listener. It fires on every alt-tab back into the page
+    // even though the document was never hidden, and each one triggered a
+    // shared-atlas rebuild plus a full repaint on every visible pane.
     window.addEventListener('pageshow', restoreWhenPageReturns)
     connect()
 
@@ -619,7 +616,6 @@ export default function TerminalPane({
       window.cancelAnimationFrame(refreshFrame ?? 0)
       window.cancelAnimationFrame(resizeFrame ?? 0)
       resizeObserver.disconnect()
-      revealObserver.disconnect()
       stopMomentum()
       scrollListener.dispose()
       stopMomentumRef.current = null
@@ -631,13 +627,11 @@ export default function TerminalPane({
       document.removeEventListener('pointerdown', closeContextMenu)
       document.removeEventListener('keydown', closeContextMenuOnEscape)
       document.removeEventListener('visibilitychange', restoreWhenPageReturns)
-      window.removeEventListener('focus', restoreWhenPageReturns)
       window.removeEventListener('pageshow', restoreWhenPageReturns)
       input.dispose()
       recoveryInput.clear()
       socket?.close(1000)
       restoreRef.current = null
-      suspendRendererRef.current = null
       terminalRef.current = null
       // Release the WebGL context before the terminal so the addon does not
       // touch an already-disposed renderer.
@@ -647,13 +641,14 @@ export default function TerminalPane({
     }
   }, [sessionId])
 
+  // `focused` is deliberately absent from the dependency list. It flips on
+  // both the pane being left and the pane being entered, so including it ran
+  // this whole recovery path on every visible pane for a single click. The ref
+  // sync effect above already keeps focusedRef current for restore().
   useEffect(() => {
-    visibleRef.current = visible
-    focusedRef.current = focused
     if (visible) {
-      restoreRef.current?.({ rebuildAtlas: true, recreateRenderer: true })
+      restoreRef.current?.()
     } else {
-      suspendRendererRef.current?.()
       setContextMenu(null)
       setPastePanelOpen(false)
       virtualKeyboardOpenRef.current = false
@@ -661,12 +656,12 @@ export default function TerminalPane({
       setVirtualModifiers(EMPTY_VIRTUAL_MODIFIERS)
       setPasteDraft('')
     }
-  }, [visible, focused])
+  }, [visible])
 
   return (
     <div className={cn(
       'absolute inset-0 min-h-0 min-w-0 grid-rows-[30px_minmax(0,1fr)] max-md:grid-rows-[28px_minmax(0,1fr)]',
-      visible ? 'grid visible' : 'grid invisible',
+      visible ? 'grid' : 'hidden',
     )} data-terminal-recovering={recovering ? 'true' : 'false'}>
       <header
         aria-label={`${deviceLabel} ${terminalLabel} 终端信息`}
