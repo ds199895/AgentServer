@@ -191,6 +191,7 @@ function applyEventBody(session: AgentSession, value: AgentEvent): AgentSession 
         ...session,
         turns: [...session.turns, {
           id: turnId, session_id: session.id, input, state: 'queued', created_at: value.occurred_at, completed_at: null, error: null,
+          model: payload.model ? text(payload.model) : null,
         }],
         messages: [...session.messages, {
           id: `user-${turnId}`, session_id: session.id, role: 'user', text: input,
@@ -206,6 +207,7 @@ function applyEventBody(session: AgentSession, value: AgentEvent): AgentSession 
         : [...session.turns, {
             id: turnId, session_id: session.id, input: text(payload.input),
             state: 'running' as const, created_at: value.occurred_at, completed_at: null, error: null,
+            model: null,
           }]
       return { ...session, state: 'running', active_turn_id: turnId, turns }
     }

@@ -209,7 +209,7 @@ class AgentSessionService:
         elif typ == "turn.queued":
             turn_id = str(p.get("turn_id") or new_id())
             if not any(turn.id == turn_id for turn in session.turns):
-                session.turns.append(AgentTurn(turn_id, session.id, str(p.get("input") or ""), "queued", value.occurred_at))
+                session.turns.append(AgentTurn(turn_id, session.id, str(p.get("input") or ""), "queued", value.occurred_at, model=str(p["model"]) if p.get("model") else None))
                 session.messages.append(AgentMessage(f"user-{turn_id}", session.id, "user", str(p.get("input") or ""), turn_id, None, value.occurred_at, False, value.sequence))
         elif typ == "turn.started":
             session.state = "running"; session.active_turn_id = str(p.get("turn_id") or "")
@@ -341,6 +341,7 @@ class AgentSessionService:
         session_id: str,
         text: str,
         turn_id: str | None = None,
+        options: Mapping[str, object] | None = None,
     ) -> AgentTurn:
         session = await self.get(owner_id, session_id)
         if session is None: raise KeyError(session_id)
@@ -351,6 +352,10 @@ class AgentSessionService:
                 raise ValueError("turn id is bound to different input")
             return existing
         turn = AgentTurn(resolved_turn_id, session_id, text, created_at=time.time())
+        queued_payload: dict[str, object] = {"turn_id": turn.id, "input": text}
+        requested_model = (options or {}).get("model")
+        if requested_model:
+            queued_payload["model"] = str(requested_model)
         await self._dispatch(
             session,
             AgentEvent(
@@ -358,12 +363,12 @@ class AgentSessionService:
                 f"agent-turn-queued:{session_id}:{turn.id}",
                 session_id,
                 "turn.queued",
-                {"turn_id": turn.id, "input": text},
+                queued_payload,
                 turn.created_at,
             ),
         )
         try:
-            await self.connector.turn(self._spec(session), turn.id, text)
+            await self.connector.turn(self._spec(session), turn.id, text, options)
         except BaseException as error:
             await self._dispatch(session, event(session_id, "turn.failed", {"turn_id": turn.id, "error": str(error)[:1000]}))
             raise

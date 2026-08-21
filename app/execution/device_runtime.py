@@ -3460,6 +3460,7 @@ class DeviceRuntimeService:
         session_id: str,
         input: str,
         turn_id: str | None = None,
+        options: Mapping[str, Any] | None = None,
         ttl: float = 5 * 60,
     ) -> Command:
         session, host = self._controlled_session(
@@ -3471,6 +3472,14 @@ class DeviceRuntimeService:
         lifetime = float(ttl)
         if not math.isfinite(lifetime) or not 1 <= lifetime <= 24 * 60 * 60:
             raise ValidationError("command ttl must be between 1 second and 24 hours")
+        # Per-turn provider options (model, effort). Bounded and whitelisted so a
+        # browser cannot smuggle arbitrary fields into the device command.
+        turn_options: dict[str, str] = {}
+        for name in ("model", "service_tier", "effort"):
+            raw = (options or {}).get(name)
+            if raw is None or raw == "":
+                continue
+            turn_options[name] = _require_text(raw, f"turn {name}", limit=128)
         resolved_turn_id = _identifier(turn_id or new_id(), "turn_id")
         command_id = hashlib.sha256(
             f"session.turn\0{owner_id}\0{session_id}\0{resolved_turn_id}".encode(
@@ -3490,6 +3499,7 @@ class DeviceRuntimeService:
                 or str(existing.payload.get("session_id") or "") != session_id
                 or str(existing.payload.get("turn_id") or "") != resolved_turn_id
                 or existing.payload.get("input") != value
+                or dict(existing.payload.get("options") or {}) != turn_options
                 or not self._command_matches_host(existing, host)
             ):
                 raise CommandConflict(
@@ -3531,6 +3541,7 @@ class DeviceRuntimeService:
                     "turn_id": resolved_turn_id,
                     "input": value,
                     "session_revision": reserved.revision,
+                    **({"options": turn_options} if turn_options else {}),
                     **self._command_fence(current_host),
                 },
                 "device command payload",

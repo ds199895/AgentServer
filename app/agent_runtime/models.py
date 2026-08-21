@@ -87,6 +87,9 @@ class AgentTurn:
     created_at: float = 0.0
     completed_at: float | None = None
     error: str | None = None
+    # Model this turn actually ran with, when it differs from the session
+    # default; lets the transcript show what produced each answer.
+    model: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return _json(self.__dict__)

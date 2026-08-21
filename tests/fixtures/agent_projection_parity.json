@@ -352,6 +352,7 @@
         "error": null,
         "id": "turn-1",
         "input": "list the files",
+        "model": null,
         "session_id": "session-fixture",
         "state": "completed"
       }

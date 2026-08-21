@@ -81,9 +81,12 @@ export function useAgentSession(sessionId: string | null) {
     reload,
     // The queued turn and its echoed user message both arrive over the socket,
     // so sending only has to hand the input to the server.
-    send: async (input: string) => {
+    send: async (
+      input: string,
+      options?: { model?: string | null; effort?: string | null },
+    ) => {
       if (!sessionId) return
-      await agentApi.turn(sessionId, input, newAgentTurnId())
+      await agentApi.turn(sessionId, input, newAgentTurnId(), options)
     },
   }
 }

@@ -31,6 +31,10 @@ class CreateAgentSessionBody(BaseModel):
 class TurnBody(BaseModel):
     input: str = Field(min_length=1, max_length=49_152)
     turn_id: str | None = Field(default=None, min_length=1, max_length=255)
+    # Per-turn provider overrides. Omitted fields fall back to the session's
+    # settings, so an unchanged picker sends nothing.
+    model: str | None = Field(default=None, max_length=128)
+    effort: str | None = Field(default=None, max_length=32)
 
 
 class RespondBody(BaseModel):
@@ -93,7 +97,12 @@ def build_agent_router(browser_user_dependency: Callable[..., str]) -> APIRouter
 
     @router.post("/api/agent/sessions/{session_id}/turns", status_code=202)
     async def turn(session_id: str, body: TurnBody, request: Request, owner_id: str = Depends(browser_user_dependency)):
-        try: return {"turn": (await service(request).send_turn(owner_id, session_id, body.input, body.turn_id)).as_dict()}
+        options = {
+            name: value
+            for name, value in (("model", body.model), ("effort", body.effort))
+            if value
+        }
+        try: return {"turn": (await service(request).send_turn(owner_id, session_id, body.input, body.turn_id, options or None)).as_dict()}
         except KeyError as error: raise HTTPException(404, "agent session not found") from error
         except (ValueError, DeviceRuntimeError, AgentConnectorError) as error: raise http_error(error) from error
 

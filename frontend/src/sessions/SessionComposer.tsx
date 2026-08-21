@@ -3,10 +3,26 @@ import { Send, Square, X } from 'lucide-react'
 import { agentApi } from '../agent/api'
 import type { AgentSession } from '../agent/types'
 import ApprovalBanner from './ApprovalBanner'
+import ModelPicker, { type ModelSelection } from './ModelPicker'
 
 interface SessionComposerProps {
   session: AgentSession
-  onSend: (input: string) => Promise<void>
+  onSend: (input: string, options?: { model?: string | null; effort?: string | null }) => Promise<void>
+}
+
+/**
+ * Model names the target device advertised for this session's provider.
+ * Capabilities are a device property, so an empty list simply means the device
+ * did not report one and the provider default applies.
+ */
+function availableModels(session: AgentSession): string[] {
+  const providers = (session.capabilities as { providers?: unknown })?.providers
+  if (!Array.isArray(providers)) return []
+  const entry = providers.find(
+    (item) => item && typeof item === 'object' && (item as { id?: unknown }).id === session.provider,
+  ) as { models?: unknown } | undefined
+  const models = entry?.models
+  return Array.isArray(models) ? models.filter((value): value is string => typeof value === 'string') : []
 }
 
 export default function SessionComposer({ session, onSend }: SessionComposerProps) {
@@ -14,7 +30,8 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
   const [isComposing, setIsComposing] = useState(false)
   // P2.5: messages typed while the agent is busy wait here instead of being
   // rejected, so a train of thought is never blocked on the agent finishing.
-  const [queue, setQueue] = useState<string[]>([])
+  const [queue, setQueue] = useState<Array<{ text: string; selection: ModelSelection }>>([])
+  const [selection, setSelection] = useState<ModelSelection>({ model: null, effort: null })
   const [sending, setSending] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -34,7 +51,7 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
     setSending(true)
     void (async () => {
       try {
-        await onSend(next)
+        await onSend(next.text, next.selection)
         setQueue(rest)
       } finally {
         setSending(false)
@@ -55,13 +72,13 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
     resetHeight()
 
     if (isBusy) {
-      setQueue((current) => [...current, text])
+      setQueue((current) => [...current, { text, selection }])
       return
     }
 
     setSending(true)
     try {
-      await onSend(text)
+      await onSend(text, selection)
     } finally {
       setSending(false)
     }
@@ -105,13 +122,13 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
         {/* Queued messages waiting for the agent to finish its current turn. */}
         {queue.length > 0 && (
           <div className="mb-3 space-y-1.5">
-            {queue.map((text, index) => (
+            {queue.map((entry, index) => (
               <div
                 key={index}
                 className="flex items-start gap-2 px-3 py-2 bg-primary/10 border border-primary/30 rounded-md text-sm text-foreground"
               >
                 <span className="text-xs font-medium text-primary mt-0.5 shrink-0">Queued</span>
-                <span className="flex-1 min-w-0 break-words">{text}</span>
+                <span className="flex-1 min-w-0 break-words">{entry.text}</span>
                 <button
                   type="button"
                   onClick={() => removeQueued(index)}
@@ -182,6 +199,25 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
             >
               <Send size={18} />
               <span className="hidden sm:inline">Send</span>
+            </button>
+          )}
+        </div>
+
+        <div className="mt-2 flex items-center gap-2">
+          <ModelPicker
+            available={availableModels(session)}
+            sessionModel={session.model}
+            selection={selection}
+            onChange={setSelection}
+            disabled={!canType}
+          />
+          {(selection.model || selection.effort) && (
+            <button
+              type="button"
+              onClick={() => setSelection({ model: null, effort: null })}
+              className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
+              Reset
             </button>
           )}
         </div>

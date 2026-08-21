@@ -94,5 +94,54 @@ class AgentRuntimePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
 
 
+class AgentTurnOptionsTests(unittest.IsolatedAsyncioTestCase):
+    """Per-turn model/effort overrides reach the connector and the transcript."""
+
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.calls: list[dict] = []
+        service = AgentSessionService(
+            AgentEventStore(Path(self.directory.name) / "agent.db")
+        )
+        original = service.connector.turn
+
+        async def recording_turn(spec, turn_id, text, options=None):
+            self.calls.append({"turn_id": turn_id, "text": text, "options": options})
+            await original(spec, turn_id, text, options)
+
+        service.connector.turn = recording_turn  # type: ignore[method-assign]
+        self.service = service
+
+    async def asyncTearDown(self) -> None:
+        await self.service.close()
+        self.directory.cleanup()
+
+    async def test_options_reach_the_connector_and_are_recorded(self) -> None:
+        session = await self.service.create(
+            owner_id="alice", provider="generic", device_id="device-a", cwd="/w"
+        )
+        await self.service.send_turn(
+            "alice", session.id, "use the big model", options={"model": "gpt-5", "effort": "high"}
+        )
+        await asyncio.sleep(0.02)
+
+        self.assertEqual(self.calls[-1]["options"], {"model": "gpt-5", "effort": "high"})
+        current = await self.service.get("alice", session.id)
+        assert current is not None
+        self.assertEqual(current.turns[-1].model, "gpt-5")
+
+    async def test_turn_without_options_records_no_model(self) -> None:
+        session = await self.service.create(
+            owner_id="alice", provider="generic", device_id="device-a", cwd="/w"
+        )
+        await self.service.send_turn("alice", session.id, "plain turn")
+        await asyncio.sleep(0.02)
+
+        self.assertIsNone(self.calls[-1]["options"])
+        current = await self.service.get("alice", session.id)
+        assert current is not None
+        self.assertIsNone(current.turns[-1].model)
+
+
 if __name__ == "__main__":
     unittest.main()

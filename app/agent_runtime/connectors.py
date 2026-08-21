@@ -55,7 +55,11 @@ class DeviceConnector(ABC):
 
     @abstractmethod
     async def turn(
-        self, spec: AgentLaunchSpec, turn_id: str, text: str
+        self,
+        spec: AgentLaunchSpec,
+        turn_id: str,
+        text: str,
+        options: Mapping[str, Any] | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -136,7 +140,14 @@ class ProviderRegistryConnector(DeviceConnector):
         except KeyError as error:
             raise AgentConnectorError("agent session bridge is not active") from error
 
-    async def turn(self, spec: AgentLaunchSpec, turn_id: str, text: str) -> None:
+    async def turn(
+        self,
+        spec: AgentLaunchSpec,
+        turn_id: str,
+        text: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        del options  # The in-process test bridge has no provider options.
         await self._bridge(spec).turn(spec.session_id, turn_id, text)
 
     async def interrupt(self, spec: AgentLaunchSpec, turn_id: str | None) -> None:
@@ -260,7 +271,13 @@ class DeviceRuntimeConnector(DeviceConnector):
             capabilities=dict(status.get("capabilities") or {}),
         )
 
-    async def turn(self, spec: AgentLaunchSpec, turn_id: str, text: str) -> None:
+    async def turn(
+        self,
+        spec: AgentLaunchSpec,
+        turn_id: str,
+        text: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
         self._active_turns[spec.session_id] = turn_id
         await asyncio.to_thread(
             self.service.send_turn,
@@ -268,6 +285,7 @@ class DeviceRuntimeConnector(DeviceConnector):
             session_id=spec.session_id,
             input=text,
             turn_id=turn_id,
+            options=dict(options) if options else None,
         )
 
     async def interrupt(self, spec: AgentLaunchSpec, turn_id: str | None) -> None:

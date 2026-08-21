@@ -51,6 +51,8 @@ export type AgentTurn = {
   created_at: number
   completed_at?: number | null
   error?: string | null
+  /** Model this turn ran with, when overridden from the session default. */
+  model?: string | null
 }
 
 export type AgentSession = {
