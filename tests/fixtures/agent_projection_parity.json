@@ -14,26 +14,45 @@
       "event_id": "event-2",
       "occurred_at": 1002.0,
       "payload": {
-        "input": "list the files",
-        "turn_id": "turn-1"
+        "models": [
+          {
+            "default": true,
+            "id": "gpt-5-codex",
+            "name": "GPT-5 Codex"
+          },
+          {
+            "id": "gpt-5"
+          }
+        ]
       },
       "sequence": 3,
       "session_id": "session-fixture",
-      "type": "turn.queued"
+      "type": "session.models"
     },
     {
       "event_id": "event-3",
       "occurred_at": 1003.0,
       "payload": {
+        "input": "list the files",
         "turn_id": "turn-1"
       },
       "sequence": 4,
       "session_id": "session-fixture",
-      "type": "turn.started"
+      "type": "turn.queued"
     },
     {
       "event_id": "event-4",
       "occurred_at": 1004.0,
+      "payload": {
+        "turn_id": "turn-1"
+      },
+      "sequence": 5,
+      "session_id": "session-fixture",
+      "type": "turn.started"
+    },
+    {
+      "event_id": "event-5",
+      "occurred_at": 1005.0,
       "payload": {
         "activity_id": "item-1",
         "detail": "ls -la",
@@ -42,27 +61,16 @@
         "title": "Command",
         "turn_id": "turn-1"
       },
-      "sequence": 5,
-      "session_id": "session-fixture",
-      "type": "activity.started"
-    },
-    {
-      "event_id": "event-5",
-      "occurred_at": 1005.0,
-      "payload": {
-        "activity_id": "item-1",
-        "output_delta": "a.txt\n"
-      },
       "sequence": 6,
       "session_id": "session-fixture",
-      "type": "activity.updated"
+      "type": "activity.started"
     },
     {
       "event_id": "event-6",
       "occurred_at": 1006.0,
       "payload": {
         "activity_id": "item-1",
-        "output_delta": "b.txt\n"
+        "output_delta": "a.txt\n"
       },
       "sequence": 7,
       "session_id": "session-fixture",
@@ -73,34 +81,32 @@
       "occurred_at": 1007.0,
       "payload": {
         "activity_id": "item-1",
-        "item_id": "item-1",
-        "status": "succeeded"
+        "output_delta": "b.txt\n"
       },
       "sequence": 8,
       "session_id": "session-fixture",
-      "type": "activity.completed"
+      "type": "activity.updated"
     },
     {
       "event_id": "event-8",
       "occurred_at": 1008.0,
       "payload": {
+        "activity_id": "item-1",
         "item_id": "item-1",
-        "message_id": "reasoning-1",
-        "role": "reasoning",
-        "text": "checking the tree",
-        "turn_id": "turn-1"
+        "status": "succeeded"
       },
       "sequence": 9,
       "session_id": "session-fixture",
-      "type": "message.delta"
+      "type": "activity.completed"
     },
     {
       "event_id": "event-9",
       "occurred_at": 1009.0,
       "payload": {
-        "message_id": "msg-1",
-        "role": "assistant",
-        "text": "Two ",
+        "item_id": "item-1",
+        "message_id": "reasoning-1",
+        "role": "reasoning",
+        "text": "checking the tree",
         "turn_id": "turn-1"
       },
       "sequence": 10,
@@ -113,7 +119,7 @@
       "payload": {
         "message_id": "msg-1",
         "role": "assistant",
-        "text": "files.",
+        "text": "Two ",
         "turn_id": "turn-1"
       },
       "sequence": 11,
@@ -126,16 +132,29 @@
       "payload": {
         "message_id": "msg-1",
         "role": "assistant",
-        "text": "Two files.",
+        "text": "files.",
         "turn_id": "turn-1"
       },
       "sequence": 12,
       "session_id": "session-fixture",
-      "type": "message.created"
+      "type": "message.delta"
     },
     {
       "event_id": "event-12",
       "occurred_at": 1012.0,
+      "payload": {
+        "message_id": "msg-1",
+        "role": "assistant",
+        "text": "Two files.",
+        "turn_id": "turn-1"
+      },
+      "sequence": 13,
+      "session_id": "session-fixture",
+      "type": "message.created"
+    },
+    {
+      "event_id": "event-13",
+      "occurred_at": 1013.0,
       "payload": {
         "activity_id": "plan-1",
         "plan": [
@@ -146,13 +165,13 @@
         ],
         "turn_id": "turn-1"
       },
-      "sequence": 13,
+      "sequence": 14,
       "session_id": "session-fixture",
       "type": "plan.updated"
     },
     {
-      "event_id": "event-13",
-      "occurred_at": 1013.0,
+      "event_id": "event-14",
+      "occurred_at": 1014.0,
       "payload": {
         "activity_id": "plan-1",
         "plan": [
@@ -167,13 +186,13 @@
         ],
         "turn_id": "turn-1"
       },
-      "sequence": 14,
+      "sequence": 15,
       "session_id": "session-fixture",
       "type": "plan.updated"
     },
     {
-      "event_id": "event-14",
-      "occurred_at": 1014.0,
+      "event_id": "event-15",
+      "occurred_at": 1015.0,
       "payload": {
         "kind": "approval",
         "options": [],
@@ -181,30 +200,30 @@
         "title": "Run command?",
         "turn_id": "turn-1"
       },
-      "sequence": 15,
+      "sequence": 16,
       "session_id": "session-fixture",
       "type": "request.created"
     },
     {
-      "event_id": "event-15",
-      "occurred_at": 1015.0,
+      "event_id": "event-16",
+      "occurred_at": 1016.0,
       "payload": {
         "request_id": "req-1",
         "resolution": {
           "decision": "approve_once"
         }
       },
-      "sequence": 16,
+      "sequence": 17,
       "session_id": "session-fixture",
       "type": "request.resolved"
     },
     {
-      "event_id": "event-16",
-      "occurred_at": 1016.0,
+      "event_id": "event-17",
+      "occurred_at": 1017.0,
       "payload": {
         "turn_id": "turn-1"
       },
-      "sequence": 17,
+      "sequence": 18,
       "session_id": "session-fixture",
       "type": "turn.completed"
     }
@@ -214,23 +233,23 @@
     "activities": [
       {
         "collapsed": true,
-        "created_at": 1004.0,
+        "created_at": 1005.0,
         "detail": "ls -la",
         "id": "item-1",
         "input": null,
         "item_id": "item-1",
         "kind": "command",
         "output": "a.txt\nb.txt\n",
-        "sequence": 5,
+        "sequence": 6,
         "session_id": "session-fixture",
         "status": "succeeded",
         "title": "Command",
         "turn_id": "turn-1",
-        "updated_at": 1007.0
+        "updated_at": 1008.0
       },
       {
         "collapsed": true,
-        "created_at": 1012.0,
+        "created_at": 1013.0,
         "detail": "",
         "id": "plan-1",
         "input": [
@@ -246,16 +265,26 @@
         "item_id": null,
         "kind": "plan",
         "output": null,
-        "sequence": 13,
+        "sequence": 14,
         "session_id": "session-fixture",
         "status": "completed",
         "title": "Plan updated",
         "turn_id": "turn-1",
-        "updated_at": 1013.0
+        "updated_at": 1014.0
       }
     ],
     "bridge_instance_id": "in-process-test",
     "capabilities": {
+      "models": [
+        {
+          "default": true,
+          "id": "gpt-5-codex",
+          "name": "GPT-5 Codex"
+        },
+        {
+          "id": "gpt-5"
+        }
+      ],
       "providers": [
         {
           "available": true,
@@ -281,33 +310,33 @@
     "last_error": null,
     "messages": [
       {
-        "created_at": 1002.0,
+        "created_at": 1003.0,
         "id": "user-turn-1",
         "item_id": null,
         "role": "user",
-        "sequence": 3,
+        "sequence": 4,
         "session_id": "session-fixture",
         "streaming": false,
         "text": "list the files",
         "turn_id": "turn-1"
       },
       {
-        "created_at": 1008.0,
+        "created_at": 1009.0,
         "id": "reasoning-1",
         "item_id": "item-1",
         "role": "reasoning",
-        "sequence": 9,
+        "sequence": 10,
         "session_id": "session-fixture",
         "streaming": true,
         "text": "checking the tree",
         "turn_id": "turn-1"
       },
       {
-        "created_at": 1009.0,
+        "created_at": 1010.0,
         "id": "msg-1",
         "item_id": null,
         "role": "assistant",
-        "sequence": 10,
+        "sequence": 11,
         "session_id": "session-fixture",
         "streaming": false,
         "text": "Two files.",
@@ -321,17 +350,17 @@
     "provider": "generic",
     "requests": [
       {
-        "created_at": 1014.0,
+        "created_at": 1015.0,
         "detail": "",
         "id": "req-1",
         "input": null,
         "kind": "approval",
         "options": [],
-        "resolved_at": 1015.0,
+        "resolved_at": 1016.0,
         "response": {
           "decision": "approve_once"
         },
-        "sequence": 15,
+        "sequence": 16,
         "session_id": "session-fixture",
         "status": "resolved",
         "title": "Run command?",
@@ -341,14 +370,14 @@
     "resume_cursor": {
       "thread_id": "thread-9"
     },
-    "sequence": 17,
+    "sequence": 18,
     "session_kind": "agent",
     "state": "ready",
     "transport": "in-process-test",
     "turns": [
       {
-        "completed_at": 1016.0,
-        "created_at": 1002.0,
+        "completed_at": 1017.0,
+        "created_at": 1003.0,
         "error": null,
         "id": "turn-1",
         "input": "list the files",
@@ -357,6 +386,6 @@
         "state": "completed"
       }
     ],
-    "updated_at": 1016.0
+    "updated_at": 1017.0
   }
 }

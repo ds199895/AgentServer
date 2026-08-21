@@ -18,6 +18,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "agent_projection_parity.json"
 # projections cannot drift apart without a test failing on one side or both.
 EVENTS: list[tuple[str, dict]] = [
     ("session.ready", {"provider_thread_id": "thread-9"}),
+    ("session.models", {"models": [{"id": "gpt-5-codex", "name": "GPT-5 Codex", "default": True}, {"id": "gpt-5"}]}),
     ("turn.queued", {"turn_id": "turn-1", "input": "list the files"}),
     ("turn.started", {"turn_id": "turn-1"}),
     ("activity.started", {"activity_id": "item-1", "kind": "command", "title": "Command", "detail": "ls -la", "turn_id": "turn-1", "item_id": "item-1"}),

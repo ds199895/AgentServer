@@ -62,6 +62,12 @@ class AgentEventStore:
             rows = db.execute("SELECT data FROM agent_sessions WHERE owner_id=? ORDER BY json_extract(data, '$.updated_at') DESC", (owner_id,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def all_sessions(self) -> list[dict[str, Any]]:
+        """Every stored session, across owners. Used only by startup reconciliation."""
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT data FROM agent_sessions").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def append(self, value: AgentEvent) -> AgentEvent:
         committed, _created = self.append_once(value)
         return committed

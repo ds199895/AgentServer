@@ -1145,6 +1145,55 @@ class CodexRuntimeAdapter(RuntimeAdapter):
         )
         await session.peer.wait_inbound_response(pending.inbound_request_id)
 
+    # Cap the catalogue walk. `model/list` is cursor paginated; a runaway or
+    # malicious cursor loop must not spin forever inside a session handler.
+    _MODEL_PAGE_LIMIT = 10
+
+    async def list_models(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        """Enumerate the models this provider session can actually run.
+
+        Codex only answers `model/list` over a live app-server connection, so
+        this is session-scoped rather than part of the static device probe.
+        """
+        session = self._require_session(session_id)
+        models: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        for _page in range(self._MODEL_PAGE_LIMIT):
+            params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+            response = _mapping(await self._request(session, "model/list", params))
+            if response is None:
+                break
+            for raw in _sequence(response.get("data")) or ():
+                entry = _mapping(raw)
+                if entry is None:
+                    continue
+                slug = _text(entry.get("model")) or _text(entry.get("id"))
+                if slug is None or slug in seen:
+                    continue
+                seen.add(slug)
+                projected: dict[str, Any] = {"id": slug}
+                display = _text(entry.get("displayName")) or _text(entry.get("name"))
+                if display:
+                    projected["name"] = display
+                if entry.get("isDefault") is True:
+                    projected["default"] = True
+                efforts = [
+                    value
+                    for value in (
+                        _text(item)
+                        for item in (_sequence(entry.get("supportedReasoningEfforts")) or ())
+                    )
+                    if value
+                ]
+                if efforts:
+                    projected["efforts"] = efforts
+                models.append(projected)
+            cursor = _text(response.get("nextCursor"))
+            if not cursor:
+                break
+        return tuple(models)
+
     async def read_thread(self, session_id: str) -> RuntimeThreadSnapshot:
         session = self._require_session(session_id)
         response = await self._request(

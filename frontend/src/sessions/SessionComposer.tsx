@@ -3,7 +3,7 @@ import { Send, Square, X } from 'lucide-react'
 import { agentApi } from '../agent/api'
 import type { AgentSession } from '../agent/types'
 import ApprovalBanner from './ApprovalBanner'
-import ModelPicker, { type ModelSelection } from './ModelPicker'
+import ModelPicker, { type AgentModel, type ModelSelection } from './ModelPicker'
 
 interface SessionComposerProps {
   session: AgentSession
@@ -11,18 +11,30 @@ interface SessionComposerProps {
 }
 
 /**
- * Model names the target device advertised for this session's provider.
- * Capabilities are a device property, so an empty list simply means the device
- * did not report one and the provider default applies.
+ * Model catalogue this session's provider reported when it started.
+ *
+ * Codex only answers `model/list` over a live app-server connection, so the
+ * list arrives as a `session.models` event rather than from the device probe.
+ * An empty list means the provider has no catalogue, and the picker offers
+ * only the provider default.
  */
-function availableModels(session: AgentSession): string[] {
-  const providers = (session.capabilities as { providers?: unknown })?.providers
-  if (!Array.isArray(providers)) return []
-  const entry = providers.find(
-    (item) => item && typeof item === 'object' && (item as { id?: unknown }).id === session.provider,
-  ) as { models?: unknown } | undefined
-  const models = entry?.models
-  return Array.isArray(models) ? models.filter((value): value is string => typeof value === 'string') : []
+function availableModels(session: AgentSession): AgentModel[] {
+  const models = (session.capabilities as { models?: unknown })?.models
+  if (!Array.isArray(models)) return []
+  return models.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const entry = raw as Record<string, unknown>
+    const id = typeof entry.id === 'string' ? entry.id : null
+    if (!id) return []
+    return [{
+      id,
+      name: typeof entry.name === 'string' ? entry.name : id,
+      isDefault: entry.default === true,
+      efforts: Array.isArray(entry.efforts)
+        ? entry.efforts.filter((value): value is string => typeof value === 'string')
+        : [],
+    }]
+  })
 }
 
 export default function SessionComposer({ session, onSend }: SessionComposerProps) {
@@ -205,7 +217,7 @@ export default function SessionComposer({ session, onSend }: SessionComposerProp
 
         <div className="mt-2 flex items-center gap-2">
           <ModelPicker
-            available={availableModels(session)}
+            models={availableModels(session)}
             sessionModel={session.model}
             selection={selection}
             onChange={setSelection}

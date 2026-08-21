@@ -602,6 +602,10 @@ async def lifespan(app: FastAPI):
         DeviceRuntimeConnector(device_runtime),
     )
     app.state.agent_sessions = agent_sessions
+    # Sessions left mid-stop by a previous process cannot advance on their own;
+    # settle them once so the UI does not show a permanently "stopping" row.
+    with contextlib.suppress(Exception):
+        agent_sessions.reconcile_stuck_sessions()
     observation_publisher = ObservationPublisher(execution.record_observation)
     observation_translator = TerminalObservationTranslator(
         default_owner=ADMIN_USERNAME,

@@ -470,6 +470,8 @@ class DeviceRuntimeConnector(DeviceConnector):
                 ),
                 turn_id=local_turn_id,
             )
+        elif typ == "session.models":
+            target = "session.models"
         elif typ == "session.stopped":
             target = "session.stopped"
         elif typ == "session.failed":

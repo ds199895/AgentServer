@@ -175,6 +175,13 @@ function applyEventBody(session: AgentSession, value: AgentEvent): AgentSession 
         resume_cursor: providerSessionId ? { thread_id: text(providerSessionId) } : session.resume_cursor,
       }
     }
+    case 'session.models': {
+      // Provider model catalogue for this session; kept on capabilities so it
+      // travels with the snapshot the composer's picker reads.
+      const models = payload.models
+      if (!Array.isArray(models)) return session
+      return { ...session, capabilities: { ...session.capabilities, models } }
+    }
     case 'session.stopped':
       return { ...session, state: 'stopped' }
     case 'session.failed':

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from app.agent_runtime.events import event
+from app.agent_runtime.connectors import AgentConnectorError
 from app.agent_runtime.service import AgentSessionService
 from app.agent_runtime.store import AgentEventStore
 
@@ -141,6 +142,81 @@ class AgentTurnOptionsTests(unittest.IsolatedAsyncioTestCase):
         current = await self.service.get("alice", session.id)
         assert current is not None
         self.assertIsNone(current.turns[-1].model)
+
+
+class AgentSessionCloseTests(unittest.IsolatedAsyncioTestCase):
+    """Closing must always reach a terminal state, even when the device is gone."""
+
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "agent.db"
+        self.service = AgentSessionService(AgentEventStore(self.path))
+
+    async def asyncTearDown(self) -> None:
+        await self.service.close()
+        self.directory.cleanup()
+
+    async def test_close_settles_when_the_device_cannot_confirm(self) -> None:
+        session = await self.service.create(
+            owner_id="alice", provider="generic", device_id="device-a", cwd="/w"
+        )
+        await asyncio.sleep(0.02)
+
+        async def unreachable(spec):
+            raise AgentConnectorError("target device Agent bridge is offline")
+
+        self.service.connector.stop = unreachable  # type: ignore[method-assign]
+        await self.service.command("alice", session.id, "close")
+
+        current = await self.service.get("alice", session.id)
+        assert current is not None
+        # Previously this stayed "stopping" forever with nothing to advance it.
+        self.assertEqual("stopped", current.state)
+
+    async def test_a_closing_session_is_not_revived_by_reading_it(self) -> None:
+        session = await self.service.create(
+            owner_id="alice", provider="generic", device_id="device-a", cwd="/w"
+        )
+        await asyncio.sleep(0.02)
+        await self.service._dispatch(
+            session,
+            event(session.id, "session.state.changed", {"state": "stopping"}),
+        )
+        self.service._sessions.pop(session.id, None)
+
+        starts = 0
+        original = self.service.connector.start
+
+        async def counting_start(spec):
+            nonlocal starts
+            starts += 1
+            return await original(spec)
+
+        self.service.connector.start = counting_start  # type: ignore[method-assign]
+        current = await self.service.get("alice", session.id)
+        assert current is not None
+        self.assertEqual("stopping", current.state)
+        self.assertEqual(0, starts)
+
+    async def test_startup_reconciles_sessions_wedged_in_stopping(self) -> None:
+        session = await self.service.create(
+            owner_id="alice", provider="generic", device_id="device-a", cwd="/w"
+        )
+        await asyncio.sleep(0.02)
+        await self.service._dispatch(
+            session,
+            event(session.id, "session.state.changed", {"state": "stopping"}),
+        )
+        await self.service.close()
+
+        # A fresh process, as after a deploy.
+        self.service = AgentSessionService(AgentEventStore(self.path))
+        self.assertEqual(1, self.service.reconcile_stuck_sessions())
+        current = await self.service.get("alice", session.id)
+        assert current is not None
+        self.assertEqual("stopped", current.state)
+        # Idempotent: a second pass finds nothing left to settle.
+        self.assertEqual(0, self.service.reconcile_stuck_sessions())
 
 
 if __name__ == "__main__":

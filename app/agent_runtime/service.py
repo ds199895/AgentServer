@@ -18,6 +18,11 @@ from .store import AgentEventStore
 # rehydration pages through the log rather than assuming one read covers it.
 _REPLAY_PAGE = 1000
 
+# States that must never be restarted by a read. `stopping` is included so a
+# session the user asked to close is not revived by opening it again while the
+# device is still confirming.
+_CLOSED_STATES = frozenset({"stopping", "stopped", "failed"})
+
 
 class AgentSessionService:
     def __init__(
@@ -91,7 +96,7 @@ class AgentSessionService:
                 self._sessions[sid] = session
                 self._subscribers[sid] = set()
         if restored:
-            if session.state in {"stopped", "failed"}:
+            if session.state in _CLOSED_STATES:
                 return session
             binding = await self.connector.start(self._spec(session))
             session.executor_id = binding.executor_id
@@ -180,7 +185,7 @@ class AgentSessionService:
         except asyncio.CancelledError:
             raise
         except BaseException as error:
-            if session.state not in {"stopped", "failed"}:
+            if session.state not in _CLOSED_STATES:
                 with contextlib.suppress(BaseException):
                     await self._dispatch(
                         session,
@@ -200,6 +205,12 @@ class AgentSessionService:
             provider_session_id = p.get("provider_session_id") or p.get("provider_thread_id")
             if provider_session_id:
                 session.resume_cursor = {"thread_id": str(provider_session_id)}
+        elif typ == "session.models":
+            # Provider model catalogue for this session, used by the composer's
+            # picker. Stored on capabilities so it travels with the snapshot.
+            values = p.get("models")
+            if isinstance(values, list):
+                session.capabilities = {**session.capabilities, "models": values}
         elif typ == "session.stopped": session.state = "stopped"
         elif typ == "session.failed": session.state, session.last_error = "failed", str(p.get("error") or "provider failed")
         elif typ == "session.state.changed":
@@ -303,6 +314,43 @@ class AgentSessionService:
             else:
                 session.activities.append(AgentActivity(activity_id, session.id, "plan", "Plan updated", status="completed", detail=str(p.get("detail") or ""), input=p.get("plan"), turn_id=p.get("turn_id"), created_at=value.occurred_at, updated_at=value.occurred_at, sequence=value.sequence))
 
+    def reconcile_stuck_sessions(self) -> int:
+        """Close out sessions left mid-stop by an earlier process.
+
+        A close used to record `stopping` before the device confirmed it, so a
+        device that never answered left the session wedged there with nothing
+        remaining to advance it. Those rows cannot recover on their own, so they
+        are settled once at startup. Returns how many were closed.
+        """
+        closed = 0
+        for raw in self.store.all_sessions():
+            if str(raw.get("state") or "") != "stopping":
+                continue
+            owner_id = str(raw.get("owner_id") or "")
+            session_id = str(raw.get("id") or "")
+            if not owner_id or not session_id:
+                continue
+            session = self._sessions.get(session_id) or self._rehydrate(
+                AgentSession.from_dict(raw)
+            )
+            if session.state != "stopping":
+                continue
+            committed, created = self.store.append_once(
+                event(
+                    session_id,
+                    "session.stopped",
+                    {"detail": "settled at startup after an unconfirmed close"},
+                )
+            )
+            if created:
+                session.sequence = committed.sequence
+                session.updated_at = committed.occurred_at
+                self._apply(session, committed)
+                self._persist(session)
+            self._sessions.pop(session_id, None)
+            closed += 1
+        return closed
+
     async def get(self, owner_id: str, session_id: str) -> AgentSession | None:
         session = self._sessions.get(session_id)
         if session and session.owner_id == owner_id: return session
@@ -311,7 +359,7 @@ class AgentSessionService:
             session = self._rehydrate(AgentSession.from_dict(raw))
             self._sessions[session_id] = session
             self._subscribers.setdefault(session_id, set())
-            if session.state not in {"stopped", "failed"}:
+            if session.state not in _CLOSED_STATES:
                 try:
                     binding = await self.connector.start(self._spec(session))
                     session.executor_id = binding.executor_id
@@ -380,9 +428,27 @@ class AgentSessionService:
         if action == "interrupt": await self.connector.interrupt(self._spec(session), session.active_turn_id)
         elif action == "respond": await self.connector.respond(self._spec(session), str((payload or {}).get("request_id") or ""), payload or {})
         elif action == "close":
-            session.state = "stopping"
-            self._persist(session)
-            await self.connector.stop(self._spec(session))
+            # `stopping` is a real provider state, so it is only recorded once
+            # the device has accepted the stop. Writing it first left a session
+            # wedged in `stopping` forever whenever the device was unreachable,
+            # with nothing remaining to move it on.
+            await self._dispatch(
+                session, event(session_id, "session.state.changed", {"state": "stopping"})
+            )
+            try:
+                await self.connector.stop(self._spec(session))
+            except BaseException as error:
+                # The device cannot confirm the stop. Close it out locally
+                # rather than stranding it: the transcript is durable, and a
+                # stale bridge cannot resume against a stopped session.
+                await self._dispatch(
+                    session,
+                    event(
+                        session_id,
+                        "session.stopped",
+                        {"detail": f"closed without device confirmation: {error}"[:1000]},
+                    ),
+                )
         else: raise ValueError("unsupported action")
 
     async def device_status(self, owner_id: str, device_id: str) -> Mapping[str, Any]:

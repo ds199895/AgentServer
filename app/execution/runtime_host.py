@@ -2492,7 +2492,35 @@ class DeviceRuntimeHost:
                         self._record_event_pump_outcome(session_handle, task)
                     )
                 )
+            await self._announce_session_models(adapter, session_id)
             return result
+
+    async def _announce_session_models(self, adapter: object, session_id: str) -> None:
+        """Publish the provider's model catalogue for this session, if it has one.
+
+        Codex only answers `model/list` over a live app-server connection, so the
+        catalogue cannot come from the static device probe. A provider without
+        the capability, or one that fails to answer, simply publishes nothing —
+        the picker then falls back to the provider default.
+        """
+        lister = getattr(adapter, "list_models", None)
+        if not callable(lister):
+            return
+        try:
+            models = await lister(session_id)
+        except BaseException:
+            # Never fail a started session because its model list is unavailable.
+            return
+        if not models:
+            return
+        await self._emit_adapter_event(
+            RuntimeEvent(
+                type="session.models",
+                payload={"models": [dict(model) for model in models]},
+                session_id=session_id,
+            ),
+            default_session_id=session_id,
+        )
 
     async def _stop_session(self, payload: Mapping[str, Any]) -> object:
         session_id = _require_text(payload.get("session_id"), "session_id")
