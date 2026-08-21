@@ -7,6 +7,7 @@ export type AgentMessage = {
   item_id?: string | null
   created_at: number
   streaming?: boolean
+  sequence?: number
 }
 
 export type AgentActivity = {
@@ -23,6 +24,7 @@ export type AgentActivity = {
   created_at: number
   updated_at: number
   collapsed?: boolean
+  sequence?: number
 }
 
 export type AgentRequest = {
@@ -35,6 +37,10 @@ export type AgentRequest = {
   status: 'pending' | 'resolved'
   turn_id?: string | null
   created_at: number
+  input?: unknown
+  response?: unknown
+  resolved_at?: number | null
+  sequence?: number
 }
 
 export type AgentTurn = {

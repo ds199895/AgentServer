@@ -131,7 +131,6 @@ _DELTA_METHODS = frozenset(
 _DISPLAY_DELTA_TYPES = {
     "item/agentMessage/delta": ("message.delta", "assistant"),
     "item/reasoning/summaryTextDelta": ("reasoning.delta", "reasoning_summary"),
-    "item/reasoning/textDelta": ("reasoning.delta", "reasoning_summary"),
     "item/commandExecution/outputDelta": ("tool.output.delta", "tool"),
     "item/fileChange/outputDelta": ("file.output.delta", "file"),
 }
@@ -139,6 +138,9 @@ _DISPLAY_DELTA_TYPES = {
 _PUBLIC_SECRET_MARKER = re.compile(r"\b(?:LEAK|SECRET|TOKEN|PASSWORD|CREDENTIAL)_[A-Z0-9_]+\b")
 _PUBLIC_SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|credential)\b\s*[:=]\s*[^\s,;]+"
+)
+_PUBLIC_SECRET_KEY = re.compile(
+    r"(?i)(?:api[_-]?key|authorization|credential|password|secret|token)"
 )
 
 
@@ -159,6 +161,143 @@ def _display_delta(value: object) -> str | None:
     text = _PUBLIC_SECRET_MARKER.sub("[redacted]", text)
     text = _PUBLIC_SECRET_ASSIGNMENT.sub(r"\1=[redacted]", text)
     return text[:16_384]
+
+
+def _display_value(value: object, *, key: str = "", depth: int = 0) -> Any:
+    """Detach a small, redacted JSON value for an explicit display field."""
+    if _PUBLIC_SECRET_KEY.search(key):
+        return "[redacted]"
+    if depth >= 5:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        text = _PUBLIC_SECRET_MARKER.sub("[redacted]", value)
+        text = _PUBLIC_SECRET_ASSIGNMENT.sub(r"\1=[redacted]", text)
+        return text[:16_384]
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, item in list(value.items())[:100]:
+            name = str(raw_key)[:128]
+            result[name] = _display_value(item, key=name, depth=depth + 1)
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [
+            _display_value(item, key=key, depth=depth + 1)
+            for item in list(value)[:100]
+        ]
+    return str(value)[:1000]
+
+
+def _selected_display_fields(
+    value: Mapping[str, Any], fields: Sequence[str]
+) -> dict[str, Any] | None:
+    result = {
+        field: _display_value(value[field], key=field)
+        for field in fields
+        if field in value and value[field] is not None
+    }
+    return result or None
+
+
+def _item_display_projection(
+    item_type: str, item: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project only documented, user-facing item fields into the public log."""
+    if item_type == "command_execution":
+        command = _display_value(item.get("command"), key="command")
+        cwd = _display_value(item.get("cwd"), key="cwd")
+        input_value = {
+            key: value
+            for key, value in (("command", command), ("cwd", cwd))
+            if value not in (None, "")
+        }
+        output = _selected_display_fields(
+            item,
+            (
+                "aggregatedOutput",
+                "output",
+                "exitCode",
+                "exit_code",
+                "durationMs",
+                "duration_ms",
+            ),
+        )
+        summary = command if isinstance(command, str) else None
+        return {
+            "title": "Command",
+            "detail": (summary or "")[:500],
+            "input": input_value or None,
+            "output": output,
+        }
+    if item_type == "file_change":
+        changes: list[dict[str, Any]] = []
+        for raw_change in _sequence(item.get("changes")) or ():
+            change = _mapping(raw_change)
+            if change:
+                projected = _selected_display_fields(
+                    change, ("path", "kind", "diff", "patch", "status")
+                )
+                if projected:
+                    changes.append(projected)
+        direct = _selected_display_fields(
+            item, ("path", "kind", "diff", "patch", "status")
+        )
+        input_value: Any = changes or direct
+        path = None
+        if changes:
+            path = changes[0].get("path")
+        elif direct:
+            path = direct.get("path")
+        return {
+            "title": "File change",
+            "detail": str(path or "")[:500],
+            "input": input_value,
+            "output": _selected_display_fields(item, ("output", "error")),
+        }
+    if item_type in {"mcp_tool_call", "dynamic_tool_call"}:
+        identity = _selected_display_fields(item, ("server", "tool", "name"))
+        input_value = _selected_display_fields(
+            item, ("server", "tool", "name", "arguments")
+        )
+        label = " · ".join(str(value) for value in (identity or {}).values())
+        return {
+            "title": label or "Tool call",
+            "detail": "",
+            "input": input_value,
+            "output": _selected_display_fields(item, ("result", "output", "error")),
+        }
+    if item_type == "web_search":
+        query = _display_value(item.get("query"), key="query")
+        return {
+            "title": "Web search",
+            "detail": str(query or "")[:500],
+            "input": _selected_display_fields(item, ("query", "action")),
+            "output": _selected_display_fields(item, ("result", "results", "error")),
+        }
+    if item_type == "reasoning":
+        return {"title": "Thinking", "detail": "", "input": None, "output": None}
+    if item_type == "plan":
+        return {"title": "Planning", "detail": "", "input": None, "output": None}
+    return {
+        "title": item_type.replace("_", " ").title(),
+        "detail": "",
+        "input": None,
+        "output": None,
+    }
+
+
+def _plan_display_projection(value: object) -> list[Any]:
+    result: list[Any] = []
+    for raw_step in _sequence(value) or ():
+        step = _mapping(raw_step)
+        if step:
+            projected = _selected_display_fields(step, ("step", "status"))
+            if projected:
+                result.append(projected)
+        elif isinstance(raw_step, str):
+            result.append(_display_value(raw_step))
+    return result
 
 
 def _completed_item_text(value: object) -> str | None:
@@ -1304,7 +1443,20 @@ class CodexRuntimeAdapter(RuntimeAdapter):
             "interaction_id": interaction_id,
             "request_type": kind,
         }
+        if kind == "command_execution_approval":
+            public_payload.update(
+                title="Approve command",
+                detail=str(_display_value(payload.get("reason"), key="reason") or "")[:1000],
+                input=_selected_display_fields(payload, ("command", "cwd")),
+            )
+        elif kind == "file_change_approval":
+            public_payload.update(
+                title="Approve file change",
+                detail=str(_display_value(payload.get("reason"), key="reason") or "")[:1000],
+                input=_selected_display_fields(payload, ("path", "changes")),
+            )
         if questions is not None:
+            public_payload["title"] = "Input required"
             public_payload["questions"] = questions
         await self._emit(
             session,
@@ -1495,11 +1647,11 @@ class CodexRuntimeAdapter(RuntimeAdapter):
             if not payload or not self._belongs_to_session(session, payload):
                 return
             turn_id = _text(payload.get("turnId"))
-            plan = _sequence(payload.get("plan")) or ()
+            plan = _plan_display_projection(payload.get("plan"))
             await self._emit(
                 session,
                 "turn.plan.updated",
-                {"activity": "planning", "step_count": len(plan)},
+                {"activity": "planning", "step_count": len(plan), "plan": plan},
                 turn_id=turn_id,
             )
             return
@@ -1587,7 +1739,11 @@ class CodexRuntimeAdapter(RuntimeAdapter):
                 )
             return
         activity = _item_activity(item_type)
-        body: dict[str, Any] = {"item_type": item_type, "activity": activity}
+        body: dict[str, Any] = {
+            "item_type": item_type,
+            "activity": activity,
+            **_item_display_projection(item_type, item),
+        }
         if method == "item/started":
             body["status"] = "in_progress"
             event_type = "item.started"

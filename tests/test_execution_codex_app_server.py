@@ -511,6 +511,28 @@ else:
             raise AssertionError("event stream ended before turn.completed")
 
         events = await asyncio.wait_for(collect_through_turn_completion(), 3)
+        command_started = next(
+            event
+            for event in events
+            if event.type == "item.started" and event.item_id == "command-item"
+        )
+        self.assertEqual("Command", command_started.payload["title"])
+        self.assertEqual("[redacted]", command_started.payload["input"]["command"])
+        self.assertEqual(
+            "[redacted]", command_started.payload["output"]["aggregatedOutput"]
+        )
+        self.assertIn("tool.output.delta", [event.type for event in events])
+        summaries = [
+            event.payload["text"]
+            for event in events
+            if event.type == "reasoning.delta"
+        ]
+        self.assertEqual(["Reviewed the public interface."], summaries)
+        plan = next(event for event in events if event.type == "turn.plan.updated")
+        self.assertEqual(
+            [{"step": "Inspect the interface", "status": "completed"}],
+            plan.payload["plan"],
+        )
         encoded_snapshot = json.dumps(asdict(snapshot), sort_keys=True)
         self.assertNotIn("LEAK_SNAPSHOT_COMMAND", encoded_snapshot)
         self.assertNotIn("LEAK_SNAPSHOT_OUTPUT", encoded_snapshot)
@@ -540,6 +562,9 @@ else:
             "LEAK_ASSISTANT_DELTA",
             "LEAK_RAW_PROVIDER_PAYLOAD",
             "LEAK_USER_PROMPT",
+            "LEAK_HIDDEN_REASONING",
+            "LEAK_HIDDEN_REASONING_DELTA",
+            "LEAK_PLAN_PRIVATE",
         ):
             self.assertNotIn(secret, all_public)
         self.assertIn("session.stopped", [event.type for event in remaining])
@@ -574,6 +599,9 @@ else:
             public = json.dumps(dict(opened.payload), sort_keys=True)
             self.assertNotIn("LEAK_APPROVAL_COMMAND", public)
             self.assertNotIn("LEAK_APPROVAL_REASON", public)
+            self.assertEqual("Approve command", opened.payload["title"])
+            self.assertEqual("[redacted]", opened.payload["input"]["command"])
+            self.assertEqual("[redacted]", opened.payload["detail"])
             await adapter.respond_to_approval(
                 "approval-session", opened.interaction_id or "", decision
             )

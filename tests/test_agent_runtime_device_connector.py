@@ -199,6 +199,89 @@ class AgentRuntimeDeviceConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.poll("device-a").commands, ())
 
+    async def test_timeline_preserves_reasoning_tool_output_and_request_order(self) -> None:
+        session = await self.service.create(
+            owner_id="alice",
+            device_id="device-a",
+            provider="codex",
+            cwd="/workspace/timeline",
+            session_id="timeline-agent",
+        )
+        start_page = self.poll("device-a")
+        self.ack("device-a", start_page.commands[0].id, "ack-timeline-start")
+        self.events(
+            "device-a",
+            session.id,
+            {"event_id": "timeline-ready", "producer_seq": 1, "type": "session.started", "payload": {"state": "ready"}},
+        )
+
+        async def ready():
+            current = await self.service.get("alice", session.id)
+            return current if current and current.state == "ready" else None
+
+        await self.wait_for(ready)
+        await self.service.send_turn("alice", session.id, "inspect", "local-turn")
+        turn_page = self.poll("device-a", start_page.next_sequence)
+        self.ack(
+            "device-a",
+            turn_page.commands[0].id,
+            "ack-timeline-turn",
+            {"session_id": session.id, "turn_id": "provider-turn"},
+        )
+        self.events(
+            "device-a",
+            session.id,
+            {"event_id": "timeline-input", "producer_seq": 2, "type": "turn.input", "payload": {"turn_id": "local-turn"}},
+            {"event_id": "timeline-turn", "producer_seq": 3, "type": "turn.started", "payload": {"turn_id": "provider-turn"}},
+            {"event_id": "thinking-start", "producer_seq": 4, "type": "item.started", "payload": {"turn_id": "provider-turn", "item_id": "thinking", "item_type": "reasoning", "title": "Thinking", "status": "in_progress"}},
+            {"event_id": "thinking-summary", "producer_seq": 5, "type": "reasoning.delta", "payload": {"turn_id": "provider-turn", "item_id": "thinking", "text": "Inspecting files."}},
+            {"event_id": "command-start", "producer_seq": 6, "type": "item.started", "payload": {"turn_id": "provider-turn", "item_id": "command", "item_type": "command_execution", "title": "Command", "status": "in_progress", "input": {"command": "rg --files"}}},
+            {"event_id": "command-output", "producer_seq": 7, "type": "tool.output.delta", "payload": {"turn_id": "provider-turn", "item_id": "command", "text": "first.py\n"}},
+        )
+
+        async def streamed():
+            current = await self.service.get("alice", session.id)
+            command = next((item for item in (current.activities if current else []) if item.id == "command"), None)
+            return current if command and command.output == "first.py\n" else None
+
+        try:
+            streamed_session = await self.wait_for(streamed)
+        except AssertionError:
+            current = await self.service.get("alice", session.id)
+            source = self.runtime.session_events(owner_id="alice", session_id=session.id)
+            self.fail(
+                f"stream did not project: {current.as_dict() if current else None}; "
+                f"source={[item.as_dict() for item in source]}"
+            )
+        self.assertEqual("reasoning", streamed_session.messages[-1].role)
+        self.assertEqual("Inspecting files.", streamed_session.messages[-1].text)
+        self.events(
+            "device-a",
+            session.id,
+            {"event_id": "approval-open", "producer_seq": 8, "type": "interaction.opened", "payload": {"turn_id": "provider-turn", "item_id": "command", "interaction_id": "approval", "request_type": "command_execution_approval", "title": "Approve command", "detail": "Needs network", "input": {"command": "curl example.test"}}},
+            {"event_id": "approval-done", "producer_seq": 9, "type": "interaction.resolved", "payload": {"turn_id": "provider-turn", "interaction_id": "approval", "resolution": "approved"}},
+            {"event_id": "command-done", "producer_seq": 10, "type": "item.completed", "payload": {"turn_id": "provider-turn", "item_id": "command", "item_type": "command_execution", "title": "Command", "status": "succeeded", "output": {"aggregatedOutput": "first.py\n", "exitCode": 0}}},
+            {"event_id": "answer", "producer_seq": 11, "type": "message.completed", "payload": {"turn_id": "provider-turn", "item_id": "answer", "text": "Done."}},
+            {"event_id": "timeline-done", "producer_seq": 12, "type": "turn.completed", "payload": {"turn_id": "provider-turn", "state": "completed"}},
+        )
+
+        async def completed():
+            current = await self.service.get("alice", session.id)
+            return current if current and current.turns[-1].state == "completed" else None
+
+        current = await self.wait_for(completed)
+        command = next(item for item in current.activities if item.id == "command")
+        request = next(item for item in current.requests if item.id == "approval")
+        answer = next(item for item in current.messages if item.id == "answer")
+        reasoning = next(item for item in current.messages if item.role == "reasoning")
+        self.assertEqual("command", command.kind)
+        self.assertEqual({"aggregatedOutput": "first.py\n", "exitCode": 0}, command.output)
+        self.assertEqual("resolved", request.status)
+        self.assertEqual("approved", request.response)
+        self.assertLess(reasoning.sequence, command.sequence)
+        self.assertLess(command.sequence, request.sequence)
+        self.assertLess(request.sequence, answer.sequence)
+
     async def test_rejected_start_transitions_agent_session_to_failed(self) -> None:
         session = await self.service.create(
             owner_id="alice",

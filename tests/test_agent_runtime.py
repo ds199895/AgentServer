@@ -57,7 +57,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_durable_snapshot_can_be_rehydrated(self) -> None:
         session = await self.service.create(owner_id="alice", provider="generic", cwd="/workspace")
-        await asyncio.sleep(0.01)
+        await self.service.send_turn("alice", session.id, "persist this timeline")
+        await asyncio.sleep(0.02)
         path = Path(self.directory.name) / "agent.db"
         await self.service.close()
         self.service = AgentSessionService(AgentEventStore(path))
@@ -66,6 +67,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         assert recovered is not None
         self.assertEqual(recovered.cwd, "/workspace")
         self.assertGreaterEqual(recovered.sequence, 2)
+        self.assertTrue(recovered.messages)
+        self.assertTrue(all(message.sequence > 0 for message in recovered.messages))
 
 
 if __name__ == "__main__":

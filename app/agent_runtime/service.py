@@ -182,7 +182,7 @@ class AgentSessionService:
             turn_id = str(p.get("turn_id") or new_id())
             if not any(turn.id == turn_id for turn in session.turns):
                 session.turns.append(AgentTurn(turn_id, session.id, str(p.get("input") or ""), "queued", value.occurred_at))
-                session.messages.append(AgentMessage(f"user-{turn_id}", session.id, "user", str(p.get("input") or ""), turn_id, None, value.occurred_at, False))
+                session.messages.append(AgentMessage(f"user-{turn_id}", session.id, "user", str(p.get("input") or ""), turn_id, None, value.occurred_at, False, value.sequence))
         elif typ == "turn.started":
             session.state = "running"; session.active_turn_id = str(p.get("turn_id") or "")
             turn = next((item for item in reversed(session.turns) if item.id == session.active_turn_id), None)
@@ -215,22 +215,56 @@ class AgentSessionService:
                     if text:
                         current.text = text
                     current.streaming = False
-            else: session.messages.append(AgentMessage(mid, session.id, str(p.get("role") or "assistant"), text, p.get("turn_id"), p.get("item_id"), value.occurred_at, typ == "message.delta"))
+            else: session.messages.append(AgentMessage(mid, session.id, str(p.get("role") or "assistant"), text, p.get("turn_id"), p.get("item_id"), value.occurred_at, typ == "message.delta", value.sequence))
         elif typ == "activity.started":
-            session.activities.append(AgentActivity(str(p.get("activity_id") or new_id()), session.id, str(p.get("kind") or "status"), str(p.get("title") or "Working"), turn_id=p.get("turn_id"), item_id=p.get("item_id"), created_at=value.occurred_at, updated_at=value.occurred_at))
+            aid = str(p.get("activity_id") or new_id())
+            current = next((a for a in reversed(session.activities) if a.id == aid), None)
+            if current is None:
+                session.activities.append(AgentActivity(aid, session.id, str(p.get("kind") or "status"), str(p.get("title") or "Working"), status=str(p.get("status") or "running"), detail=str(p.get("detail") or ""), input=p.get("input"), output=p.get("output"), turn_id=p.get("turn_id"), item_id=p.get("item_id"), created_at=value.occurred_at, updated_at=value.occurred_at, collapsed=bool(p.get("collapsed", True)), sequence=value.sequence))
         elif typ in {"activity.updated", "activity.completed"}:
             aid = str(p.get("activity_id") or "")
             current = next((a for a in reversed(session.activities) if a.id == aid), None)
             if current:
-                current.status = str(p.get("status") or ("completed" if typ.endswith("completed") else current.status)); current.detail = str(p.get("detail") or current.detail); current.output = p.get("output", current.output); current.updated_at = value.occurred_at
+                current.status = str(p.get("status") or ("completed" if typ.endswith("completed") else current.status))
+                if p.get("title"):
+                    current.title = str(p["title"])
+                if p.get("detail"):
+                    current.detail = str(p["detail"])
+                if p.get("detail_delta"):
+                    current.detail += str(p["detail_delta"])
+                if "input" in p and p.get("input") is not None:
+                    current.input = p["input"]
+                if "output" in p and p.get("output") is not None:
+                    current.output = p["output"]
+                if p.get("output_delta"):
+                    fragment = str(p["output_delta"])
+                    current.output = f"{current.output or ''}{fragment}"
+                current.updated_at = value.occurred_at
+            elif aid:
+                session.activities.append(AgentActivity(aid, session.id, str(p.get("kind") or "output"), str(p.get("title") or "Tool output"), status=str(p.get("status") or ("completed" if typ.endswith("completed") else "running")), detail=str(p.get("detail") or p.get("detail_delta") or ""), input=p.get("input"), output=p.get("output") if p.get("output") is not None else p.get("output_delta"), turn_id=p.get("turn_id"), item_id=p.get("item_id"), created_at=value.occurred_at, updated_at=value.occurred_at, sequence=value.sequence))
+            if typ == "activity.completed" and p.get("item_id"):
+                reasoning = next(
+                    (
+                        message
+                        for message in reversed(session.messages)
+                        if message.role == "reasoning"
+                        and message.item_id == p.get("item_id")
+                    ),
+                    None,
+                )
+                if reasoning:
+                    reasoning.streaming = False
         elif typ == "request.created":
-            session.state = "waiting"; session.requests.append(AgentRequest(str(p.get("request_id") or new_id()), session.id, str(p.get("kind") or "user_input"), str(p.get("title") or "Input required"), str(p.get("detail") or ""), list(p.get("options") or []), turn_id=p.get("turn_id"), created_at=value.occurred_at))
+            session.state = "waiting"; session.requests.append(AgentRequest(str(p.get("request_id") or new_id()), session.id, str(p.get("kind") or "user_input"), str(p.get("title") or "Input required"), str(p.get("detail") or ""), list(p.get("options") or []), turn_id=p.get("turn_id"), created_at=value.occurred_at, input=p.get("input"), sequence=value.sequence))
         elif typ == "request.resolved":
             req = next((r for r in reversed(session.requests) if r.id == p.get("request_id")), None)
-            if req: req.status = "resolved"
+            if req:
+                req.status = "resolved"
+                req.response = p.get("resolution", p.get("response"))
+                req.resolved_at = value.occurred_at
             session.state = "running" if session.active_turn_id else "ready"
         elif typ == "plan.updated":
-            session.activities.append(AgentActivity(str(p.get("activity_id") or value.id), session.id, "plan", "Plan updated", status="completed", detail=str(p.get("detail") or ""), input=p.get("plan"), turn_id=p.get("turn_id"), created_at=value.occurred_at, updated_at=value.occurred_at))
+            session.activities.append(AgentActivity(str(p.get("activity_id") or value.id), session.id, "plan", "Plan updated", status="completed", detail=str(p.get("detail") or ""), input=p.get("plan"), turn_id=p.get("turn_id"), created_at=value.occurred_at, updated_at=value.occurred_at, sequence=value.sequence))
 
     async def get(self, owner_id: str, session_id: str) -> AgentSession | None:
         session = self._sessions.get(session_id)

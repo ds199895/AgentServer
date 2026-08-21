@@ -108,6 +108,51 @@ class Peer:
                 "threadId": self.thread_id,
                 "turnId": turn_id,
                 "item": {
+                    "id": "reasoning-item",
+                    "type": "reasoning",
+                    "status": "inProgress",
+                    "text": "LEAK_HIDDEN_REASONING",
+                },
+            },
+        )
+        self.notify(
+            "item/reasoning/textDelta",
+            {
+                "threadId": self.thread_id,
+                "turnId": turn_id,
+                "itemId": "reasoning-item",
+                "delta": "LEAK_HIDDEN_REASONING_DELTA",
+            },
+        )
+        self.notify(
+            "item/reasoning/summaryTextDelta",
+            {
+                "threadId": self.thread_id,
+                "turnId": turn_id,
+                "itemId": "reasoning-item",
+                "delta": "Reviewed the public interface.",
+            },
+        )
+        self.notify(
+            "turn/plan/updated",
+            {
+                "threadId": self.thread_id,
+                "turnId": turn_id,
+                "plan": [
+                    {
+                        "step": "Inspect the interface",
+                        "status": "completed",
+                        "private": "LEAK_PLAN_PRIVATE",
+                    }
+                ],
+            },
+        )
+        self.notify(
+            "item/started",
+            {
+                "threadId": self.thread_id,
+                "turnId": turn_id,
+                "item": {
                     "id": "command-item",
                     "type": "commandExecution",
                     "status": "inProgress",

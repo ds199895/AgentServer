@@ -31,6 +31,7 @@ class AgentMessage:
     item_id: str | None = None
     created_at: float = 0.0
     streaming: bool = False
+    sequence: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return _json(self.__dict__)
@@ -51,6 +52,7 @@ class AgentActivity:
     created_at: float = 0.0
     updated_at: float = 0.0
     collapsed: bool = True
+    sequence: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return _json(self.__dict__)
@@ -67,6 +69,10 @@ class AgentRequest:
     status: str = "pending"
     turn_id: str | None = None
     created_at: float = 0.0
+    input: Any = None
+    response: Any = None
+    resolved_at: float | None = None
+    sequence: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return _json(self.__dict__)

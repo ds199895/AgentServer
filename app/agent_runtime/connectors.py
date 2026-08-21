@@ -350,17 +350,49 @@ class DeviceRuntimeConnector(DeviceConnector):
                 turn_id=local_turn_id,
                 item_id=item_id,
             )
-        elif typ in {"item.started", "item.completed"}:
-            target = "activity.started" if typ.endswith("started") else "activity.completed"
-            item_type = str(payload.get("item_type") or "tool")
+        elif typ == "reasoning.delta":
+            target = "message.delta"
+            body.update(
+                message_id=f"reasoning-{item_id or source.event_id}",
+                role="reasoning",
+                text=str(payload.get("text") or ""),
+                turn_id=local_turn_id,
+                item_id=item_id,
+            )
+        elif typ in {"tool.output.delta", "file.output.delta"}:
+            target = "activity.updated"
             body.update(
                 activity_id=item_id or source.event_id,
-                kind="tool",
-                title=item_type.replace("_", " ").title(),
+                status="running",
+                output_delta=str(payload.get("text") or ""),
+                turn_id=local_turn_id,
+                item_id=item_id,
+            )
+        elif typ in {"item.started", "item.completed"}:
+            item_type = str(payload.get("item_type") or "tool")
+            if item_type in {"user_message", "assistant_message"}:
+                return None
+            target = "activity.started" if typ.endswith("started") else "activity.completed"
+            kind = {
+                "reasoning": "status",
+                "plan": "plan",
+                "command_execution": "command",
+                "file_change": "file",
+                "mcp_tool_call": "tool",
+                "dynamic_tool_call": "tool",
+                "web_search": "tool",
+            }.get(item_type, "status")
+            body.update(
+                activity_id=item_id or source.event_id,
+                kind=kind,
+                title=str(payload.get("title") or item_type.replace("_", " ").title()),
                 status=str(
                     payload.get("status")
                     or ("completed" if typ.endswith("completed") else "running")
                 ),
+                detail=str(payload.get("detail") or ""),
+                input=payload.get("input"),
+                output=payload.get("output"),
                 turn_id=local_turn_id,
                 item_id=item_id,
             )
@@ -384,6 +416,7 @@ class DeviceRuntimeConnector(DeviceConnector):
                 kind="user_input" if "input" in kind else "approval",
                 title=str(payload.get("title") or "Action requires confirmation"),
                 detail=str(payload.get("detail") or kind.replace("_", " ")),
+                input=payload.get("input"),
                 options=list(payload.get("questions") or []),
                 turn_id=local_turn_id,
             )
