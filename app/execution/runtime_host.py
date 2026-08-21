@@ -64,6 +64,7 @@ def _public_text(value: object, *, limit: int = 16_384) -> str:
 SUPPORTED_COMMAND_TYPES = frozenset(
     {
         "runtime.probe",
+        "workspace.browse",
         "session.start",
         "session.turn",
         "session.interrupt",
@@ -81,7 +82,7 @@ SUPPORTED_COMMAND_TYPES = frozenset(
 # between entering the handler and recording its result. Provider operations are
 # deliberately quarantined as ``uncertain`` unless the control plane explicitly
 # decides how to recover them.
-IDEMPOTENT_COMMAND_TYPES = frozenset({"runtime.probe"})
+IDEMPOTENT_COMMAND_TYPES = frozenset({"runtime.probe", "workspace.browse"})
 
 
 class DeviceRuntimeError(RuntimeError):
@@ -2164,6 +2165,16 @@ class DeviceRuntimeHost:
                 )
             return payload
 
+        if command_type == "workspace.browse":
+            raw = str(payload.get("path") or "").strip()
+            try:
+                target = (Path(raw).expanduser() if raw else Path.home()).resolve()
+            except (OSError, RuntimeError) as error:
+                raise ValueError("workspace path cannot be resolved") from error
+            if not target.is_dir():
+                raise ValueError("workspace path is not an existing directory")
+            return payload
+
         session_id = _require_text(payload.get("session_id"), "session_id")
         if command_type == "session.start":
             provider = _require_text(payload.get("provider"), "provider", limit=80)
@@ -2261,6 +2272,54 @@ class DeviceRuntimeHost:
                 f"unsupported device command type: {command_type}"
             )
         return payload
+
+    # Directory names only. This exists so the browser can pick a working
+    # directory before a session is started, which is the one moment no
+    # session-scoped workspace channel is available yet. It deliberately does
+    # not read file contents, and never follows a symlink out of the parent.
+    _BROWSE_LIMIT = 200
+
+    async def _browse_workspace(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        raw = str(payload.get("path") or "").strip()
+        try:
+            target = Path(raw).expanduser() if raw else Path.home()
+            target = target.resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError("workspace path cannot be resolved") from error
+        if not target.is_dir():
+            raise ValueError("workspace path is not an existing directory")
+
+        def scan() -> list[dict[str, Any]]:
+            entries: list[dict[str, Any]] = []
+            with os.scandir(target) as iterator:
+                for entry in iterator:
+                    if len(entries) >= self._BROWSE_LIMIT:
+                        break
+                    name = entry.name
+                    if name.startswith("."):
+                        continue
+                    try:
+                        # follow_symlinks=False: a link pointing outside the tree
+                        # is listed as what it is, not silently traversed.
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    entries.append({"name": name, "path": str(target / name)})
+            entries.sort(key=lambda item: item["name"].lower())
+            return entries
+
+        try:
+            entries = await asyncio.to_thread(scan)
+        except PermissionError as error:
+            raise ValueError("workspace path is not readable") from error
+        parent = target.parent
+        return {
+            "path": str(target),
+            "parent": str(parent) if parent != target else None,
+            "entries": entries,
+            "truncated": len(entries) >= self._BROWSE_LIMIT,
+        }
 
     async def _probe(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         requested = str(payload.get("provider") or "").strip()
@@ -2620,6 +2679,8 @@ class DeviceRuntimeHost:
         )
         if command_type == "runtime.probe":
             return await self._probe(payload)
+        if command_type == "workspace.browse":
+            return await self._browse_workspace(payload)
         if command_type == "session.start":
             return await self._start_session(payload)
         if command_type == "session.stop":

@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { DirectoryPicker } from './DirectoryPicker'
 
 export type AgentStartOptions = {
   provider: string
@@ -30,7 +31,7 @@ export function AgentStartDialog({
   )
   const preferred = providers.find((value) => value.id === 'codex')?.id || providers[0]?.id || ''
   const [provider, setProvider] = useState(preferred)
-  const [cwd, setCwd] = useState('.')
+  const [cwd, setCwd] = useState('')
   const [permissionMode, setPermissionMode] = useState('workspace-write')
   const [model, setModel] = useState('')
   const [busy, setBusy] = useState(false)
@@ -76,9 +77,9 @@ export function AgentStartDialog({
               </SelectContent>
             </Select>
           </Label>
-          <Label>
+          <Label className="grid gap-1.5">
             设备工作目录
-            <Input required value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/path/to/project" className="h-auto px-3.5 py-[13px]" />
+            <DirectoryPicker deviceId={device.id} value={cwd} onChange={setCwd} />
           </Label>
           <Label>
             权限模式

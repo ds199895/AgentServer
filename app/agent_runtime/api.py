@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -35,6 +36,10 @@ class TurnBody(BaseModel):
     # settings, so an unchanged picker sends nothing.
     model: str | None = Field(default=None, max_length=128)
     effort: str | None = Field(default=None, max_length=32)
+
+
+class BrowseBody(BaseModel):
+    path: str | None = Field(default=None, max_length=4096)
 
 
 class RespondBody(BaseModel):
@@ -78,6 +83,57 @@ def build_agent_router(browser_user_dependency: Callable[..., str]) -> APIRouter
             return await service(request).device_status(owner_id, device_id)
         except (ValueError, DeviceRuntimeError, AgentConnectorError) as error:
             raise http_error(error) from error
+
+    @router.post("/api/agent/devices/{device_id}/browse")
+    async def browse_device(
+        device_id: str,
+        body: BrowseBody,
+        request: Request,
+        owner_id: str = Depends(browser_user_dependency),
+    ):
+        """List directories on a device so a session can pick its cwd.
+
+        Device commands are asynchronous, so this enqueues the browse and waits
+        for the host's acknowledgement rather than making the browser poll. The
+        wait is short and bounded; a device that is slow or offline surfaces as
+        an explicit error instead of a hung request.
+        """
+        runtime = getattr(request.app.state, "device_runtime", None)
+        if runtime is None:
+            raise HTTPException(503, "device runtime is unavailable")
+        path = (body.path or "").strip()
+        try:
+            command = await asyncio.to_thread(
+                runtime.enqueue_device_command,
+                owner_id=owner_id,
+                device_id=device_id,
+                command_type="workspace.browse",
+                payload={"path": path} if path else {},
+                ttl=60,
+            )
+        except (DeviceRuntimeError, ValueError) as error:
+            raise http_error(error) from error
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            current = await asyncio.to_thread(
+                runtime.get_command, owner_id=owner_id, command_id=command.id
+            )
+            if current is not None and current.terminal:
+                status = getattr(current.status, "value", str(current.status))
+                ack = dict(current.ack_payload or {})
+                if status != "completed":
+                    raise HTTPException(
+                        422, str(ack.get("error") or f"device browse {status}")
+                    )
+                return {
+                    "path": ack.get("path") or path,
+                    "parent": ack.get("parent"),
+                    "entries": ack.get("entries") or [],
+                    "truncated": bool(ack.get("truncated")),
+                }
+            await asyncio.sleep(0.1)
+        raise HTTPException(504, "device did not answer the browse request in time")
 
     @router.get("/api/agent/sessions")
     async def list_sessions(request: Request, owner_id: str = Depends(browser_user_dependency)):

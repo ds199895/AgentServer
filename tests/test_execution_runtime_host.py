@@ -1212,6 +1212,49 @@ class DeviceRuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         await host.close()
         self.assertEqual(1, adapter.close_calls)
 
+    async def test_workspace_browse_lists_only_directories(self) -> None:
+        root = self.root / "browse-root"
+        (root / "project-a").mkdir(parents=True)
+        (root / "project-b").mkdir()
+        (root / ".hidden").mkdir()
+        (root / "notes.txt").write_text("not a directory", encoding="utf-8")
+
+        client = FakeDeviceClient()
+        client.server_commands = [
+            command(1, "workspace.browse", {"path": str(root)})
+        ]
+        host = self.host(client, registry={"fake": FakeAdapterFactory()})
+        await host.poll_commands()
+        await host.flush_command_acks()
+
+        [(_command_id, body)] = client.acknowledgements
+        self.assertEqual("completed", body["status"])
+        result = body["payload"]
+        self.assertEqual(str(root), result["path"])
+        self.assertEqual(str(root.parent), result["parent"])
+        # Directories only, hidden entries and plain files excluded.
+        self.assertEqual(
+            ["project-a", "project-b"],
+            [entry["name"] for entry in result["entries"]],
+        )
+        self.assertFalse(result["truncated"])
+        await host.close()
+
+    async def test_workspace_browse_rejects_a_missing_directory(self) -> None:
+        client = FakeDeviceClient()
+        client.server_commands = [
+            command(1, "workspace.browse", {"path": str(self.root / "nope")})
+        ]
+        host = self.host(client, registry={"fake": FakeAdapterFactory()})
+        # Rejected in the preflight, like every other invalid command, so it
+        # never reaches a handler and never degrades the poll cycle.
+        await host.poll_commands()
+
+        [(_command_id, body)] = client.acknowledgements
+        self.assertEqual("rejected", body["status"])
+        self.assertEqual("invalid_command", body["payload"]["error_code"])
+        await host.close()
+
     async def test_typed_runtime_registry_is_consumed_directly(self) -> None:
         client = FakeDeviceClient()
         factory = FakeTypedAdapterFactory()

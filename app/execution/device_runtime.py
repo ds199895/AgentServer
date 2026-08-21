@@ -3153,6 +3153,14 @@ class DeviceRuntimeService:
         )
         return DeviceCommandPage(tuple(commands), next_sequence)
 
+    def get_command(self, *, owner_id: str, command_id: str) -> Command | None:
+        """Read one queued command, including the device's ack payload."""
+        return self.execution_store.command_queue.get(
+            owner_id=owner_id,
+            command_id=command_id,
+            now=self.clock(),
+        )
+
     def ack_command(
         self,
         claims: DeviceCredentialClaims,
