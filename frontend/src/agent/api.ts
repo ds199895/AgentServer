@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentSession } from './types'
+import type { AgentSession } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: 'same-origin', ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } })
@@ -23,10 +23,4 @@ export function newAgentTurnId(): string {
 export function agentSessionSocketUrl(id: string, afterSequence = 0): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${protocol}//${window.location.host}/ws/agent/sessions/${encodeURIComponent(id)}?after_sequence=${Math.max(0, afterSequence)}`
-}
-
-export function applyAgentEvent(session: AgentSession, value: AgentEvent): AgentSession {
-  // Server snapshots are authoritative. Refreshing after a sequence gap also
-  // keeps reconnect handling deterministic when an event queue overflows.
-  return { ...session, sequence: Math.max(session.sequence, value.sequence) }
 }

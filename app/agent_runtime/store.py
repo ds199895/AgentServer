@@ -15,15 +15,31 @@ class AgentEventStore:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        # One long-lived connection instead of one per operation: every access
+        # is already serialized by `_lock`, and opening a connection costs more
+        # than the statement itself, which a streaming turn pays on every delta.
+        self._db: sqlite3.Connection | None = sqlite3.connect(
+            self.path, check_same_thread=False
+        )
+        self._db.row_factory = sqlite3.Row
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS agent_sessions (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, data TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS agent_events (session_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL, payload TEXT NOT NULL, occurred_at REAL NOT NULL, PRIMARY KEY(session_id, sequence))")
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, check_same_thread=False)
-        db.row_factory = sqlite3.Row
-        return db
+        # Used as a context manager by callers, which commits on exit and rolls
+        # back on error. The connection itself outlives the block.
+        if self._db is None:
+            raise RuntimeError("agent event store is closed")
+        return self._db
+
+    def close(self) -> None:
+        """Release the connection and its -wal/-shm sidecar files."""
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
 
     def save_session(self, owner_id: str, session_id: str, data: dict[str, Any]) -> None:
         with self._lock, self._connect() as db:

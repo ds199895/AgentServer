@@ -14,6 +14,10 @@ from .events import AgentEvent, event, new_id
 from .models import AgentActivity, AgentMessage, AgentRequest, AgentSession, AgentTurn
 from .store import AgentEventStore
 
+# Replay page size. `AgentEventStore.events` caps a single read at 5000 rows, so
+# rehydration pages through the log rather than assuming one read covers it.
+_REPLAY_PAGE = 1000
+
 
 class AgentSessionService:
     def __init__(
@@ -64,7 +68,7 @@ class AgentSessionService:
             if current is None:
                 raw = self.store.load_session(owner_id, sid)
                 if raw is not None:
-                    current = AgentSession.from_dict(raw)
+                    current = self._rehydrate(AgentSession.from_dict(raw))
                     self._sessions[sid] = current
                     self._subscribers.setdefault(sid, set())
                     restored = True
@@ -120,7 +124,31 @@ class AgentSessionService:
         return session
 
     def _persist(self, session: AgentSession) -> None:
-        self.store.save_session(session.owner_id, session.id, session.as_dict())
+        # Metadata only. Messages, activities, requests and turns are derived by
+        # replaying `agent_events`, so persisting them here would rewrite the
+        # whole transcript on every delta and make one turn cost O(events^2).
+        self.store.save_session(
+            session.owner_id, session.id, session.as_dict(include_history=False)
+        )
+
+    def _rehydrate(self, session: AgentSession) -> AgentSession:
+        """Rebuild a session's history from its durable event log."""
+        session.messages.clear()
+        session.activities.clear()
+        session.requests.clear()
+        session.turns.clear()
+        cursor = 0
+        while True:
+            values = self.store.events(
+                session.owner_id, session.id, cursor, limit=_REPLAY_PAGE
+            )
+            if not values:
+                break
+            for value in values:
+                self._apply(session, value)
+                cursor = value.sequence
+            session.sequence = max(session.sequence, cursor)
+        return session
 
     async def _dispatch(self, session: AgentSession, value: AgentEvent) -> AgentEvent:
         committed, created = self.store.append_once(value)
@@ -271,7 +299,7 @@ class AgentSessionService:
         if session and session.owner_id == owner_id: return session
         raw = self.store.load_session(owner_id, session_id)
         if raw:
-            session = AgentSession.from_dict(raw)
+            session = self._rehydrate(AgentSession.from_dict(raw))
             self._sessions[session_id] = session
             self._subscribers.setdefault(session_id, set())
             if session.state not in {"stopped", "failed"}:
@@ -362,3 +390,4 @@ class AgentSessionService:
         if self._consumers:
             await asyncio.gather(*self._consumers, return_exceptions=True)
         await self.connector.close()
+        self.store.close()
