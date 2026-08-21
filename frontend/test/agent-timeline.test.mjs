@@ -56,11 +56,14 @@ test('legacy timeline entries without sequence use their event timestamps', () =
   )
 })
 
-test('agent pane renders the merged timeline and expandable tool input/output', async () => {
-  const pane = await readFile(new URL('../src/agent/AgentSessionPane.tsx', import.meta.url), 'utf8')
-  assert.match(pane, /buildAgentTimeline\(session\)/)
-  assert.match(pane, /<DataBlock label="Input"/)
-  assert.match(pane, /<DataBlock label="Output"/)
-  assert.doesNotMatch(pane, /session\.messages\.map/)
-  assert.doesNotMatch(pane, /session\.activities\.map/)
+test('session timeline groups the merged timeline into turns with expandable tool rows', async () => {
+  const timeline = await readFile(new URL('../src/sessions/SessionTimeline.tsx', import.meta.url), 'utf8')
+  assert.match(timeline, /buildAgentTimeline\(session\)/)
+  // Rows carry both sides of a tool call, and collapse by default.
+  assert.match(timeline, /inputText/)
+  assert.match(timeline, /outputText/)
+  assert.match(timeline, /groupByTurn/)
+  // The timeline must read the merged projection, not re-walk raw collections.
+  assert.doesNotMatch(timeline, /session\.messages\.map/)
+  assert.doesNotMatch(timeline, /session\.activities\.map/)
 })

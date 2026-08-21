@@ -103,10 +103,13 @@ test('device bootstrap API keeps enrollment credentials scoped and abortable', a
   assert.equal(JSON.parse(calls[0].init.body).ttl_seconds, 30 * 60)
 })
 
-test('application mounts the agent session pane and no longer references the legacy dialog', async () => {
+test('application mounts the agent sessions page and no longer references the legacy dialog', async () => {
   const app = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
   const dashboard = await readFile(new URL('../src/components/DeviceDashboard.tsx', import.meta.url), 'utf8')
-  assert.match(app, /<AgentSessionPane sessionId=\{agentSessionId\}/)
+  // Agent sessions live on their own page behind a header tab, not in a drawer.
+  assert.match(app, /<SessionsPage/)
+  assert.match(app, /sessionId=\{agentSessionId\}/)
+  assert.doesNotMatch(app, /<AgentSessionPane/)
   assert.match(app, /<AgentStartDialog/)
   assert.doesNotMatch(app, /provider: 'generic'/)
   assert.match(dashboard, /device\.runtime\?\.state !== 'online'/)

@@ -4,7 +4,7 @@ import { XIcon } from 'lucide-react'
 import { api, frontendBuildSha, normalizeTerminalSessions, type DetectedService, type Device, type Preview, type TerminalSession } from '@/api'
 import { agentApi } from '@/agent/api'
 import { AgentStartDialog } from '@/agent/AgentStartDialog'
-import { AgentSessionPane } from '@/agent/AgentSessionPane'
+import SessionsPage from '@/sessions/SessionsPage'
 import { DeviceDashboard } from '@/components/DeviceDashboard'
 import { DeviceDialog } from '@/components/DeviceDialog'
 import { DownloadsPage } from '@/components/DownloadsPage'
@@ -131,22 +131,35 @@ function focusTerminalInput(id: string): void {
   }))
 }
 
-function routeFromLocation(): { page: MainPage; terminalId: string | null } {
+function routeFromLocation(): { page: MainPage; terminalId: string | null; agentSessionId: string | null } {
   const terminalMatch = window.location.pathname.match(/^\/terminal\/([^/]+)\/?$/)
   if (terminalMatch) {
     try {
-      return { page: 'terminals', terminalId: decodeURIComponent(terminalMatch[1]) }
+      return { page: 'terminals', terminalId: decodeURIComponent(terminalMatch[1]), agentSessionId: null }
     } catch {
-      return { page: 'terminals', terminalId: terminalMatch[1] }
+      return { page: 'terminals', terminalId: terminalMatch[1], agentSessionId: null }
     }
   }
   if (/^\/terminals\/?$/.test(window.location.pathname)) {
-    return { page: 'terminals', terminalId: null }
+    return { page: 'terminals', terminalId: null, agentSessionId: null }
+  }
+  // /sessions and /sessions/<id> — the id is a deep link into one Agent session.
+  const agentMatch = window.location.pathname.match(/^\/sessions(?:\/([^/]+))?\/?$/)
+  if (agentMatch) {
+    let agentSessionId: string | null = agentMatch[1] ?? null
+    if (agentSessionId) {
+      try {
+        agentSessionId = decodeURIComponent(agentSessionId)
+      } catch {
+        // Malformed escape: fall back to the raw segment.
+      }
+    }
+    return { page: 'sessions', terminalId: null, agentSessionId }
   }
   if (/^\/setup\/?$/.test(window.location.pathname)) {
-    return { page: 'setup', terminalId: null }
+    return { page: 'setup', terminalId: null, agentSessionId: null }
   }
-  return { page: 'devices', terminalId: null }
+  return { page: 'devices', terminalId: null, agentSessionId: null }
 }
 
 export default function App() {
@@ -159,7 +172,8 @@ export default function App() {
   const [missingTerminalId, setMissingTerminalId] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [deviceDialog, setDeviceDialog] = useState<Device | 'new' | null>(null)
-  const [agentSessionId, setAgentSessionId] = useState<string | null>(null)
+  const [agentSessionId, setAgentSessionId] = useState<string | null>(() => routeFromLocation().agentSessionId)
+  const [agentSessionCount, setAgentSessionCount] = useState(0)
   const [agentStartDevice, setAgentStartDevice] = useState<Device | null>(null)
   const [previewTarget, setPreviewTarget] = useState<{ deviceId?: string; terminalId?: string } | null>(null)
   const [activePreview, setActivePreview] = useState<{ preview: Preview; url: string } | null>(null)
@@ -533,6 +547,7 @@ export default function App() {
       setWorkspaceSessionId((current) => current === null ? null : nextId)
       setMissingTerminalId(nextMissingId)
       setPage(route.page)
+      setAgentSessionId(route.agentSessionId)
       if (nextId) {
         lastTerminalIdRef.current = nextId
         storeTerminalId(nextId)
@@ -716,9 +731,22 @@ export default function App() {
     }
     activeIdRef.current = null; setActiveId(null); setMissingTerminalId(null); setPage(nextPage)
     setWorkspaceSessionId(null)
-    const path = nextPage === 'setup' ? '/setup' : '/'
+    const path = nextPage === 'setup' ? '/setup' : nextPage === 'sessions' ? '/sessions' : '/'
     if (window.location.pathname !== path) window.history[replace ? 'replaceState' : 'pushState']({}, '', path)
   }
+  // Selecting an agent session rewrites the URL so it survives refresh and
+  // can be shared; the Agent tab itself is plain `/sessions`.
+  const selectAgentSession = (nextId: string | null) => {
+    setAgentSessionId(nextId)
+    const path = nextId ? `/sessions/${encodeURIComponent(nextId)}` : '/sessions'
+    if (window.location.pathname !== path) window.history.pushState({}, '', path)
+  }
+
+  const openAgentSession = (nextId: string) => {
+    setPage('sessions')
+    selectAgentSession(nextId)
+  }
+
   const openTerminal = async (device: Device, targetLeafId?: string | null) => {
     const capturedTargetLeafId = targetLeafId ?? focusedLeafIdRef.current
     beginSessionMutation()
@@ -904,6 +932,7 @@ export default function App() {
         page={page}
         deviceSummary={`${devices.filter((device) => device.frp_online).length}/${devices.length}`}
         sessionCount={sessions.length}
+        agentSessionCount={agentSessionCount}
         onNavigate={navigate}
         onShowPassword={() => setShowPassword(true)}
         onLogout={() => void logout()}
@@ -997,6 +1026,13 @@ export default function App() {
                 onBack={() => navigate('devices')}
               />
             )
+          ) : page === 'sessions' ? (
+            <SessionsPage
+              devices={devices}
+              sessionId={agentSessionId}
+              onSelectSession={selectAgentSession}
+              onSessionsChanged={setAgentSessionCount}
+            />
           ) : page === 'setup' ? (
             <DownloadsPage devices={devices} onChanged={() => void load()} />
           ) : (
@@ -1013,9 +1049,9 @@ export default function App() {
               onSelectTerminal={(sessionId) => showTerminal(sessionId)}
               onPreview={(device) => setPreviewTarget({ deviceId: device?.id })}
               onStartAgent={setAgentStartDevice}
-              onSelectAgent={(_sessionId, deviceId) => {
+              onSelectAgent={(sessionId, deviceId) => {
                 void deviceId
-                setAgentSessionId(_sessionId)
+                openAgentSession(sessionId)
               }}
             />
           )}
@@ -1079,14 +1115,9 @@ export default function App() {
               ...options,
               device_id: agentStartDevice.id,
             })
-            setAgentSessionId(value.session.id)
+            openAgentSession(value.session.id)
           }}
         />
-      )}
-      {agentSessionId && (
-        <div className="fixed inset-y-0 right-0 z-40 flex w-[min(680px,100vw)] border-l border-[#26343e] shadow-[-20px_0_60px_#0008]">
-          <AgentSessionPane sessionId={agentSessionId} onClose={() => setAgentSessionId(null)} />
-        </div>
       )}
       {previewTarget && (
         <PreviewDialog

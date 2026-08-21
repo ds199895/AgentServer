@@ -8,13 +8,14 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 
-export type MainPage = 'devices' | 'setup' | 'terminals'
+export type MainPage = 'devices' | 'setup' | 'terminals' | 'sessions'
 
 type Props = {
   username: string
   page: MainPage
   deviceSummary: string
   sessionCount: number
+  agentSessionCount: number
   onNavigate: (page: MainPage) => void
   onShowPassword: () => void
   onLogout: () => void
@@ -47,7 +48,7 @@ function HeaderTab({ active, onClick, children, badge }: { active: boolean; onCl
   )
 }
 
-export function Topbar({ username, page, deviceSummary, sessionCount, onNavigate, onShowPassword, onLogout }: Props) {
+export function Topbar({ username, page, deviceSummary, sessionCount, agentSessionCount, onNavigate, onShowPassword, onLogout }: Props) {
   return (
     <header className="z-[5] grid grid-cols-[1fr_auto_1fr] items-center border-b border-border bg-[#0b0f14] px-[18px] max-md:grid-cols-[auto_minmax(0,1fr)_auto] max-md:px-2">
       <button onClick={() => onNavigate('devices')} className="flex cursor-pointer items-center gap-[11px] justify-self-start font-bold tracking-[-0.02em] text-[#edf4f9]">
@@ -57,6 +58,7 @@ export function Topbar({ username, page, deviceSummary, sessionCount, onNavigate
       <nav aria-label="主导航" className="flex h-full items-stretch gap-1 max-md:min-w-0 max-md:justify-self-center">
         <HeaderTab active={page === 'devices'} onClick={() => onNavigate('devices')} badge={deviceSummary}>设备列表</HeaderTab>
         <HeaderTab active={page === 'terminals'} onClick={() => onNavigate('terminals')} badge={sessionCount}>终端</HeaderTab>
+        <HeaderTab active={page === 'sessions'} onClick={() => onNavigate('sessions')} badge={agentSessionCount}>Agent</HeaderTab>
         <HeaderTab active={page === 'setup'} onClick={() => onNavigate('setup')}>安装客户端</HeaderTab>
       </nav>
       <div className="justify-self-end">

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
 import { Plus, Search, Trash2, Bot } from 'lucide-react'
-import { api, type Device } from '../api'
+import type { Device } from '../api'
 import { agentApi } from '../agent/api'
 import { AgentStartDialog } from '../agent/AgentStartDialog'
 import { useAgentSession } from '../agent/useAgentSession'
@@ -24,29 +23,40 @@ const STATE_STYLES: Record<string, string> = {
   disconnected: 'text-destructive',
 }
 
-export default function SessionsPage() {
-  const { sessionId } = useParams<{ sessionId?: string }>()
-  const navigate = useNavigate()
+type Props = {
+  devices: Device[]
+  sessionId: string | null
+  /** Selecting a session rewrites the URL so it stays deep-linkable. */
+  onSelectSession: (sessionId: string | null) => void
+  onSessionsChanged?: (count: number) => void
+}
+
+export default function SessionsPage({
+  devices,
+  sessionId,
+  onSelectSession,
+  onSessionsChanged,
+}: Props) {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [devices, setDevices] = useState<Device[]>([])
   const [searchQuery, setSearchQuery] = useState('')
   const [startDevice, setStartDevice] = useState<Device | null>(null)
   const [listError, setListError] = useState('')
-  const { session, error, send } = useAgentSession(sessionId ?? null)
+  const { session, error, send } = useAgentSession(sessionId)
 
   const refreshSessions = useCallback(async () => {
     try {
       const result = await agentApi.sessions()
-      setSessions(result.sessions as SessionSummary[])
+      const values = result.sessions as SessionSummary[]
+      setSessions(values)
+      onSessionsChanged?.(values.length)
       setListError('')
     } catch (reason) {
       setListError(reason instanceof Error ? reason.message : 'Unable to load sessions')
     }
-  }, [])
+  }, [onSessionsChanged])
 
   useEffect(() => {
     void refreshSessions()
-    void api.devices().then(setDevices).catch(() => setDevices([]))
   }, [refreshSessions])
 
   // The open session owns its own live projection; refreshing the list when its
@@ -73,7 +83,7 @@ export default function SessionsPage() {
     try {
       await agentApi.close(id)
       await refreshSessions()
-      if (id === sessionId) navigate('/sessions')
+      if (id === sessionId) onSelectSession(null)
     } catch (reason) {
       setListError(reason instanceof Error ? reason.message : 'Unable to close session')
     }
@@ -133,11 +143,11 @@ export default function SessionsPage() {
               key={item.id}
               role="button"
               tabIndex={0}
-              onClick={() => navigate(`/sessions/${item.id}`)}
+              onClick={() => onSelectSession(item.id)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault()
-                  navigate(`/sessions/${item.id}`)
+                  onSelectSession(item.id)
                 }
               }}
               className={`group flex w-full cursor-pointer items-start gap-2 border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-card ${
@@ -226,7 +236,7 @@ export default function SessionsPage() {
           onStart={async (options) => {
             const created = await agentApi.create({ ...options, device_id: startDevice.id })
             await refreshSessions()
-            navigate(`/sessions/${created.session.id}`)
+            onSelectSession(created.session.id)
           }}
         />
       )}
