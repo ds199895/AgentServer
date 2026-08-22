@@ -108,6 +108,16 @@
   .terminal-host .xterm {
     height: 100%;
   }
+  /* xterm's helper textarea is invisible (opacity: 0) and has no colors of its
+     own. iPadOS derives the hardware-keyboard IME candidate bar colors from the
+     focused element; without explicit colors the home-screen Web App renders the
+     active candidate black-on-black. Declare the dark palette so the derivation
+     has consistent values — opacity keeps the element visually hidden. */
+  .terminal-host .xterm .xterm-helper-textarea {
+    color: #dce5ef;
+    background-color: #0b0f14;
+    caret-color: #77f2b4;
+  }
   .terminal-host .xterm-viewport {
     scrollbar-color: #34404c transparent;
     scrollbar-width: thin;
