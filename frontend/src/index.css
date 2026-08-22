@@ -2,6 +2,7 @@
 @import 'tw-animate-css';
 
 :root {
+  color-scheme: dark;
   --radius: 0.5rem;
   --background: #080b0f;
   --foreground: #dce5ef;
