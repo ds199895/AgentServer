@@ -20,6 +20,11 @@ import {
   type VirtualModifierState,
 } from '@/terminal-virtual-keyboard'
 import { isSnapshotProtocolReply, RecoveryInputBuffer } from '@/terminal-stream'
+import {
+  attachNativeInputBridge,
+  configureTerminalInputTextarea,
+  type NativeInputState,
+} from '@/terminal-input-bridge'
 
 const SNAPSHOT_COMPLETE_MESSAGE = '\x01[snapshot-complete]'
 
@@ -299,6 +304,8 @@ export default function TerminalPane({
     }
     terminal.open(hostRef.current)
     terminalRef.current = terminal
+    const nativeInputState: NativeInputState = { composing: false, pending: false }
+    let nativeInputBridge: ReturnType<typeof attachNativeInputBridge> | null = null
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true
       const key = event.key.toLowerCase()
@@ -400,7 +407,13 @@ export default function TerminalPane({
             activeElement === document.body ||
             activeElement === document.documentElement ||
             hostRef.current?.contains(activeElement)
-          if (focusedRef.current && !virtualKeyboardOpenRef.current && mayRestoreFocus) {
+          if (
+            focusedRef.current &&
+            !virtualKeyboardOpenRef.current &&
+            !nativeInputState.composing &&
+            !nativeInputState.pending &&
+            mayRestoreFocus
+          ) {
             terminal.focus()
           }
         })
@@ -411,6 +424,27 @@ export default function TerminalPane({
     const sendInput = (data: Uint8Array<ArrayBuffer>) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(data)
     }
+
+    const sendNativeText = (data: string) => {
+      if (replayingSnapshot) {
+        if (!recoveryInput.push(data) && !recoveryOverflowReported) {
+          recoveryOverflowReported = true
+          showNotice('终端恢复期间输入过多，已停止继续缓存')
+        }
+        return
+      }
+      sendInput(textEncoder.encode(data))
+    }
+
+    const attachNativeInput = () => {
+      if (nativeInputBridge || !terminal.textarea) return
+      configureTerminalInputTextarea(terminal.textarea)
+      nativeInputBridge = attachNativeInputBridge(terminal.textarea, {
+        state: nativeInputState,
+        onFallbackText: sendNativeText,
+      })
+    }
+    attachNativeInput()
 
     const flushRecoveryInput = () => {
       for (const data of recoveryInput.drain()) sendInput(data)
@@ -469,6 +503,7 @@ export default function TerminalPane({
     }
 
     const input = terminal.onData((data) => {
+      nativeInputBridge?.noteXtermData(data)
       if (replayingSnapshot) {
         if (isSnapshotProtocolReply(data)) return
         if (!recoveryInput.push(data) && !recoveryOverflowReported) {
@@ -629,6 +664,8 @@ export default function TerminalPane({
       document.removeEventListener('visibilitychange', restoreWhenPageReturns)
       window.removeEventListener('pageshow', restoreWhenPageReturns)
       input.dispose()
+      nativeInputBridge?.dispose()
+      nativeInputBridge = null
       recoveryInput.clear()
       socket?.close(1000)
       restoreRef.current = null

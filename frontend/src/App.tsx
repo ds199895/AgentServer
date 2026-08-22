@@ -127,7 +127,14 @@ function focusTerminalInput(id: string): void {
     const pane = document.querySelector<HTMLElement>(
       `[data-terminal-id="${CSS.escape(id)}"]`,
     )
-    pane?.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus({ preventScroll: true })
+    const textarea = pane?.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')
+    if (
+      textarea?.isConnected &&
+      textarea.dataset.nativeComposing !== 'true' &&
+      textarea.dataset.nativeInputPending !== 'true'
+    ) {
+      textarea.focus({ preventScroll: true })
+    }
   }))
 }
 
