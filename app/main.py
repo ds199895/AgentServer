@@ -132,9 +132,16 @@ DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 # Terminal scrollback replays are sliced to this size so a single attach cannot
 # hand the event loop a multi-megabyte frame in one go.
 SNAPSHOT_CHUNK_BYTES = 64 * 1024
+TERMINAL_SCROLLBACK_BYTES = int(
+    os.getenv("TERMINAL_SCROLLBACK_BYTES", str(2 * 1024 * 1024))
+)
+# Replay everything the server still retains. Slicing the replay into
+# SNAPSHOT_CHUNK_BYTES frames is what keeps one attach from stalling the event
+# loop, so a lower cap here bought no latency and instead made every reconnect
+# discard scrollback the session was still holding.
 TERMINAL_SNAPSHOT_BYTES = max(
     SNAPSHOT_CHUNK_BYTES,
-    int(os.getenv("TERMINAL_SNAPSHOT_BYTES", str(512 * 1024))),
+    int(os.getenv("TERMINAL_SNAPSHOT_BYTES", str(TERMINAL_SCROLLBACK_BYTES))),
 )
 # Session-state pushes are coalesced over this window so a burst of transitions
 # (a device reconnecting, several services going offline) sends one snapshot.
@@ -1013,9 +1020,7 @@ async def lifespan(app: FastAPI):
             cwd=os.getenv("TERMINAL_CWD", str(ROOT)),
             shell=os.getenv("TERMINAL_SHELL") or None,
             proxy=os.getenv("TERMINAL_PROXY") or None,
-            scrollback_bytes=int(
-                os.getenv("TERMINAL_SCROLLBACK_BYTES", str(2 * 1024 * 1024))
-            ),
+            scrollback_bytes=TERMINAL_SCROLLBACK_BYTES,
             backend=os.getenv(
                 "TERMINAL_BACKEND",
                 "tmux" if os.getenv("ENVIRONMENT") == "production" else "direct",
@@ -1898,7 +1903,7 @@ async def execution_reconcile_loop(app: FastAPI) -> None:
 async def service_monitor_loop(app: FastAPI) -> None:
     interval = max(2.0, float(os.getenv("SERVICE_PROBE_INTERVAL", "15")))
     process_interval = max(
-        interval, float(os.getenv("SERVICE_PROCESS_SCAN_INTERVAL", "30"))
+        interval, float(os.getenv("SERVICE_PROCESS_SCAN_INTERVAL", "15"))
     )
     process_missing_threshold = max(
         1, int(os.getenv("SERVICE_PROCESS_MISSING_SCANS", "2"))
@@ -1937,7 +1942,7 @@ async def service_monitor_loop(app: FastAPI) -> None:
                         not online
                         and source == "process"
                         and scheme == "http"
-                        and os.getenv("SERVICE_PROCESS_TRY_HTTPS", "0") == "1"
+                        and os.getenv("SERVICE_PROCESS_TRY_HTTPS", "1") == "1"
                     ):
                         online, error = await probe_device_service(
                             device, port, "https", timeout=probe_timeout

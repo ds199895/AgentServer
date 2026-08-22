@@ -71,7 +71,10 @@ NON_SERVICE_URL_CONTEXT = re.compile(
 MAX_DETECTED_SERVICES = 8
 MAX_PROCESS_SERVICE_CANDIDATES = 8
 SERVICE_REDISCOVERY_COOLDOWN = 5 * 60
-SERVICE_REDISCOVERY_MAX_COOLDOWN = 60 * 60
+# A service that failed a few probes is usually a dev server between restarts,
+# not a permanently dead port. Backing off for an hour meant it stayed missing
+# from the terminal header long after it came back.
+SERVICE_REDISCOVERY_MAX_COOLDOWN = 10 * 60
 NON_HTTP_SERVICE_PORTS = frozenset(
     {
         1883,  # MQTT

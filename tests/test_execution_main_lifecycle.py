@@ -20,6 +20,9 @@ from fastapi import FastAPI, HTTPException
 from app.execution import ExecutionStore
 from app.execution.service import ExecutionService
 from app.main import (
+    SNAPSHOT_CHUNK_BYTES,
+    TERMINAL_SCROLLBACK_BYTES,
+    TERMINAL_SNAPSHOT_BYTES,
     CreateTerminalBody,
     TerminalExecutionLifecycle,
     create_terminal,
@@ -28,6 +31,18 @@ from app.main import (
     reconcile_execution_state,
 )
 from app.terminal import TerminalSession
+
+
+class TerminalReplayBudgetTests(unittest.TestCase):
+    def test_cold_replay_covers_everything_the_session_retains(self) -> None:
+        # Attaching must not silently drop scrollback the server is still
+        # holding: a reconnect that replays less than the retained buffer makes
+        # history disappear from the pane for no latency benefit, because the
+        # replay is already sliced into SNAPSHOT_CHUNK_BYTES frames.
+        self.assertGreaterEqual(TERMINAL_SNAPSHOT_BYTES, TERMINAL_SCROLLBACK_BYTES)
+
+    def test_replay_is_sliced_rather_than_sent_as_one_frame(self) -> None:
+        self.assertLess(SNAPSHOT_CHUNK_BYTES, TERMINAL_SNAPSHOT_BYTES)
 
 
 class ManagedTerminalEnvironmentTests(unittest.TestCase):
